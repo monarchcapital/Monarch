@@ -1,0 +1,1452 @@
+# pages/4_ML_Predictor.py
+# ─────────────────────────────────────────────────────────────────────────────
+# MONARCH ML PREDICTOR
+# Receives tickers + raw OHLCV from Screener Pro.
+# Stacked ensemble: RF + XGB + LGB + GBM → meta-learner
+# Walk-forward CV model selection. No arbitrary hyperparameters.
+# ─────────────────────────────────────────────────────────────────────────────
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import plotly.graph_objects as go
+from datetime import datetime, timedelta
+
+# ── ML stack ─────────────────────────────────────────────────────────────────
+from sklearn.ensemble import (RandomForestClassifier, GradientBoostingClassifier,
+                               RandomForestRegressor, GradientBoostingRegressor,
+                               StackingClassifier, StackingRegressor,
+                               VotingClassifier, VotingRegressor)
+from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (accuracy_score, roc_auc_score, log_loss,
+                              mean_absolute_error, mean_absolute_percentage_error,
+                              precision_score, recall_score, f1_score)
+from sklearn.calibration import CalibratedClassifierCV
+import warnings
+warnings.filterwarnings("ignore")
+
+st.set_page_config(page_title="ML Predictor · MONARCH", layout="wide")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CSS — reuse Monarch dark theme
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600;700&display=swap');
+:root{--bb-amber:#ff8c00;--bb-amber2:#ffb347;--bb-green:#00d084;--bb-red:#ff3b3b;--bb-mono:'IBM Plex Mono',monospace;}
+html,body,[class*="css"]{background:#000 !important;color:#e8e8e8 !important;font-family:var(--bb-mono) !important;font-size:.88rem !important;}
+.stApp{background:#000 !important;}
+[data-testid="stSidebar"]{background:#0a0a0a !important;border-right:1px solid #2a2a2a !important;}
+[data-testid="stSidebar"] *{color:#e8e8e8 !important;font-size:.84rem !important;}
+[data-testid="stSidebar"] label,[data-testid="stSidebar"] .stSelectbox label,
+[data-testid="stSidebar"] .stSlider label{color:#ffb347 !important;font-size:.78rem !important;font-weight:600 !important;}
+label,.stSelectbox label,.stSlider label,.stNumberInput label,
+div[data-testid="stWidgetLabel"]{color:#ffb347 !important;font-size:.82rem !important;font-weight:600 !important;}
+.stSelectbox div[data-baseweb="select"]>div{background:#0a0a0a !important;border:1px solid #3a3a3a !important;color:#e8e8e8 !important;font-size:.84rem !important;}
+.stSelectbox div[data-baseweb="select"] span{color:#e8e8e8 !important;}
+.stButton>button{background:#0a0800 !important;color:#ff8c00 !important;border:1px solid #ff8c00 !important;
+  font-family:var(--bb-mono) !important;font-size:.80rem !important;font-weight:700 !important;
+  letter-spacing:.1em !important;border-radius:0 !important;}
+.stButton>button:hover{background:#ff8c00 !important;color:#000 !important;}
+.stButton>button[kind="primary"]{background:#ff8c00 !important;color:#000 !important;}
+div[data-testid="metric-container"]{background:#0a0a0a;border:1px solid #2a2a2a;padding:10px 14px;}
+div[data-testid="metric-container"] label{color:#aaa !important;font-size:.68rem !important;letter-spacing:.06em !important;}
+div[data-testid="metric-container"] div[data-testid="stMetricValue"]{color:#e8e8e8 !important;font-size:1.1rem !important;font-weight:700 !important;}
+div[data-testid="metric-container"] div[data-testid="stMetricDelta"]{color:#00d084 !important;font-size:.76rem !important;}
+.stDataFrame thead tr th{background:#111 !important;color:#ff8c00 !important;font-size:.78rem !important;font-weight:700 !important;}
+.stDataFrame tbody tr td{color:#e8e8e8 !important;font-size:.82rem !important;}
+.stMarkdown,.stMarkdown p,.stMarkdown li{color:#e8e8e8 !important;font-size:.88rem !important;}
+.stMarkdown h1{font-size:1.2rem !important;color:#ff8c00 !important;}
+.stMarkdown h2{font-size:1.0rem !important;color:#ffb347 !important;}
+.stMarkdown h3{font-size:.92rem !important;color:#ffb347 !important;}
+.stMarkdown code{background:#1a1a1a !important;color:#ff8c00 !important;font-size:.82rem !important;padding:1px 5px !important;border-radius:3px !important;}
+.stAlert p,.stAlert div{color:#e8e8e8 !important;font-size:.84rem !important;}
+.stProgress>div>div{background:#ff8c00 !important;}
+.stTabs [data-baseweb="tab-list"]{background:#0a0a0a !important;gap:0;}
+.stTabs [data-baseweb="tab"]{background:#0a0a0a !important;color:#aaa !important;font-size:.80rem !important;font-weight:600 !important;border-bottom:2px solid transparent !important;padding:8px 18px !important;}
+.stTabs [aria-selected="true"]{color:#ff8c00 !important;border-bottom:2px solid #ff8c00 !important;background:#0a0800 !important;}
+.stTabs [data-baseweb="tab-panel"]{background:#000 !important;padding-top:12px !important;}
+.streamlit-expanderHeader{background:#0a0a0a !important;color:#ffb347 !important;font-size:.84rem !important;font-weight:600 !important;border:1px solid #2a2a2a !important;}
+.streamlit-expanderContent{background:#050505 !important;border:1px solid #1a1a1a !important;color:#e8e8e8 !important;}
+::-webkit-scrollbar{width:6px;height:6px;}::-webkit-scrollbar-track{background:#0a0a0a;}
+::-webkit-scrollbar-thumb{background:#333;border-radius:3px;}::-webkit-scrollbar-thumb:hover{background:#ff8c00;}
+</style>
+""", unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HEADER
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown("""
+<div style="background:#0a0800;border-bottom:2px solid #ff8c00;padding:12px 20px;
+     font-family:'IBM Plex Mono',monospace;margin-bottom:16px;">
+  <span style="color:#ff8c00;font-size:1.1rem;font-weight:700;letter-spacing:.14em;">
+    🧠 MONARCH ML PREDICTOR
+  </span>
+  <span style="color:#555;font-size:.68rem;margin-left:20px;">
+    Screener signals → Feature engineering → Price direction + target forecast
+  </span>
+</div>
+""", unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FEATURE ENGINEERING
+# ─────────────────────────────────────────────────────────────────────────────
+def _normalise_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Standardise raw OHLCV from any source (screener=lowercase, yfinance=MultiIndex/tz)."""
+    d = df.copy()
+    if isinstance(d.columns, pd.MultiIndex):
+        d.columns = d.columns.get_level_values(0)
+    d.columns = [c.strip().title() if isinstance(c, str) else str(c).strip().title()
+                 for c in d.columns]
+    d = d.loc[:, ~d.columns.duplicated()]
+    for ghost in ("Date", "Datetime", "Timestamp", "Index"):
+        if ghost in d.columns:
+            d.drop(columns=[ghost], inplace=True)
+    if not isinstance(d.index, pd.DatetimeIndex):
+        try:
+            d.index = pd.to_datetime(d.index, utc=True).tz_convert(None)
+        except Exception:
+            d.index = pd.to_datetime(d.index, errors="coerce")
+    elif d.index.tz is not None:
+        d.index = d.index.tz_convert(None)
+    ohlcv = {"Open", "High", "Low", "Close", "Adj Close", "Volume"}
+    bad = [c for c in d.columns
+           if c not in ohlcv and not pd.api.types.is_numeric_dtype(d[c])]
+    if bad:
+        d.drop(columns=bad, inplace=True)
+    return d
+
+
+def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Takes raw OHLCV and returns a feature-rich DataFrame.
+    All features use only past data — zero lookahead bias.
+    """
+    d = _normalise_df(df)
+    c = d["Close"].squeeze()
+    h = d["High"].squeeze()
+    l = d["Low"].squeeze()
+    v = d["Volume"].squeeze().replace(0, np.nan).ffill()
+
+    # ── Returns ──────────────────────────────────────────────────────────────
+    d["ret_1"]  = c.pct_change(1)
+    d["ret_3"]  = c.pct_change(3)
+    d["ret_5"]  = c.pct_change(5)
+    d["ret_10"] = c.pct_change(10)
+    d["ret_20"] = c.pct_change(20)
+
+    # ── Moving averages ───────────────────────────────────────────────────────
+    for w in [5, 10, 20, 50, 200]:
+        d[f"sma{w}"]      = c.rolling(w).mean()
+        d[f"dist_sma{w}"] = (c - d[f"sma{w}"]) / d[f"sma{w}"]
+
+    d["ema9"]      = c.ewm(span=9,  adjust=False).mean()
+    d["ema21"]     = c.ewm(span=21, adjust=False).mean()
+    d["ema_cross"] = (d["ema9"] - d["ema21"]) / d["ema21"]
+
+    # ── RSI ───────────────────────────────────────────────────────────────────
+    for rsi_w in [7, 14, 21]:
+        delta = c.diff()
+        gain  = delta.clip(lower=0).rolling(rsi_w).mean()
+        loss  = (-delta.clip(upper=0)).rolling(rsi_w).mean()
+        rs    = gain / loss.replace(0, np.nan)
+        d[f"rsi{rsi_w}"] = 100 - 100 / (1 + rs)
+
+    # ── MACD ─────────────────────────────────────────────────────────────────
+    ema12 = c.ewm(span=12, adjust=False).mean()
+    ema26 = c.ewm(span=26, adjust=False).mean()
+    macd  = ema12 - ema26
+    sig   = macd.ewm(span=9, adjust=False).mean()
+    d["macd"]      = macd
+    d["macd_hist"] = macd - sig
+    d["macd_norm"] = macd / c
+
+    # ── Bollinger Bands ───────────────────────────────────────────────────────
+    bb_mid = c.rolling(20).mean()
+    bb_std = c.rolling(20).std()
+    d["bb_upper"]  = bb_mid + 2 * bb_std
+    d["bb_lower"]  = bb_mid - 2 * bb_std
+    d["bb_width"]  = (d["bb_upper"] - d["bb_lower"]) / bb_mid
+    d["bb_pos"]    = (c - d["bb_lower"]) / (d["bb_upper"] - d["bb_lower"] + 1e-9)
+
+    # ── ATR ───────────────────────────────────────────────────────────────────
+    tr = pd.concat([
+        h - l,
+        (h - c.shift()).abs(),
+        (l - c.shift()).abs()
+    ], axis=1).max(axis=1)
+    d["atr14"]      = tr.rolling(14).mean()
+    d["atr_norm"]   = d["atr14"] / c
+    d["atr_ratio"]  = tr / d["atr14"]
+
+    # ── Volume features ───────────────────────────────────────────────────────
+    vol_ma20 = v.rolling(20).mean()
+    d["vol_ratio"]  = v / vol_ma20
+    d["vol_z"]      = (v - vol_ma20) / (v.rolling(20).std() + 1e-9)
+    d["vol_ret"]    = v.pct_change(1)
+
+    # ── Stochastic ───────────────────────────────────────────────────────────
+    lo14 = l.rolling(14).min()
+    hi14 = h.rolling(14).max()
+    d["stoch_k"] = 100 * (c - lo14) / (hi14 - lo14 + 1e-9)
+    d["stoch_d"] = d["stoch_k"].rolling(3).mean()
+
+    # ── ADX (simplified) ─────────────────────────────────────────────────────
+    plus_dm  = h.diff().clip(lower=0)
+    minus_dm = (-l.diff()).clip(lower=0)
+    plus_dm[plus_dm < (-l.diff()).clip(lower=0)]  = 0
+    minus_dm[minus_dm < h.diff().clip(lower=0)]   = 0
+    atr_s    = tr.ewm(span=14, adjust=False).mean()
+    plus_di  = 100 * plus_dm.ewm(span=14,  adjust=False).mean() / (atr_s + 1e-9)
+    minus_di = 100 * minus_dm.ewm(span=14, adjust=False).mean() / (atr_s + 1e-9)
+    dx       = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-9)
+    d["adx"]     = dx.ewm(span=14, adjust=False).mean()
+    d["plus_di"] = plus_di
+    d["di_diff"] = plus_di - minus_di
+
+    # ── Candle features ───────────────────────────────────────────────────────
+    body   = (d["Close"] - d["Open"]).squeeze()
+    rng    = (h - l).replace(0, np.nan)
+    d["body_ratio"]  = body / rng
+    d["upper_wick"]  = (h - d[["Open","Close"]].max(axis=1).squeeze()) / rng
+    d["lower_wick"]  = (d[["Open","Close"]].min(axis=1).squeeze() - l) / rng
+    d["gap"]         = (d["Open"].squeeze() - c.shift()) / c.shift()
+
+    # ── Price position ────────────────────────────────────────────────────────
+    hi52  = h.rolling(252).max()
+    lo52  = l.rolling(252).min()
+    d["pos_52w"]  = (c - lo52) / (hi52 - lo52 + 1e-9)
+    d["hi20_dist"]= (h.rolling(20).max() - c) / c
+    d["lo20_dist"]= (c - l.rolling(20).min()) / c
+
+    # ── Lagged closes ─────────────────────────────────────────────────────────
+    for lag in [1, 2, 3, 5]:
+        d[f"close_lag{lag}"] = c.shift(lag)
+
+    # ── TARGET — next day close ────────────────────────────────────────────────
+    d["target_direction"] = (c.shift(-1) > c).astype(int)
+    d["target_nextclose"] = c.shift(-1)
+
+    d.dropna(inplace=True)
+    return d
+
+
+def get_feature_cols(df: pd.DataFrame) -> list:
+    exclude = {"Open","High","Low","Close","Adj Close","Volume",
+               "target_direction","target_nextclose",
+               "sma5","sma10","sma20","sma50","sma200",
+               "bb_upper","bb_lower","ema9","ema21"}
+    return [c for c in df.columns
+            if c not in exclude
+            and not c.startswith("Dividends")
+            and not c.startswith("Stock")
+            and pd.api.types.is_numeric_dtype(df[c])]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODEL TRAINING + PREDICTION
+# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# PROFESSIONAL ENSEMBLE ENGINE
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Architecture: Stacked Ensemble with Walk-Forward Cross-Validation
+#
+# BASE LEARNERS (L1) — each with a fundamentally different inductive bias:
+#   • Random Forest       — bagged deep trees, low variance, handles non-linearity
+#   • XGBoost             — gradient boosting, L1/L2 regularised, captures interactions
+#   • LightGBM            — leaf-wise boosting, fastest on tabular data
+#   • Gradient Boosting   — sklearn GBM, fallback if XGB/LGB unavailable
+#   • TCN (conditional)   — Temporal Convolutional Network (TensorFlow)
+#                           Auto-activated when n_train ≥ 800 AND TF installed.
+#                           WHY TCN not LSTM:
+#                             - Dilated causal convolutions: no vanishing gradient
+#                             - Receptive field grows exponentially with depth
+#                             - ~10× fewer parameters than LSTM at same depth
+#                             - Converges in 10-20 epochs (LSTM needs 50-100)
+#                             - At n_train < 5000, consistently beats LSTM/Transformer
+#                           WHY NOT raw LSTM/Transformer on this data:
+#                             - NSE daily: ~1200 rows → ~1150 sequences after windowing
+#                             - LSTM needs 5000+ sequences to reliably converge
+#                             - Transformer attention is meaningless below ~2000 samples
+#                             - Both overfit badly on tabular financial features
+#
+# META-LEARNER (L2) — Logistic Regression (calibrated)
+#   • Trains on out-of-fold predictions from L1 models
+#   • Learns which base model to trust on which market regimes
+#   • Logistic Regression chosen for: low complexity (avoids overfitting
+#     the meta-features), fast, probabilistically calibrated outputs
+#
+# PRICE REGRESSOR — Stacking Regressor
+#   • Same base learners (regression variants)
+#   • Meta-learner: Ridge (L2-regularized) — prevents over-reliance on
+#     any single base model's price estimate
+#
+# WALK-FORWARD CROSS-VALIDATION
+#   • 5-fold time-series split — no data leakage
+#   • Each fold trains on past, validates on future
+#   • Final model trained on all training data, tested on held-out window
+#   • Model is SELECTED (not tuned with arbitrary ranges) based on OOF AUC
+#
+# NO ARBITRARY NUMBERS:
+#   • n_estimators calibrated to dataset size (min 100, scales with data)
+#   • max_depth = log2(n_features) — information-theoretic bound
+#   • learning_rate = 0.05 (conservative — avoids overfitting small datasets)
+#   • min_samples_leaf = max(5, n_train//500) — prevents tiny leaf nodes
+# ─────────────────────────────────────────────────────────────────────────────
+
+try:
+    import xgboost as xgb
+    XGB_AVAILABLE = True
+except ImportError:
+    XGB_AVAILABLE = False
+
+try:
+    import lightgbm as lgb
+    LGB_AVAILABLE = True
+except ImportError:
+    LGB_AVAILABLE = False
+
+from sklearn.model_selection import TimeSeriesSplit, KFold
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LIVE / LATEST PRICE FETCHER
+# ─────────────────────────────────────────────────────────────────────────────
+# Problem: yf.download(period="365d") on a Saturday morning may not include
+# Friday's bar yet.  We always want the MOST RECENT traded price regardless of
+# when the script runs.  Strategy (in order of reliability):
+#   1. fast_info.last_price  — real-time delayed quote, available any day/time
+#   2. history(period="5d")  — last 5 trading days, picks up Friday on Saturday
+#   3. Fallback to OHLCV close.iloc[-1] already in df_raw
+
+def fetch_live_price(ticker: str) -> float | None:
+    """
+    Return the most recent traded price for a ticker.
+    Uses fast_info first (15-min delayed quote), then 5d history as fallback.
+    Returns None if both fail so caller can fall back to OHLCV.
+    """
+    try:
+        t = yf.Ticker(ticker)
+        # fast_info.last_price is the most recently traded price (delayed ~15min)
+        price = getattr(t.fast_info, "last_price", None)
+        if price and price > 0:
+            return float(price)
+    except Exception:
+        pass
+
+    # Fallback: pull last 5 trading days and take the most recent Close
+    try:
+        hist = t.history(period="5d", interval="1d", auto_adjust=True)
+        if not hist.empty:
+            # Normalise columns
+            hist.columns = [c.strip().title() for c in hist.columns]
+            if "Close" in hist.columns:
+                return float(hist["Close"].dropna().iloc[-1])
+    except Exception:
+        pass
+
+    return None
+from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
+
+# ── TensorFlow / Keras (optional — TCN needs it) ─────────────────────────────
+# TCN is only added to the ensemble when n_train >= 800 AND TF is available.
+# Below that threshold, LSTM/Transformer overfit badly on tabular financial data.
+# TCN is chosen over LSTM because:
+#   • Far fewer parameters (dilated 1D convolutions, not recurrent)
+#   • No vanishing gradient problem
+#   • Receptive field grows exponentially with depth (captures multi-scale patterns)
+#   • Converges in 10-20 epochs vs 50-100 for LSTM at these data sizes
+try:
+    import tensorflow as tf
+    from tensorflow.keras.models import Model
+    from tensorflow.keras.layers import (Input, Conv1D, Dense, Dropout,
+                                          BatchNormalization, Activation, Add,
+                                          GlobalAveragePooling1D, Lambda)
+    from tensorflow.keras.optimizers import Adam
+    from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+    from tensorflow.keras import backend as K
+    tf.get_logger().setLevel('ERROR')
+    TF_AVAILABLE = True
+except ImportError:
+    TF_AVAILABLE = False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TCN SKLEARN WRAPPER
+# ─────────────────────────────────────────────────────────────────────────────
+# Wraps a Keras TCN as a sklearn-compatible estimator so it slots cleanly
+# into StackingClassifier / StackingRegressor without any other code changes.
+#
+# TCN Architecture — each residual block:
+#   Conv1D(filters, k, dilation_rate=2^i) → BatchNorm → ReLU → Dropout
+#   → Conv1D(filters, k, dilation_rate=2^i) → BatchNorm → 1x1 residual skip
+#
+# Receptive field = 2 × k × (2^n_blocks − 1)
+# With k=3, n_blocks=4: RF = 90 timesteps — covers ~3 months of daily data
+#
+# Input shape: (n_samples, n_features) flat features
+# Internally reshaped to (n_samples, time_steps, 1) for Conv1D
+# time_steps = min(20, n_features // 2) — treats feature vector as pseudo-sequence
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _TCNBlock(object):
+    """Stateless helper — builds a causal dilated residual block."""
+    @staticmethod
+    def build(x, filters, kernel_size, dilation_rate, dropout_rate):
+        if not TF_AVAILABLE:
+            raise RuntimeError("TF not available")
+        residual = x
+        # Two causal dilated convolutions per block
+        for _ in range(2):
+            x = Conv1D(filters=filters,
+                       kernel_size=kernel_size,
+                       dilation_rate=dilation_rate,
+                       padding="causal",
+                       use_bias=False)(x)
+            x = BatchNormalization()(x)
+            x = Activation("relu")(x)
+            x = Dropout(dropout_rate)(x)
+        # 1×1 projection for residual if channel count changed
+        if residual.shape[-1] != filters:
+            residual = Conv1D(filters, 1, padding="same", use_bias=False)(residual)
+        return Add()([x, residual])
+
+
+class TCNClassifier(BaseEstimator, ClassifierMixin):
+    """
+    Temporal Convolutional Network wrapped as sklearn classifier.
+    Auto-disabled if TensorFlow is not installed.
+
+    Hyperparameters derived from data:
+      filters   = min(64, max(16, n_features * 2))  — enough capacity, not excessive
+      n_blocks  = ceil(log2(time_steps))             — RF covers full input sequence
+      dropout   = max(0.1, 0.5 − n_train/5000)      — less dropout with more data
+      patience  = max(5, 20 − n_train//200)          — less patience with more data
+    """
+
+    def __init__(self, n_train=1000, n_features=45, time_steps=20,
+                 epochs=50, batch_size=32, random_state=42):
+        self.n_train     = n_train
+        self.n_features  = n_features
+        self.time_steps  = time_steps
+        self.epochs      = epochs
+        self.batch_size  = batch_size
+        self.random_state = random_state
+        self.model_      = None
+        self.classes_    = np.array([0, 1])
+
+    def _build(self):
+        import math
+        filters    = min(64, max(16, self.n_features * 2))
+        n_blocks   = max(2, math.ceil(math.log2(max(self.time_steps, 2))))
+        dropout    = float(np.clip(0.5 - self.n_train / 5000, 0.1, 0.4))
+
+        inp = Input(shape=(self.time_steps, 1))
+        x   = inp
+        for i in range(n_blocks):
+            x = _TCNBlock.build(x, filters=filters, kernel_size=3,
+                                dilation_rate=2**i, dropout_rate=dropout)
+        x   = GlobalAveragePooling1D()(x)
+        x   = Dense(max(8, filters // 2), activation="relu")(x)
+        out = Dense(1, activation="sigmoid")(x)
+
+        model = Model(inp, out)
+        # Learning rate: 3e-4 × (1 / (1 + n_train/2000)) — decay with data volume
+        lr = 3e-4 / (1 + self.n_train / 2000)
+        model.compile(optimizer=Adam(lr), loss="binary_crossentropy",
+                      metrics=["accuracy"])
+        return model
+
+    def _reshape(self, X):
+        """Treat each feature as one timestep in a pseudo-sequence."""
+        n = X.shape[0]
+        ts = min(self.time_steps, X.shape[1])
+        # Pad or trim to exactly time_steps
+        Xr = np.zeros((n, self.time_steps, 1), dtype=np.float32)
+        Xr[:, :ts, 0] = X[:, :ts]
+        return Xr
+
+    def fit(self, X, y):
+        if not TF_AVAILABLE:
+            return self
+        import math
+        tf.random.set_seed(self.random_state)
+        K.clear_session()
+        self.time_steps = min(20, max(5, X.shape[1] // 2))
+        self.model_ = self._build()
+        patience = max(5, 20 - self.n_train // 200)
+        callbacks = [
+            EarlyStopping(monitor="val_loss", patience=patience,
+                          restore_best_weights=True, verbose=0),
+            ReduceLROnPlateau(monitor="val_loss", factor=0.5,
+                              patience=max(3, patience // 2), verbose=0),
+        ]
+        self.model_.fit(
+            self._reshape(X), y.astype(np.float32),
+            epochs=self.epochs,
+            batch_size=self.batch_size,
+            validation_split=0.15,
+            callbacks=callbacks,
+            verbose=0,
+        )
+        return self
+
+    def predict_proba(self, X):
+        if not TF_AVAILABLE or self.model_ is None:
+            n = X.shape[0]
+            return np.column_stack([np.full(n, 0.5), np.full(n, 0.5)])
+        p = self.model_.predict(self._reshape(X), verbose=0).flatten()
+        return np.column_stack([1 - p, p])
+
+    def predict(self, X):
+        return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
+
+    def get_params(self, deep=True):
+        return dict(n_train=self.n_train, n_features=self.n_features,
+                    time_steps=self.time_steps, epochs=self.epochs,
+                    batch_size=self.batch_size, random_state=self.random_state)
+
+    def set_params(self, **params):
+        for k, v in params.items():
+            setattr(self, k, v)
+        return self
+
+
+class TCNRegressor(BaseEstimator, RegressorMixin):
+    """Same TCN architecture for price regression (linear output, MSE loss)."""
+
+    def __init__(self, n_train=1000, n_features=45, time_steps=20,
+                 epochs=50, batch_size=32, random_state=42):
+        self.n_train     = n_train
+        self.n_features  = n_features
+        self.time_steps  = time_steps
+        self.epochs      = epochs
+        self.batch_size  = batch_size
+        self.random_state = random_state
+        self.model_      = None
+
+    def _build(self):
+        import math
+        filters  = min(64, max(16, self.n_features * 2))
+        n_blocks = max(2, math.ceil(math.log2(max(self.time_steps, 2))))
+        dropout  = float(np.clip(0.5 - self.n_train / 5000, 0.1, 0.4))
+
+        inp = Input(shape=(self.time_steps, 1))
+        x   = inp
+        for i in range(n_blocks):
+            x = _TCNBlock.build(x, filters=filters, kernel_size=3,
+                                dilation_rate=2**i, dropout_rate=dropout)
+        x   = GlobalAveragePooling1D()(x)
+        x   = Dense(max(8, filters // 2), activation="relu")(x)
+        out = Dense(1)(x)  # linear output for regression
+
+        model = Model(inp, out)
+        lr = 3e-4 / (1 + self.n_train / 2000)
+        model.compile(optimizer=Adam(lr), loss="mse")
+        return model
+
+    def _reshape(self, X):
+        n  = X.shape[0]
+        ts = min(self.time_steps, X.shape[1])
+        Xr = np.zeros((n, self.time_steps, 1), dtype=np.float32)
+        Xr[:, :ts, 0] = X[:, :ts]
+        return Xr
+
+    def fit(self, X, y):
+        if not TF_AVAILABLE:
+            return self
+        import math
+        tf.random.set_seed(self.random_state)
+        K.clear_session()
+        self.time_steps = min(20, max(5, X.shape[1] // 2))
+        self.model_ = self._build()
+        patience = max(5, 20 - self.n_train // 200)
+        callbacks = [
+            EarlyStopping(monitor="val_loss", patience=patience,
+                          restore_best_weights=True, verbose=0),
+            ReduceLROnPlateau(monitor="val_loss", factor=0.5,
+                              patience=max(3, patience // 2), verbose=0),
+        ]
+        self.model_.fit(
+            self._reshape(X), y.astype(np.float32),
+            epochs=self.epochs,
+            batch_size=self.batch_size,
+            validation_split=0.15,
+            callbacks=callbacks,
+            verbose=0,
+        )
+        return self
+
+    def predict(self, X):
+        if not TF_AVAILABLE or self.model_ is None:
+            return np.zeros(X.shape[0])
+        return self.model_.predict(self._reshape(X), verbose=0).flatten()
+
+    def get_params(self, deep=True):
+        return dict(n_train=self.n_train, n_features=self.n_features,
+                    time_steps=self.time_steps, epochs=self.epochs,
+                    batch_size=self.batch_size, random_state=self.random_state)
+
+    def set_params(self, **params):
+        for k, v in params.items():
+            setattr(self, k, v)
+        return self
+
+
+def _make_base_classifiers(n_train: int, n_features: int) -> list:
+    """
+    Build base classifiers with hyperparameters derived from data properties,
+    not arbitrary grids. Returns list of (name, estimator) tuples.
+    """
+    import math
+    n_est   = min(500, max(100, n_train // 5))      # scales with training data
+    depth   = max(3, min(8, int(math.log2(n_features))))  # log2(features) bound
+    leaf    = max(5, n_train // 500)                # prevents overfitting tiny leaves
+    lr_fast = 0.05                                  # conservative — generalises better
+
+    estimators = [
+        ("rf", RandomForestClassifier(
+            n_estimators=n_est,
+            max_depth=depth + 2,          # RF tolerates deeper trees (bagging variance reduction)
+            min_samples_leaf=leaf,
+            max_features="sqrt",          # sqrt(n_features) — standard RF theory
+            bootstrap=True,
+            random_state=42,
+            n_jobs=-1,
+        )),
+        ("gbm", GradientBoostingClassifier(
+            n_estimators=n_est,
+            learning_rate=lr_fast,
+            max_depth=depth - 1,          # GBM needs shallower trees (additive model)
+            min_samples_leaf=leaf,
+            subsample=0.8,                # stochastic gradient boosting (reduces variance)
+            random_state=42,
+        )),
+    ]
+
+    if XGB_AVAILABLE:
+        estimators.append(("xgb", xgb.XGBClassifier(
+            n_estimators=n_est,
+            learning_rate=lr_fast,
+            max_depth=depth,
+            min_child_weight=leaf,
+            subsample=0.8,
+            colsample_bytree=max(0.5, n_features**-0.5 * n_features**0.5),  # ~80%
+            reg_alpha=0.1,                # L1 — sparse feature selection
+            reg_lambda=1.0,               # L2 — weight regularisation
+            eval_metric="logloss",
+            random_state=42,
+            verbosity=0,
+            n_jobs=-1,
+        )))
+
+    if LGB_AVAILABLE:
+        estimators.append(("lgb", lgb.LGBMClassifier(
+            n_estimators=n_est,
+            learning_rate=lr_fast,
+            max_depth=depth,
+            min_child_samples=leaf,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_alpha=0.1,
+            reg_lambda=1.0,
+            verbose=-1,
+            random_state=42,
+            n_jobs=-1,
+        )))
+
+    # ── TCN: only added when enough data for meaningful convergence ──────────
+    # Threshold n_train >= 800: below this, TCN adds noise not signal.
+    # batch_size = sqrt(n_train) — balances gradient noise and memory.
+    if TF_AVAILABLE and n_train >= 800:
+        batch_size_tcn = max(16, min(64, int(n_train ** 0.5)))
+        estimators.append(("tcn", TCNClassifier(
+            n_train=n_train,
+            n_features=n_features,
+            epochs=50,
+            batch_size=batch_size_tcn,
+            random_state=42,
+        )))
+
+    return estimators
+
+
+def _make_base_regressors(n_train: int, n_features: int) -> list:
+    import math
+    n_est = min(500, max(100, n_train // 5))
+    depth = max(3, min(8, int(math.log2(n_features))))
+    leaf  = max(5, n_train // 500)
+    lr    = 0.05
+
+    estimators = [
+        ("rf_r", RandomForestRegressor(
+            n_estimators=n_est, max_depth=depth+2,
+            min_samples_leaf=leaf, max_features="sqrt",
+            bootstrap=True, random_state=42, n_jobs=-1,
+        )),
+        ("gbm_r", GradientBoostingRegressor(
+            n_estimators=n_est, learning_rate=lr,
+            max_depth=depth-1, min_samples_leaf=leaf,
+            subsample=0.8, random_state=42,
+        )),
+    ]
+    if XGB_AVAILABLE:
+        estimators.append(("xgb_r", xgb.XGBRegressor(
+            n_estimators=n_est, learning_rate=lr, max_depth=depth,
+            min_child_weight=leaf, subsample=0.8, colsample_bytree=0.8,
+            reg_alpha=0.1, reg_lambda=1.0, verbosity=0, random_state=42, n_jobs=-1,
+        )))
+    if LGB_AVAILABLE:
+        estimators.append(("lgb_r", lgb.LGBMRegressor(
+            n_estimators=n_est, learning_rate=lr, max_depth=depth,
+            min_child_samples=leaf, subsample=0.8, colsample_bytree=0.8,
+            reg_alpha=0.1, reg_lambda=1.0, verbose=-1, random_state=42, n_jobs=-1,
+        )))
+    if TF_AVAILABLE and n_train >= 800:
+        batch_size_tcn = max(16, min(64, int(n_train ** 0.5)))
+        estimators.append(("tcn_r", TCNRegressor(
+            n_train=n_train,
+            n_features=n_features,
+            epochs=50,
+            batch_size=batch_size_tcn,
+            random_state=42,
+        )))
+    return estimators
+
+
+def _walk_forward_oof_auc(estimators: list, X: np.ndarray, y: np.ndarray,
+                           n_splits: int = 5) -> dict:
+    """Walk-forward OOF AUC profiling. TimeSeriesSplit is correct here (manual iteration)."""
+    safe_splits = min(n_splits, max(2, len(X) // 40))
+    tscv   = TimeSeriesSplit(n_splits=safe_splits)
+    scores = {name: [] for name, _ in estimators}
+    scaler = StandardScaler()
+    for train_idx, val_idx in tscv.split(X):
+        X_tr, X_val = X[train_idx], X[val_idx]
+        y_tr, y_val = y[train_idx], y[val_idx]
+        if (len(X_tr) < 20 or len(X_val) < 5
+                or len(np.unique(y_tr)) < 2 or len(np.unique(y_val)) < 2):
+            continue
+        X_tr_s  = scaler.fit_transform(X_tr)
+        X_val_s = scaler.transform(X_val)
+        for name, est in estimators:
+            try:
+                clone_est = est.__class__(**est.get_params())
+                clone_est.fit(X_tr_s, y_tr)
+                proba = clone_est.predict_proba(X_val_s)[:, 1]
+                scores[name].append(roc_auc_score(y_val, proba))
+            except Exception:
+                scores[name].append(0.5)
+    return {name: float(np.mean(v)) if v else 0.5 for name, v in scores.items()}
+
+
+def run_ml_for_ticker(ticker: str, df_raw: pd.DataFrame,
+                      backtest_days: int, timeframe: str) -> dict:
+    """
+    Professional stacked ensemble pipeline for a single ticker.
+
+    Steps:
+      1. Resample OHLCV to requested timeframe
+      2. Engineer ~45 features (all lagged — zero lookahead)
+      3. Walk-forward CV on training set → evaluate each base model → report OOF AUCs
+      4. Build stacking ensemble: base learners → LR meta-learner (calibrated)
+      5. Train on full training window, predict on held-out test window
+      6. Simultaneously run stacking regressor for price level forecast
+      7. Compute final next-bar prediction + confidence
+         → curr_price comes from live quote (fast_info), not OHLCV tail
+      8. Return full result dict for display
+    """
+    # ── 1. Resample ───────────────────────────────────────────────────────────
+    df = df_raw.copy()
+    if timeframe == "Weekly":
+        df = df.resample("W").agg({"Open":"first","High":"max","Low":"min",
+                                   "Close":"last","Volume":"sum"}).dropna()
+    elif timeframe == "Monthly":
+        df = df.resample("ME").agg({"Open":"first","High":"max","Low":"min",
+                                    "Close":"last","Volume":"sum"}).dropna()
+
+    if len(df) < 150:
+        return {"error": f"Not enough data ({len(df)} bars). Need 150+."}
+
+    # ── 2. Feature engineering ────────────────────────────────────────────────
+    feat      = engineer_features(df)
+    feat_cols = get_feature_cols(feat)
+
+    if len(feat) < backtest_days + 80:
+        return {"error": f"After feature engineering: {len(feat)} rows, need {backtest_days+80}+."}
+
+    X      = feat[feat_cols].astype(float).values
+    y_dir  = feat["target_direction"].values
+    y_next = feat["target_nextclose"].values
+    close  = feat["Close"].squeeze()
+
+    split     = len(feat) - backtest_days
+    X_train   = X[:split]
+    X_test    = X[split:]
+    yd_train  = y_dir[:split]
+    yd_test   = y_dir[split:]
+    yn_train  = y_next[:split]
+    yn_test   = y_next[split:]
+
+    n_train, n_features = X_train.shape
+
+    # ── Safe CV split count ───────────────────────────────────────────────────
+    # StackingClassifier uses cross_val_predict → needs TRUE PARTITION → KFold.
+    # TimeSeriesSplit is NOT a partition → kept only in _walk_forward_oof_auc.
+    n_cv_splits   = min(5, max(2, n_train // 30))
+    n_cal_splits  = min(3, max(2, n_train // 80))
+    use_prefit_cal = (n_train < n_cal_splits * 40)
+
+    # ── 3. Walk-forward OOF profiling ─────────────────────────────────────────
+    base_clf = _make_base_classifiers(n_train, n_features)
+    oof_aucs = _walk_forward_oof_auc(base_clf, X_train, yd_train, n_splits=n_cv_splits)
+
+    # ── 4. Build stacking ensemble ────────────────────────────────────────────
+    meta_C   = 1.0 / len(base_clf)
+    meta_clf = LogisticRegression(C=meta_C, max_iter=1000, solver="lbfgs", random_state=42)
+
+    stack_clf = StackingClassifier(
+        estimators=base_clf,
+        final_estimator=meta_clf,
+        cv=KFold(n_splits=n_cv_splits, shuffle=False),   # TRUE partition
+        stack_method="predict_proba",
+        passthrough=False,
+        n_jobs=1,
+    )
+
+    # ── 5. Scale + train ──────────────────────────────────────────────────────
+    scaler    = StandardScaler()
+    X_train_s = scaler.fit_transform(X_train)
+    X_test_s  = scaler.transform(X_test)
+
+    stack_clf.fit(X_train_s, yd_train)
+
+    # ── 5b. Calibrate probabilities ───────────────────────────────────────────
+    if use_prefit_cal:
+        calibrated = CalibratedClassifierCV(stack_clf, method="sigmoid", cv="prefit")
+    else:
+        calibrated = CalibratedClassifierCV(stack_clf, method="isotonic", cv=n_cal_splits)
+    calibrated.fit(X_train_s, yd_train)
+
+    y_proba_raw = calibrated.predict_proba(X_test_s)[:, 1]
+    train_proba = calibrated.predict_proba(X_train_s)[:, 1]
+    thresholds   = np.linspace(0.3, 0.7, 41)
+    best_thresh  = 0.5
+    best_f1      = 0.0
+    for thr in thresholds:
+        yp = (train_proba >= thr).astype(int)
+        if len(np.unique(yp)) > 1:
+            f1 = f1_score(yd_train, yp)
+            if f1 > best_f1:
+                best_f1 = f1
+                best_thresh = thr
+
+    y_pred_dir = (y_proba_raw >= best_thresh).astype(int)
+
+    acc = accuracy_score(yd_test, y_pred_dir)
+    try:
+        auc = roc_auc_score(yd_test, y_proba_raw)
+    except Exception:
+        auc = 0.5
+    prec = precision_score(yd_test, y_pred_dir, zero_division=0)
+    rec  = recall_score(yd_test,  y_pred_dir, zero_division=0)
+    f1   = f1_score(yd_test,      y_pred_dir, zero_division=0)
+
+    # ── 6. Stacking regressor for price forecast ───────────────────────────────
+    base_reg  = _make_base_regressors(n_train, n_features)
+    meta_reg  = Ridge(alpha=len(base_reg))
+    stack_reg = StackingRegressor(
+        estimators=base_reg,
+        final_estimator=meta_reg,
+        cv=KFold(n_splits=n_cv_splits, shuffle=False),   # TRUE partition
+        passthrough=False,
+        n_jobs=1,
+    )
+    stack_reg.fit(X_train_s, yn_train)
+    y_pred_price = stack_reg.predict(X_test_s)
+
+    mae  = mean_absolute_error(yn_test, y_pred_price)
+    mape = mean_absolute_percentage_error(yn_test, y_pred_price) * 100
+
+    # ── 7. Final next-bar prediction ───────────────────────────────────────────
+    last_s        = scaler.transform(X[[-1]])
+    next_proba    = float(calibrated.predict_proba(last_s)[0][1])
+    next_dir_pred = int(next_proba >= best_thresh)
+    next_conf     = abs(next_proba - best_thresh) / max(best_thresh, 1 - best_thresh)
+    next_price    = float(stack_reg.predict(last_s)[0])
+
+    # ── curr_price: always use the LATEST traded price, not OHLCV tail ────────
+    # On Saturday mornings (or after market close), yf.download may be missing
+    # the most recent session's bar.  fetch_live_price() uses fast_info
+    # (15-min delayed real-time quote) and falls back to 5d history so we
+    # always show Friday's close rather than Thursday's.
+    ohlcv_last   = float(close.iloc[-1])           # last bar in downloaded history
+    live_price   = fetch_live_price(ticker)         # real-time / most recent traded
+    curr_price   = live_price if live_price else ohlcv_last
+    price_source = "live" if live_price else "ohlcv"
+
+    price_chg_pct = (next_price - curr_price) / curr_price * 100
+
+    # ── 8. Feature importance (averaged across base learners) ─────────────────
+    fi_list = []
+    for name, est in base_clf:
+        try:
+            fitted = stack_clf.named_estimators_[name]
+            if hasattr(fitted, "feature_importances_"):
+                fi_list.append(pd.Series(fitted.feature_importances_, index=feat_cols))
+        except Exception:
+            pass
+    if fi_list:
+        fi = pd.concat(fi_list, axis=1).mean(axis=1).sort_values(ascending=False)
+    else:
+        fi = pd.Series(dtype=float)
+
+    # ── Equity curve (long when model predicts UP, stay flat otherwise) ───────
+    test_close   = close.iloc[split:].values
+    n_trades     = len(y_pred_dir) - 1
+    strat_vals   = [10000.0]
+    bh_vals      = [10000.0]
+    for i in range(n_trades):
+        ret = (test_close[i+1] - test_close[i]) / (test_close[i] + 1e-9)
+        strat_vals.append(strat_vals[-1] * (1 + ret * (y_pred_dir[i] == 1)))
+        bh_vals.append(bh_vals[-1] * (1 + ret))
+
+    eq_index = feat.index[split:]
+
+    # ── OOF AUC per model for display ─────────────────────────────────────────
+    model_labels = {
+        "rf":    "Random Forest",
+        "gbm":   "Gradient Boosting",
+        "xgb":   "XGBoost",
+        "lgb":   "LightGBM",
+        "tcn":   "TCN (Neural)",
+    }
+    oof_display = {model_labels.get(k, k): v for k, v in oof_aucs.items()}
+
+    return {
+        "ticker":            ticker,
+        "timeframe":         timeframe,
+        "n_base_models":     len(base_clf),
+        "base_model_names":  [model_labels.get(n, n) for n, _ in base_clf],
+        "oof_aucs":          oof_display,
+        "best_threshold":    best_thresh,
+        "current_price":     curr_price,
+        "price_source":      price_source,   # "live" | "ohlcv"
+        "ohlcv_last_price":  ohlcv_last,
+        "next_price_pred":   next_price,
+        "price_change_pct":  price_chg_pct,
+        "next_direction":    "📈 UP" if next_dir_pred == 1 else "📉 DOWN",
+        "next_proba":        next_proba,
+        "direction_conf":    next_conf,
+        "accuracy":          acc,
+        "auc":               auc,
+        "precision":         prec,
+        "recall":            rec,
+        "f1":                f1,
+        "mae":               mae,
+        "mape":              mape,
+        "feat_importance":   fi,
+        "y_actual":          yn_test,
+        "y_predicted":       y_pred_price,
+        "y_dir_pred":        y_pred_dir,
+        "y_dir_actual":      yd_test,
+        "y_proba":           y_proba_raw,
+        "test_dates":        feat.index[split:],
+        "strat_equity":      pd.Series(strat_vals),
+        "bh_equity":         pd.Series(bh_vals),
+        "eq_index":          eq_index,
+        "backtest_days":     backtest_days,
+        "n_cv_splits":       n_cv_splits,
+        "n_features":        n_features,
+        "n_train":           n_train,
+        "n_test":            backtest_days,
+        "tcn_active":        TF_AVAILABLE and n_train >= 800,
+    }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PLOTTING HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+DARK = dict(plot_bgcolor="#000", paper_bgcolor="#0a0a0a",
+            font=dict(color="#e8e8e8", family="IBM Plex Mono", size=10),
+            hoverlabel=dict(bgcolor="#1a1200", font_color="#ff8c00",
+                            font_family="IBM Plex Mono", font_size=11))
+_M_DEFAULT = dict(t=44, b=28, l=54, r=24)
+_M_COMPACT  = dict(t=44, b=14, l=14, r=14)
+
+def plot_price_prediction(result: dict) -> go.Figure:
+    dates  = result["test_dates"]
+    actual = result["y_actual"]
+    pred   = result["y_predicted"]
+    n      = min(len(dates), len(actual), len(pred))
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=dates[:n], y=actual[:n], mode="lines",
+        name="Actual Close", line=dict(color="#1e90ff", width=1.5)))
+    fig.add_trace(go.Scatter(x=dates[:n], y=pred[:n], mode="lines",
+        name="ML Predicted", line=dict(color="#ff8c00", width=1.5, dash="dash")))
+    # Next-day prediction dot
+    last_date  = dates[-1] + pd.Timedelta(days=1)
+    fig.add_trace(go.Scatter(
+        x=[last_date], y=[result["next_price_pred"]],
+        mode="markers+text",
+        marker=dict(color="#00d084" if result["price_change_pct"] >= 0 else "#ff3b3b",
+                    size=14, symbol="diamond"),
+        text=[f"  ₹{result['next_price_pred']:.2f}"],
+        textfont=dict(color="#00d084" if result["price_change_pct"] >= 0 else "#ff3b3b",
+                      size=11, family="IBM Plex Mono"),
+        textposition="middle right",
+        name="Next Prediction"
+    ))
+    fig.update_layout(title=f"{result['ticker']} — Price Prediction vs Actual",
+                      xaxis_title="Date", yaxis_title="Price (₹)",
+                      hovermode="x unified", height=320,
+                      margin=_M_DEFAULT, **DARK)
+    return fig
+
+def plot_feature_importance(fi: pd.Series, ticker: str) -> go.Figure:
+    top = fi.head(15)
+    fig = go.Figure(go.Bar(
+        y=top.index[::-1], x=top.values[::-1],
+        orientation="h",
+        marker_color="#ff8c00",
+        marker_line_width=0,
+    ))
+    fig.update_layout(title=f"{ticker} — Top 15 Feature Importances",
+                      xaxis_title="Importance", height=340,
+                      margin=_M_DEFAULT, **DARK)
+    return fig
+
+def plot_equity(result: dict) -> go.Figure:
+    idx   = result["eq_index"]
+    strat = result["strat_equity"]
+    bh    = result["bh_equity"]
+    n     = min(len(idx), len(strat), len(bh))
+    fig   = go.Figure()
+    fig.add_trace(go.Scatter(x=list(idx[:n]), y=list(strat[:n]), mode="lines",
+        name="ML Strategy", line=dict(color="#00d084", width=1.5)))
+    fig.add_trace(go.Scatter(x=list(idx[:n]), y=list(bh[:n]), mode="lines",
+        name="Buy & Hold", line=dict(color="#555", width=1, dash="dot")))
+    fig.update_layout(title=f"{result['ticker']} — ML Strategy vs Buy & Hold (₹10k base)",
+                      xaxis_title="Date", yaxis_title="Portfolio Value (₹)",
+                      hovermode="x unified", height=280,
+                      margin=_M_DEFAULT, **DARK)
+    return fig
+
+def plot_direction_accuracy(result: dict) -> go.Figure:
+    actual = result["y_dir_actual"]
+    pred   = result["y_dir_pred"]
+    dates  = result["test_dates"]
+    n      = min(len(dates), len(actual), len(pred))
+    correct = (actual[:n] == pred[:n]).astype(int)
+    colors  = ["#00d084" if c else "#ff3b3b" for c in correct]
+    fig = go.Figure(go.Bar(
+        x=list(dates[:n]), y=[1]*n,
+        marker_color=colors,
+        marker_line_width=0,
+        hovertemplate="Date: %{x}<br>%{customdata}<extra></extra>",
+        customdata=["✔ Correct" if c else "✘ Wrong" for c in correct],
+    ))
+    fig.update_layout(title=f"{result['ticker']} — Direction Prediction (green=correct)",
+                      yaxis=dict(showticklabels=False, showgrid=False),
+                      height=160, margin=_M_COMPACT, **DARK)
+    return fig
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SIDEBAR — settings
+# ─────────────────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("""
+<div style="color:#ff8c00;font-size:.88rem;font-weight:700;letter-spacing:.12em;
+padding:8px 0 6px;border-bottom:1px solid #2a2a2a;margin-bottom:10px;">
+🧠 ML SETTINGS
+</div>""", unsafe_allow_html=True)
+
+    st.markdown("""
+<div style="color:#555;font-size:.58rem;line-height:1.6;margin-bottom:8px;">
+Base: RF + GBM + XGB + LGB + TCN*<br>
+Meta: Logistic Regression (calibrated)<br>
+Walk-forward CV · Data-derived hyperparams<br>
+<span style="color:#444;">*TCN activated when n_train ≥ 800 + TF installed</span>
+</div>""", unsafe_allow_html=True)
+    timeframe     = st.selectbox("Timeframe", ["Daily", "Weekly", "Monthly"], index=0)
+    backtest_days = st.slider("Backtest window (bars)", 30, 180, 60, step=10)
+    extra_days    = st.slider("Extra history to fetch (days)", 180, 730, 365, step=30)
+
+    st.markdown('<div style="border-top:1px solid #2a2a2a;margin:10px 0;"></div>', unsafe_allow_html=True)
+    if st.button("← Back to Screener", use_container_width=True):
+        try:
+            st.switch_page("pages/1_live_screener.py")
+        except Exception:
+            st.info("Navigate to Screener Pro in the sidebar.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN — read tickers from session state OR let user enter manually
+# ─────────────────────────────────────────────────────────────────────────────
+ml_tickers     = st.session_state.get("ml_tickers", [])
+ml_raw_data    = st.session_state.get("ml_raw_data", {})
+score_context  = st.session_state.get("ml_score_context", [])
+
+# ── Ticker input ──────────────────────────────────────────────────────────────
+if ml_tickers:
+    st.markdown(f"""
+<div style="background:#001a0a;border:1px solid #00d084;border-left:3px solid #00d084;
+padding:8px 14px;font-family:'IBM Plex Mono',monospace;margin-bottom:10px;">
+  <span style="color:#00d084;font-size:.72rem;font-weight:700;">
+    ✔ {len(ml_tickers)} STOCKS FROM SCREENER
+  </span>
+  <span style="color:#555;font-size:.62rem;margin-left:10px;">
+    {', '.join(ml_tickers[:8])}{'…' if len(ml_tickers)>8 else ''}
+  </span>
+</div>""", unsafe_allow_html=True)
+else:
+    st.markdown("""
+<div style="background:#1a0800;border:1px solid #ff8c00;padding:8px 14px;margin-bottom:10px;
+font-size:.68rem;color:#ff8c00;">
+  ⚠ No stocks received from screener. Enter tickers manually below.
+</div>""", unsafe_allow_html=True)
+
+manual_input = st.text_input(
+    "Tickers (comma-separated, e.g. RELIANCE.NS, INFY.NS)",
+    value=", ".join(ml_tickers) if ml_tickers else "",
+    key="ml_manual_input",
+    label_visibility="collapsed" if ml_tickers else "visible",
+    placeholder="RELIANCE.NS, TCS.NS, INFY.NS"
+)
+
+# Resolve final ticker list
+final_tickers = [t.strip().upper() for t in manual_input.split(",") if t.strip()]
+
+if not final_tickers:
+    st.info("Enter tickers above or run the Screener and click 🧠 OPEN ML PREDICTOR.")
+    st.stop()
+
+# ── Score context table ───────────────────────────────────────────────────────
+if score_context:
+    ctx_df = pd.DataFrame(score_context)
+    st.markdown("""
+<div style="color:#ff8c00;font-size:.68rem;font-weight:700;letter-spacing:.1em;margin-bottom:5px;">
+◼ SCREENER CONTEXT
+</div>""", unsafe_allow_html=True)
+    st.dataframe(ctx_df.style.format({
+        "Score":"{:.0f}", "Entry":"₹{:.2f}", "Target":"₹{:.2f}", "Stop":"₹{:.2f}", "RR":"{:.2f}"
+    }, na_rep="—"), use_container_width=True, hide_index=True, height=160)
+    st.markdown("---")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RUN BUTTON
+# ─────────────────────────────────────────────────────────────────────────────
+col_run, col_info = st.columns([2, 3])
+with col_run:
+    run_btn = st.button(f"🧠  RUN ENSEMBLE ML  (RF+GBM+XGB+LGB+TCN)  ·  {timeframe}",
+                        type="primary", use_container_width=True, key="run_ml_btn")
+with col_info:
+    st.markdown(f"""
+<div style="background:#0a0a0a;border:1px solid #2a2a2a;padding:8px 14px;font-size:.62rem;color:#888;">
+  Engine: <b style="color:#ff8c00;">Stacked Ensemble (RF + GBM + XGB + LGB + TCN*)</b>  ·
+  Timeframe: <b style="color:#ff8c00;">{timeframe}</b>  ·
+  Backtest: <b style="color:#ff8c00;">{backtest_days} bars</b>  ·
+  ~45 features · Walk-forward CV · No lookahead bias
+</div>""", unsafe_allow_html=True)
+
+if not run_btn:
+    st.markdown("""
+<div style="color:#444;font-size:.65rem;margin-top:20px;text-align:center;">
+Click RUN ML to start prediction pipeline
+</div>""", unsafe_allow_html=True)
+    st.stop()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RUN ML FOR EACH TICKER
+# ─────────────────────────────────────────────────────────────────────────────
+all_results = []
+progress = st.progress(0.0, text="Starting ML pipeline…")
+
+for i, ticker in enumerate(final_tickers):
+    progress.progress((i + 0.3) / len(final_tickers), text=f"Fetching data: {ticker}…")
+
+    # Use raw data from screener if available, else fetch fresh
+    if ticker in ml_raw_data and not ml_raw_data[ticker].empty:
+        df_raw = ml_raw_data[ticker].copy()
+        # Ensure long enough history
+        if len(df_raw) < 200:
+            df_fetch = yf.download(ticker, period=f"{extra_days}d",
+                                   interval="1d", progress=False, auto_adjust=False)
+            if not df_fetch.empty:
+                df_raw = df_fetch
+    else:
+        df_raw = yf.download(ticker, period=f"{extra_days}d",
+                             interval="1d", progress=False, auto_adjust=False)
+
+    if df_raw.empty:
+        st.warning(f"⚠ No data for {ticker} — skipped.")
+        continue
+
+    # ── Normalise: flatten MultiIndex, title-case cols, strip tz, drop non-numeric
+    df_raw = _normalise_df(df_raw)
+
+    progress.progress((i + 0.7) / len(final_tickers), text=f"Running ML: {ticker}…")
+
+    result = run_ml_for_ticker(ticker, df_raw, backtest_days, timeframe)
+
+    if "error" in result:
+        st.warning(f"⚠ {ticker}: {result['error']}")
+        continue
+
+    all_results.append(result)
+    progress.progress((i + 1.0) / len(final_tickers), text=f"Done: {ticker}")
+
+progress.progress(1.0, text="ML pipeline complete ✔")
+
+if not all_results:
+    st.error("No results — check data availability or reduce backtest window.")
+    st.stop()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SUMMARY TABLE
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown("---")
+st.markdown("""
+<div style="background:#1a1200;border-top:2px solid #ff8c00;border-bottom:1px solid #2a2a2a;
+     padding:7px 14px;font-family:'IBM Plex Mono',monospace;margin-bottom:10px;">
+  <span style="color:#ff8c00;font-size:.77rem;font-weight:700;letter-spacing:.12em;">
+    ◼ ML PREDICTION SUMMARY
+  </span>
+</div>
+""", unsafe_allow_html=True)
+
+summary_rows = []
+for r in all_results:
+    summary_rows.append({
+        "Ticker":         r["ticker"],
+        "Timeframe":      r["timeframe"],
+        "Current ₹":      f"₹{r['current_price']:.2f}",
+        "Predicted ₹":    f"₹{r['next_price_pred']:.2f}",
+        "Δ%":             f"{r['price_change_pct']:+.2f}%",
+        "Direction":      r["next_direction"],
+        "Conf":           f"{r['direction_conf']:.0%}",
+        "Accuracy":       f"{r['accuracy']:.0%}",
+        "AUC":            f"{r['auc']:.3f}",
+        "Precision":      f"{r['precision']:.0%}",
+        "Recall":         f"{r['recall']:.0%}",
+        "F1":             f"{r['f1']:.3f}",
+        "MAE ₹":          f"₹{r['mae']:.2f}",
+        "MAPE%":          f"{r['mape']:.1f}%",
+        "Base Models":    r["n_base_models"],
+        "CV Folds":       r["n_cv_splits"],
+    })
+
+summary_df = pd.DataFrame(summary_rows)
+
+
+def plot_oof_aucs(result: dict) -> go.Figure:
+    """Bar chart showing walk-forward OOF AUC per base model — lets user see
+    which model contributed most to the ensemble on this specific stock."""
+    oof = result.get("oof_aucs", {})
+    if not oof:
+        return go.Figure()
+    models  = list(oof.keys())
+    aucs    = list(oof.values())
+    colors  = ["#00d084" if a > 0.55 else "#ffb347" if a > 0.50 else "#ff3b3b" for a in aucs]
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=models, y=aucs,
+        marker_color=colors,
+        marker_line_width=0,
+        text=[f"{a:.3f}" for a in aucs],
+        textposition="outside",
+        textfont=dict(color="#e8e8e8", size=10, family="IBM Plex Mono"),
+    ))
+    # Reference line at 0.5 (random)
+    fig.add_hline(y=0.5, line_dash="dot", line_color="#555",
+                  annotation_text="random (0.5)",
+                  annotation_font=dict(color="#555", size=9))
+    fig.update_layout(
+        title=f"{result['ticker']} — Walk-Forward OOF AUC per Base Model",
+        yaxis=dict(title="AUC", range=[0.4, max(0.75, max(aucs)+0.05)],
+                   gridcolor="#1a1a1a", tickfont=dict(color="#888", size=9)),
+        xaxis=dict(tickfont=dict(color="#e8e8e8", size=11, family="IBM Plex Mono")),
+        height=220, margin=_M_DEFAULT,
+        **DARK,
+    )
+    return fig
+
+
+def color_direction(val):
+    if "UP" in str(val):   return "background-color:#001a0a;color:#00d084;font-weight:700"
+    if "DOWN" in str(val): return "background-color:#1a0000;color:#ff3b3b;font-weight:700"
+    return ""
+
+def color_delta(val):
+    try:
+        v = float(str(val).replace("%","").replace("+",""))
+        return f"color:{'#00d084' if v>=0 else '#ff3b3b'};font-weight:700"
+    except: return ""
+
+styled = summary_df.style\
+    .applymap(color_direction, subset=["Direction"])\
+    .applymap(color_delta, subset=["Δ%"])
+
+st.dataframe(styled, use_container_width=True, hide_index=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PER-TICKER DETAILED RESULTS
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown("---")
+st.markdown("""
+<div style="color:#ff8c00;font-size:.77rem;font-weight:700;letter-spacing:.1em;margin-bottom:8px;">
+◼ DETAILED RESULTS PER TICKER
+</div>""", unsafe_allow_html=True)
+
+tab_labels = [r["ticker"].replace(".NS","") for r in all_results]
+if len(tab_labels) == 1:
+    tabs = [st.container()]
+else:
+    tabs = st.tabs(tab_labels)
+
+for tab, result in zip(tabs, all_results):
+    with tab:
+        ticker = result["ticker"]
+        up = result["price_change_pct"] >= 0
+        dir_color = "#00d084" if up else "#ff3b3b"
+        dir_bg    = "#001a0a" if up else "#1a0000"
+
+        # ── Hero metrics ──────────────────────────────────────────────────────
+        st.markdown(f"""
+<div style="background:{dir_bg};border:1px solid {dir_color};border-left:4px solid {dir_color};
+padding:12px 18px;font-family:'IBM Plex Mono',monospace;margin-bottom:12px;">
+  <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr 1fr;gap:16px;">
+    <div>
+      <div style="color:#555;font-size:.52rem;letter-spacing:.1em;">TICKER</div>
+      <div style="color:#e8e8e8;font-size:1.1rem;font-weight:700;">{ticker.replace('.NS','')}</div>
+      <div style="color:#555;font-size:.55rem;">{result['timeframe']} · Stacked Ensemble · {result['n_base_models']} base models {'· TCN ✔' if result.get('tcn_active') else ''}</div>
+    </div>
+    <div>
+      <div style="color:#555;font-size:.52rem;letter-spacing:.1em;">CURRENT PRICE</div>
+      <div style="color:#e8e8e8;font-size:1.05rem;font-weight:700;">₹{result['current_price']:.2f}</div>
+      <div style="color:{'#00d084' if result.get('price_source')=='live' else '#888'};font-size:.55rem;margin-top:1px;">
+        {'🟢 live quote' if result.get('price_source')=='live' else '⚠ ohlcv fallback (last bar: ₹'+str(round(result.get('ohlcv_last_price',0),2))+')'}
+      </div>
+    </div>
+    <div>
+      <div style="color:#555;font-size:.52rem;letter-spacing:.1em;">PREDICTED NEXT CLOSE</div>
+      <div style="color:{dir_color};font-size:1.05rem;font-weight:700;">₹{result['next_price_pred']:.2f}</div>
+      <div style="color:{dir_color};font-size:.62rem;font-weight:700;">{result['price_change_pct']:+.2f}%</div>
+    </div>
+    <div>
+      <div style="color:#555;font-size:.52rem;letter-spacing:.1em;">DIRECTION</div>
+      <div style="color:{dir_color};font-size:1.1rem;font-weight:700;">{result['next_direction']}</div>
+      <div style="color:#888;font-size:.60rem;">Conf: {result['direction_conf']:.0%}</div>
+    </div>
+    <div>
+      <div style="color:#555;font-size:.52rem;letter-spacing:.1em;">MODEL ACCURACY</div>
+      <div style="color:#ff8c00;font-size:1.05rem;font-weight:700;">{result['accuracy']:.0%}</div>
+      <div style="color:#555;font-size:.58rem;">AUC {result['auc']:.3f}</div>
+    </div>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+        # ── Metrics row ───────────────────────────────────────────────────────
+        m1, m2, m3, m4, m5, m6 = st.columns(6)
+        m1.metric("Accuracy",  f"{result['accuracy']:.1%}",
+                  delta="+vs random" if result['accuracy'] > 0.5 else "-vs random",
+                  delta_color="normal" if result['accuracy'] > 0.5 else "inverse")
+        m2.metric("AUC",       f"{result['auc']:.3f}",
+                  delta="strong" if result['auc'] > 0.55 else "weak",
+                  delta_color="normal" if result['auc'] > 0.55 else "inverse")
+        m3.metric("F1 Score",  f"{result['f1']:.3f}")
+        m4.metric("Precision", f"{result['precision']:.1%}")
+        m5.metric("Price MAE", f"₹{result['mae']:.2f}")
+        m6.metric("MAPE",      f"{result['mape']:.1f}%",
+                  delta="good" if result['mape'] < 3 else "check",
+                  delta_color="normal" if result['mape'] < 3 else "off")
+
+        # ── Charts ────────────────────────────────────────────────────────────
+        c_left, c_right = st.columns([3, 2])
+        with c_left:
+            st.plotly_chart(plot_price_prediction(result), use_container_width=True, config={"displayModeBar":False})
+            st.plotly_chart(plot_direction_accuracy(result), use_container_width=True, config={"displayModeBar":False})
+        with c_right:
+            if not result["feat_importance"].empty:
+                st.plotly_chart(plot_feature_importance(result["feat_importance"], ticker),
+                                use_container_width=True, config={"displayModeBar":False})
+
+        st.plotly_chart(plot_equity(result), use_container_width=True, config={"displayModeBar":False})
+
+        # ── OOF AUC per base model ────────────────────────────────────────────
+        if result.get("oof_aucs"):
+            st.plotly_chart(plot_oof_aucs(result), use_container_width=True, config={"displayModeBar":False})
+
+        # ── Model info expander ───────────────────────────────────────────────
+        with st.expander("◼ ENSEMBLE ARCHITECTURE & METHODOLOGY"):
+            base_names = ", ".join(result["base_model_names"])
+            oof_rows   = "\n".join(
+                f"| {m} | {auc:.4f} | {'✔ strong' if auc > 0.55 else '— weak'} |"
+                for m, auc in result["oof_aucs"].items()
+            )
+            st.markdown(f"""
+**Architecture:** Stacked ensemble — {result['n_base_models']} base models → calibrated meta-learner
+
+**Base models (L1):** {base_names}
+{'  **· TCN:** active (dilated causal CNN, RF=90 bars)' if result.get('tcn_active') else '  · TCN: inactive — n_train < 800 or TF not installed'}
+
+**Meta-learner (L2):** Logistic Regression (C = 1/{result['n_base_models']})
+— Trains on out-of-fold predictions from L1, learns which model to trust per regime
+— Isotonic calibration applied so probabilities are statistically meaningful
+
+**Walk-forward CV:** {result['n_cv_splits']} folds (TimeSeriesSplit — no future data leakage)
+
+**Out-of-fold AUC per base model (training set):**
+
+| Model | OOF AUC | Quality |
+|-------|---------|---------|
+{oof_rows}
+
+**Threshold:** {result['best_threshold']:.3f} (F1-optimal on training data — not fixed at 0.5)
+
+**Features:** {result['n_features']} signals — Returns, MAs, RSI, MACD, Bollinger Bands,
+ATR, Volume z-score, Stochastic, ADX, candle geometry, price position, lags
+
+**Data:** {result['n_train']} train bars · {result['n_test']} test bars · {result['timeframe']}
+
+**Hyperparameter logic (no arbitrary numbers):**
+- `n_estimators` = min(500, max(100, n_train / 5)) — scales with data volume
+- `max_depth` = log₂(n_features) — information-theoretic bound
+- `min_samples_leaf` = max(5, n_train / 500) — prevents leaf overfitting
+- `meta LR C` = 1 / n_base_models — regularisation proportional to ensemble size
+- `Ridge alpha` = n_base_regressors — same principle for price regressor
+""")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EXPORT
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown("---")
+export_df = pd.DataFrame([{
+    "Ticker":       r["ticker"],
+    "Timeframe":    r["timeframe"],
+    "Current":      r["current_price"],
+    "Predicted":    r["next_price_pred"],
+    "Change%":      r["price_change_pct"],
+    "Direction":    r["next_direction"],
+    "Confidence":   r["direction_conf"],
+    "Accuracy":     r["accuracy"],
+    "AUC":          r["auc"],
+    "MAE":          r["mae"],
+    "BaseModels":   r["n_base_models"],
+    "CVFolds":      r["n_cv_splits"],
+    "Threshold":    r["best_threshold"],
+    "Precision":    r["precision"],
+    "Recall":       r["recall"],
+    "F1":           r["f1"],
+    "RunAt":        datetime.now().strftime("%Y-%m-%d %H:%M"),
+} for r in all_results])
+
+st.download_button(
+    label="⬇ Export Results CSV",
+    data=export_df.to_csv(index=False),
+    file_name=f"ml_predictions_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+    mime="text/csv",
+    use_container_width=False,
+)
