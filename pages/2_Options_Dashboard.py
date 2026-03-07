@@ -157,39 +157,61 @@ input[type="number"], input[type="text"], input[type="password"] {
 
 /* ── Expanders ── */
 [data-testid="stExpander"] { background: var(--bb-surface) !important; border: 1px solid var(--bb-border) !important; border-radius: 0 !important; }
-[data-testid="stExpander"] summary { color: var(--bb-amber2) !important; font-size: .66rem !important; letter-spacing: .08em !important; font-family: 'IBM Plex Mono', monospace !important; }
-[data-testid="stExpander"] summary:hover { color: var(--bb-amber) !important; background: #1a1400 !important; }
-[data-testid="stExpander"] svg { fill: var(--bb-amber2) !important; stroke: var(--bb-amber2) !important; }
 [data-testid="stExpanderDetails"] { background: var(--bb-bg) !important; border-top: 1px solid var(--bb-border) !important; }
+
+/* ── EXPANDER ARROW OVERLAP FIX ──
+   Streamlit renders a Material Icons <span> with the ligature text "keyboard_arrow_down"
+   which bleeds into the label. Kill it via font-size:0 + display:none on every possible
+   selector, while keeping the label <p> fully visible.                                  */
+[data-testid="stExpander"] summary,
+[data-testid="stExpander"] details > summary {
+    display: flex !important; align-items: center !important;
+    padding: 8px 12px !important; list-style: none !important;
+    cursor: pointer !important; overflow: hidden !important;
+}
+[data-testid="stExpander"] summary::-webkit-details-marker,
+[data-testid="stExpander"] summary::marker { display: none !important; }
+/* Zero-out the Material Icons span (the arrow ligature text) */
+[data-testid="stExpander"] summary span,
+[data-testid="stExpander"] summary > div > span,
+[data-testid="stExpander"] summary .material-icons,
+[data-testid="stExpander"] summary [class*="material"],
+[data-testid="stExpander"] summary [data-testid="StyledFullScreenButton"] {
+    font-size: 0 !important; width: 0 !important; height: 0 !important;
+    overflow: hidden !important; visibility: hidden !important; display: none !important;
+}
+/* Keep the actual label paragraph readable */
+[data-testid="stExpander"] summary p,
+[data-testid="stExpander"] summary > div > p {
+    font-size: 0.64rem !important; color: var(--bb-amber2) !important;
+    font-family: 'IBM Plex Mono', monospace !important; letter-spacing: 0.08em !important;
+    text-transform: uppercase !important; visibility: visible !important;
+    display: block !important; margin: 0 !important; overflow: visible !important;
+}
+[data-testid="stExpander"] summary:hover p { color: var(--bb-amber) !important; }
+/* Hide SVG chevrons */
+[data-testid="stExpander"] summary svg {
+    display: none !important; visibility: hidden !important; width: 0 !important; height: 0 !important;
+}
 
 /* ── Divider ── */
 hr, [data-testid="stDivider"] { border-color: var(--bb-border) !important; margin: 8px 0 !important; }
 [data-testid="stDivider"] hr { border-top: 1px solid var(--bb-border) !important; }
-
-/* ── Spinner / info / warning ── */
+/* ── Alerts ── */
 [data-testid="stAlert"] { background: var(--bb-surface) !important; border: 1px solid var(--bb-border) !important; color: var(--bb-white) !important; border-radius: 0 !important; font-size: .7rem !important; }
 [data-testid="stAlert"] p { color: var(--bb-white) !important; }
 .stInfo { border-left: 3px solid var(--bb-blue) !important; }
 .stWarning { border-left: 3px solid var(--bb-amber) !important; }
 .stError { border-left: 3px solid var(--bb-red) !important; }
 .stSuccess { border-left: 3px solid var(--bb-green) !important; }
-
-/* ── Spinner text ── */
 [data-testid="stSpinner"] p, .stSpinner p { color: var(--bb-amber) !important; }
-
 /* ── Scrollbars ── */
 ::-webkit-scrollbar { width: 4px; height: 4px; }
 ::-webkit-scrollbar-track { background: var(--bb-bg); }
 ::-webkit-scrollbar-thumb { background: var(--bb-border); }
 ::-webkit-scrollbar-thumb:hover { background: var(--bb-amber); }
-
 /* ── Hide Streamlit branding ── */
 #MainMenu, footer, [data-testid="stToolbar"], [data-testid="stDecoration"] { display: none !important; }
-
-/* ── Expander arrow overlap fix (from previous session) ── */
-[data-testid="stExpander"] summary svg,
-[data-testid="stExpander"] summary span[data-testid="StyledFullScreenButton"],
-[data-testid="stExpander"] summary > div > svg { display: none !important; visibility: hidden !important; width: 0 !important; font-size: 0 !important; }
 </style>
 """, unsafe_allow_html=True)
 
