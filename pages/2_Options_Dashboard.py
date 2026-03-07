@@ -212,6 +212,11 @@ hr, [data-testid="stDivider"] { border-color: var(--bb-border) !important; margi
 ::-webkit-scrollbar-thumb:hover { background: var(--bb-amber); }
 /* ── Hide Streamlit branding ── */
 #MainMenu, footer, [data-testid="stToolbar"], [data-testid="stDecoration"] { display: none !important; }
+/* ── PRICE DELTA COLORS ── */
+[data-testid="stMetricDeltaIcon-Up"] { color: var(--bb-green) !important; }
+[data-testid="stMetricDeltaIcon-Down"] { color: var(--bb-red) !important; }
+[data-testid="stMetricDelta"]:has([data-testid="stMetricDeltaIcon-Up"]) { color: var(--bb-green) !important; }
+[data-testid="stMetricDelta"]:has([data-testid="stMetricDeltaIcon-Down"]) { color: var(--bb-red) !important; }
 </style>
 """, unsafe_allow_html=True)
 
