@@ -59,7 +59,14 @@ h1{color:var(--a)!important;font-size:1.05rem!important;font-weight:700!importan
 hr{border-color:#1e1e1e!important;margin:10px 0!important;}
 .streamlit-expanderHeader,[data-testid="stExpander"] summary{background:var(--s)!important;color:var(--a)!important;
   font-family:var(--mo)!important;font-size:.68rem!important;font-weight:600!important;
-  letter-spacing:.1em!important;text-transform:uppercase!important;border-radius:0!important;border:1px solid var(--b)!important;}
+  letter-spacing:.1em!important;text-transform:uppercase!important;border-radius:0!important;
+  border:1px solid var(--b)!important;list-style:none!important;}
+[data-testid="stExpander"] summary{list-style:none!important;-webkit-appearance:none!important;}
+[data-testid="stExpander"] summary::-webkit-details-marker{display:none!important;}
+[data-testid="stExpander"] summary::marker{display:none!important;content:""!important;}
+[data-testid="stExpander"] summary svg{display:none!important;width:0!important;height:0!important;}
+[data-testid="stExpander"] summary p{display:inline!important;}
+[data-testid="stExpander"] summary::before{content:"▸  ";color:var(--a)!important;font-size:.68rem;}
 ::-webkit-scrollbar{width:4px;height:4px;}
 ::-webkit-scrollbar-track{background:var(--bg);}
 ::-webkit-scrollbar-thumb{background:#333;}
@@ -159,15 +166,22 @@ def _days(end_str: str) -> float:
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return max(0.0, (dt - datetime.now(timezone.utc)).total_seconds() / 86400)
+        raw = (dt - datetime.now(timezone.utc)).total_seconds() / 86400
+        # Floor at 1.0 — sub-day precision causes annualised overflow and is not useful
+        return max(1.0, raw) if raw > 0 else float("inf")
     except Exception:
         return float("inf")
 
 
 def _ann(net: float, days: float):
-    if days <= 0 or days == float("inf") or days > 3650 or net <= 0:
+    if not net or not days:
         return None
-    return ((1 + net) ** (365 / days) - 1) * 100
+    if days < 1 or days == float("inf") or days > 3650 or net <= 0:
+        return None
+    try:
+        return min(((1 + net) ** (365.0 / days) - 1) * 100, 100_000.0)
+    except (OverflowError, ZeroDivisionError):
+        return None
 
 
 def _vwap(asks: list, target_dollars: float):
@@ -917,7 +931,7 @@ if not display:
 
 tabs = st.tabs([f"{r['strategy'].split()[0]} #{i+1}" for i, r in enumerate(display)])
 
-for tab, r in zip(tabs, display):
+for _ti, (tab, r) in enumerate(zip(tabs, display)):
     with tab:
         strat   = r["strategy"]
         col_ac  = STRAT_COLORS.get(strat, "#ff8c00")
@@ -999,19 +1013,24 @@ padding:16px 20px;font-family:'IBM Plex Mono',monospace;margin-bottom:16px;">
         # 3 charts
         c1, c2, c3 = st.columns(3)
         with c1:
-            st.plotly_chart(chart_payoff(r, lot_size), use_container_width=True, config={"displayModeBar": False})
+            st.plotly_chart(chart_payoff(r, lot_size), use_container_width=True,
+                            config={"displayModeBar": False}, key=f"payoff_{_ti}")
         with c2:
             if r.get("history"):
-                st.plotly_chart(chart_history(r["history"], r), use_container_width=True, config={"displayModeBar": False})
+                st.plotly_chart(chart_history(r["history"], r), use_container_width=True,
+                                config={"displayModeBar": False}, key=f"hist_{_ti}")
             elif r.get("signals"):
-                st.plotly_chart(chart_radar(r["signals"]), use_container_width=True, config={"displayModeBar": False})
+                st.plotly_chart(chart_radar(r["signals"]), use_container_width=True,
+                                config={"displayModeBar": False}, key=f"radar_{_ti}")
             else:
-                st.plotly_chart(chart_annualised(r), use_container_width=True, config={"displayModeBar": False})
+                st.plotly_chart(chart_annualised(r), use_container_width=True,
+                                config={"displayModeBar": False}, key=f"ann_{_ti}")
         with c3:
-            st.plotly_chart(chart_size(r, lot_size), use_container_width=True, config={"displayModeBar": False})
+            st.plotly_chart(chart_size(r, lot_size), use_container_width=True,
+                            config={"displayModeBar": False}, key=f"size_{_ti}")
 
         # Full stats
-        with st.expander("▸ FULL STATISTICS"):
+        with st.expander("FULL STATISTICS"):
             ec1, ec2 = st.columns(2)
             with ec1:
                 rows_c = [("Strategy", strat), ("Risk", r["risk"]),
