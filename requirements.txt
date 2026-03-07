@@ -46,4 +46,9 @@ scikit-learn
 xgboost
 lightgbm
 catboost
+streamlit-autorefresh==1.0.1
 optuna
+feedparser
+python-dateutil
+pytz
+
