@@ -87,10 +87,10 @@ p, span, div, label, li, caption,
 [data-testid="stMarkdownContainer"] p,
 [data-testid="stMarkdownContainer"] span,
 [data-testid="stMarkdownContainer"] li {
-    color: var(--bb-white2) !important;
+    color: var(--bb-white2);
     font-family: var(--bb-mono) !important;
-    font-size: 0.92rem !important;
 }
+[data-testid="stMarkdownContainer"] > div { color: var(--bb-white2) !important; }
 
 /* ── SIDEBAR ── */
 [data-testid="stSidebar"], [data-testid="stSidebar"] > div {
@@ -102,21 +102,21 @@ p, span, div, label, li, caption,
 [data-testid="stSidebar"] label,
 [data-testid="stSidebar"] div {
     color: var(--bb-muted) !important;
-    font-size: 0.88rem !important;
+    font-size: 0.67rem !important;
     letter-spacing: 0.05em !important;
 }
 
 /* ── HEADERS ── */
-h1 { color: var(--bb-amber) !important; font-size: 1.25rem !important;
+h1 { color: var(--bb-amber) !important; font-size: 1.05rem !important;
      font-weight: 700 !important; letter-spacing: 0.18em !important;
      text-transform: uppercase !important;
      border-bottom: 2px solid var(--bb-amber) !important;
      padding-bottom: 6px !important; margin-bottom: 12px !important; }
-h2 { color: var(--bb-amber2) !important; font-size: 1.02rem !important;
+h2 { color: var(--bb-amber2) !important; font-size: 0.85rem !important;
      font-weight: 600 !important; letter-spacing: 0.12em !important;
      text-transform: uppercase !important;
      border-bottom: 1px solid #2a2a2a !important; padding-bottom: 4px !important; }
-h3 { color: var(--bb-white) !important; font-size: 0.92rem !important;
+h3 { color: var(--bb-white) !important; font-size: 0.78rem !important;
      font-weight: 600 !important; letter-spacing: 0.1em !important;
      text-transform: uppercase !important; }
 h4, h5, h6 { color: var(--bb-muted) !important; font-size: 0.70rem !important;
@@ -135,9 +135,9 @@ h4, h5, h6 { color: var(--bb-muted) !important; font-size: 0.70rem !important;
     letter-spacing: 0.12em !important; text-transform: uppercase !important;
 }
 [data-testid="stMetricValue"] {
-    color: var(--bb-amber) !important; font-size: 1.35rem !important; font-weight: 700 !important;
+    color: var(--bb-amber) !important; font-size: 1.05rem !important; font-weight: 700 !important;
 }
-[data-testid="stMetricDelta"] { font-size: 0.82rem !important; }
+[data-testid="stMetricDelta"] { font-size: 0.62rem !important; }
 
 /* ── DATAFRAME — full Bloomberg terminal ── */
 [data-testid="stDataFrame"] {
@@ -149,7 +149,7 @@ h4, h5, h6 { color: var(--bb-muted) !important; font-size: 0.70rem !important;
     background-color: #1a1200 !important;
     color: var(--bb-amber) !important;
     font-family: var(--bb-mono) !important;
-    font-size: 0.78rem !important; font-weight: 700 !important;
+    font-size: 0.60rem !important; font-weight: 700 !important;
     letter-spacing: 0.14em !important; text-transform: uppercase !important;
     border-bottom: 2px solid var(--bb-amber) !important;
     border-right: 1px solid #2a2a2a !important;
@@ -161,7 +161,7 @@ h4, h5, h6 { color: var(--bb-muted) !important; font-size: 0.70rem !important;
     background-color: #0d0d0d !important;
     color: var(--bb-white) !important;
     font-family: var(--bb-mono) !important;
-    font-size: 0.88rem !important;
+    font-size: 0.68rem !important;
     border-bottom: 1px solid #1a1a1a !important;
     border-right: 1px solid #1a1a1a !important;
     padding: 4px 10px !important; white-space: nowrap !important;
@@ -178,7 +178,7 @@ h4, h5, h6 { color: var(--bb-muted) !important; font-size: 0.70rem !important;
 .stButton > button {
     background: #140e00 !important; color: var(--bb-amber) !important;
     border: 1px solid var(--bb-amber) !important; border-radius: 0 !important;
-    font-family: var(--bb-mono) !important; font-size: 0.88rem !important;
+    font-family: var(--bb-mono) !important; font-size: 0.70rem !important;
     font-weight: 600 !important; letter-spacing: 0.1em !important;
     text-transform: uppercase !important; padding: 6px 18px !important;
 }
@@ -239,56 +239,32 @@ hr { border-color: #1e1e1e !important; margin: 10px 0 !important; }
     letter-spacing: 0.06em !important;
 }
 
-/* ── EXPANDER — complete fix for keyboard_arrow_right text overlap ── */
-.streamlit-expanderHeader,
-[data-testid="stExpander"] summary {
-    background: var(--bb-surface) !important;
-    color: var(--bb-amber) !important;
-    font-family: var(--bb-mono) !important;
-    font-size: 0.92rem !important;
-    font-weight: 600 !important;
-    letter-spacing: 0.1em !important;
-    text-transform: uppercase !important;
-    border-radius: 0 !important;
+/* ── EXPANDER ── */
+.streamlit-expanderHeader, [data-testid="stExpander"] summary {
+    background: var(--bb-surface) !important; color: var(--bb-amber) !important;
+    font-family: var(--bb-mono) !important; font-size: 0.92rem !important;
+    font-weight: 600 !important; letter-spacing: 0.1em !important;
+    text-transform: uppercase !important; border-radius: 0 !important;
     border: 1px solid var(--bb-border) !important;
-    padding: 8px 12px !important;
-    list-style: none !important;
-    cursor: pointer !important;
 }
-/* Nuclear: hide EVERY form of the toggle icon including keyboard_arrow_right text */
+/* Kill every possible form of the Streamlit expander arrow icon:
+   - SVG element (newer Streamlit)
+   - Material Icons <span> that renders "keyboard_arrow_right" / "keyboard_arrow_down"
+   - Any <span> inside summary that uses icon fonts */
 [data-testid="stExpander"] summary svg,
 [data-testid="stExpander"] summary .material-icons,
-[data-testid="stExpander"] summary [data-testid="stExpanderToggleIcon"],
-[data-testid="stExpander"] summary [data-testid="stExpanderToggleIcon"] *,
+[data-testid="stExpander"] summary span[data-testid="stExpanderToggleIcon"],
 [data-testid="stExpander"] summary > div > span:first-child,
-[data-testid="stExpander"] summary > span:first-child,
-[data-testid="stExpander"] summary span[class*="icon"],
-[data-testid="stExpander"] summary span[data-testid] {
+[data-testid="stExpander"] summary > span:first-child {
     display: none !important;
     visibility: hidden !important;
     width: 0 !important;
-    height: 0 !important;
-    max-width: 0 !important;
-    max-height: 0 !important;
     overflow: hidden !important;
     font-size: 0 !important;
     color: transparent !important;
-    opacity: 0 !important;
-    position: absolute !important;
-    pointer-events: none !important;
 }
-[data-testid="stExpander"] summary::-webkit-details-marker,
-[data-testid="stExpander"] summary::marker { display: none !important; content: "" !important; }
-[data-testid="stExpander"] summary::before,
-[data-testid="stExpander"] summary::after { display: none !important; content: "" !important; }
 [data-testid="stExpander"] {
-    border: 1px solid var(--bb-border) !important;
-    border-radius: 0 !important;
-    background: var(--bb-surface) !important;
-}
-[data-testid="stExpanderDetails"] {
-    background: var(--bb-bg) !important;
-    border-top: 1px solid var(--bb-border) !important;
+    border: 1px solid var(--bb-border) !important; border-radius: 0 !important;
 }
 [data-testid="stExpander"] [data-testid="stMarkdownContainer"] p,
 [data-testid="stExpander"] [data-testid="stMarkdownContainer"] li,
@@ -327,11 +303,91 @@ hr { border-color: #1e1e1e !important; margin: 10px 0 !important; }
 ::-webkit-scrollbar-thumb { background: #333; border-radius: 0; }
 ::-webkit-scrollbar-thumb:hover { background: var(--bb-amber); }
 
-/* ── PRICE DELTA COLORS ── */
-[data-testid="stMetricDeltaIcon-Up"] { color: var(--bb-green) !important; }
-[data-testid="stMetricDeltaIcon-Down"] { color: var(--bb-red) !important; }
-[data-testid="stMetricDelta"]:has([data-testid="stMetricDeltaIcon-Up"]) { color: var(--bb-green) !important; }
-[data-testid="stMetricDelta"]:has([data-testid="stMetricDeltaIcon-Down"]) { color: var(--bb-red) !important; }
+/* ══════════════════════════════════════════════════════════════
+   FIX 1 — KILL keyboard_double_arrow / keyboard_arrow_right
+   These are Streamlit sidebar nav icons rendered by Material Icons font.
+   Target every possible selector across all Streamlit versions.
+   ══════════════════════════════════════════════════════════════ */
+
+/* Sidebar page-nav icon spans (the ones showing "keyboard_double_a..." text) */
+[data-testid="stSidebarNavLink"] span[data-testid="stIconMaterial"],
+[data-testid="stSidebarNavLink"] span.material-icons,
+[data-testid="stSidebarNavLink"] span[class*="icon"],
+[data-testid="stSidebarNavLink"] svg,
+[data-testid="stNavLink"] span[data-testid="stIconMaterial"],
+[data-testid="stNavLink"] span.material-icons,
+[data-testid="stNavLink"] svg,
+/* Expander toggle icons */
+[data-testid="stExpander"] summary [data-testid="stExpanderToggleIcon"],
+[data-testid="stExpander"] summary [data-testid="stExpanderToggleIcon"] *,
+[data-testid="stExpander"] summary svg,
+[data-testid="stExpander"] summary .material-icons,
+[data-testid="stExpander"] summary > div > span:first-child,
+[data-testid="stExpander"] summary > span:first-child,
+[data-testid="stExpander"] summary span[data-testid],
+/* ANY span/element using Material Icons font anywhere in sidebar */
+[data-testid="stSidebar"] span[data-testid="stIconMaterial"],
+[data-testid="stSidebar"] .material-icons,
+.streamlit-expanderHeader span[class*="arrow"],
+.streamlit-expanderHeader svg {
+    display: none !important;
+    visibility: hidden !important;
+    width: 0 !important;
+    height: 0 !important;
+    max-width: 0 !important;
+    max-height: 0 !important;
+    overflow: hidden !important;
+    font-size: 0 !important;
+    color: transparent !important;
+    opacity: 0 !important;
+    position: absolute !important;
+    pointer-events: none !important;
+}
+[data-testid="stExpander"] summary::-webkit-details-marker,
+[data-testid="stExpander"] summary::marker { display: none !important; content: "" !important; }
+[data-testid="stExpander"] summary::before,
+[data-testid="stExpander"] summary::after  { display: none !important; content: "" !important; }
+
+/* Also hide the text label that appears before the icon in the nav */
+[data-testid="stSidebarNavLink"] [data-testid="stIconMaterial"]::before,
+[data-testid="stSidebarNavLink"] [data-testid="stIconMaterial"]::after,
+/* Kill material icon font rendering as text */
+@font-face rules won't help - target the element using the font */
+[data-testid="stSidebar"] [style*="material"] {
+    font-size: 0 !important;
+    color: transparent !important;
+}
+
+/* ══════════════════════════════════════════════════════════════
+   FIX 2 — PRICE/CHANGE COLORS  (green positive · red negative)
+   The global "color: !important" catch-all was overriding inline
+   style="color:#00d084" attributes. Fixed by:
+   a) Removing !important from the catch-all color rule
+   b) Adding explicit high-specificity green/red rules
+   ══════════════════════════════════════════════════════════════ */
+
+/* Metric delta colors */
+[data-testid="stMetricDeltaIcon-Up"],
+[data-testid="stMetricDelta"]:has([data-testid="stMetricDeltaIcon-Up"]),
+[data-testid="stMetricDelta"]:has([data-testid="stMetricDeltaIcon-Up"]) * {
+    color: #00d084 !important;
+}
+[data-testid="stMetricDeltaIcon-Down"],
+[data-testid="stMetricDelta"]:has([data-testid="stMetricDeltaIcon-Down"]),
+[data-testid="stMetricDelta"]:has([data-testid="stMetricDeltaIcon-Down"]) * {
+    color: #ff3b3b !important;
+}
+
+/* ══════════════════════════════════════════════════════════════
+   FIX 3 — FONT SIZE INCREASES across all pages
+   ══════════════════════════════════════════════════════════════ */
+[data-testid="stMetricValue"] { font-size: 0.92rem !important; font-weight: 700 !important; }
+[data-testid="stMetricLabel"] p { font-size: 0.78rem !important; }
+[data-testid="stMetricDelta"]   { font-size: 0.82rem !important; }
+.stDataFrame thead tr th { font-size: 0.80rem !important; }
+.stDataFrame tbody tr td { font-size: 0.90rem !important; }
+.stButton > button      { font-size: 0.90rem !important; }
+
 
 /* ── LEGEND BAR ── */
 .bb-header {
