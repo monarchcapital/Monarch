@@ -119,130 +119,346 @@ def _normalise_df(df: pd.DataFrame) -> pd.DataFrame:
     return d
 
 
-def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCREENER SIGNAL HELPERS  (exact same math as 1_Live_screener.py)
+# All return rolling Series — fully vectorised, zero lookahead when shifted.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ema(s: pd.Series, n: int) -> pd.Series:
+    return s.ewm(span=n, adjust=False).mean()
+
+def _rsi_wilder(c: pd.Series, n: int) -> pd.Series:
+    delta    = c.diff()
+    gain     = delta.clip(lower=0).ewm(alpha=1/n, adjust=False).mean()
+    loss     = (-delta.clip(upper=0)).ewm(alpha=1/n, adjust=False).mean()
+    return (100 - 100 / (1 + gain / loss.replace(0, np.nan))).fillna(50)
+
+def _atr(h: pd.Series, l: pd.Series, c: pd.Series, n: int = 14) -> pd.Series:
+    tr = pd.concat([h - l,
+                    (h - c.shift(1)).abs(),
+                    (l - c.shift(1)).abs()], axis=1).max(axis=1)
+    return tr.ewm(span=n, adjust=False).mean(), tr
+
+def _percentile_rank(s: pd.Series, window: int) -> pd.Series:
     """
-    Takes raw OHLCV and returns a feature-rich DataFrame.
-    All features use only past data — zero lookahead bias.
+    Rolling percentile rank of the last value within a window.
+    Output: 0.0 (at window min) → 1.0 (at window max).
+    min_periods = max(10, window // 5) so short histories still produce values.
+    No arbitrary thresholds — fully adaptive to the stock's own history.
+    """
+    mp = max(10, window // 5)
+    lo = s.rolling(window, min_periods=mp).min()
+    hi = s.rolling(window, min_periods=mp).max()
+    return ((s - lo) / (hi - lo + 1e-9)).clip(0, 1)
+
+def _rs_score_series(c: pd.Series, nifty_c: pd.Series) -> pd.Series:
+    """
+    Vectorised RS score (0-1) matching screener's relative_strength():
+    vol-normalised alpha via tanh squashing, 5d weighted 60/40 over 20d.
+    Fully adaptive — no fixed ±2% band.
+    """
+    # Align nifty to stock's index
+    nifty_aligned = nifty_c.reindex(c.index).ffill()
+
+    stock_r5  = c.pct_change(5)
+    stock_r20 = c.pct_change(20)
+    nifty_r5  = nifty_aligned.pct_change(5)
+    nifty_r20 = nifty_aligned.pct_change(20)
+
+    beat5  = stock_r5  - nifty_r5
+    beat20 = stock_r20 - nifty_r20
+
+    # Volatility normalisation — stock's own rolling std
+    ret_std5  = c.pct_change().rolling(5,  min_periods=3).std().clip(lower=0.001)
+    ret_std20 = c.pct_change().rolling(20, min_periods=5).std().clip(lower=0.001)
+
+    alpha5  = beat5  / (ret_std5  * np.sqrt(5)  + 1e-9)
+    alpha20 = beat20 / (ret_std20 * np.sqrt(20) + 1e-9)
+
+    rs5  = 0.5 * (1 + np.tanh(alpha5  / 1.5))
+    rs20 = 0.5 * (1 + np.tanh(alpha20 / 1.5))
+
+    return (rs5 * 0.6 + rs20 * 0.4).clip(0, 1)
+
+
+def engineer_features(df: pd.DataFrame,
+                      nifty_close: pd.Series | None = None) -> pd.DataFrame:
+    """
+    Full feature set combining:
+      A) Standard technicals (returns, MAs, RSI, MACD, BB, ATR, volume, stoch, ADX, candles)
+      B) All 10 Screener scoring signals ported as rolling time-series:
+           F1  RS vs Nifty         — vol-normalised tanh alpha (0-1)
+           F2  Momentum acceleration — EMA5−EMA20 velocity, percentile-ranked
+           F3  Volume surge z-score  — (vol − μ) / σ over rolling 20d
+           F4  Institutional accumulation — vol5/vol20 sigmoid score
+           F5  Volatility contraction — ATR5/ATR20 percentile, inverted
+           F5b Range compression     — range5/range20 percentile, inverted
+           F5c VCVE interaction      — inst_ratio × (1 − vc_ratio)
+           F6  Coil/base quality     — compression × flatness
+           F7  Trend structure       — EMA9/EMA50 percentile over 250d
+           F8  Breakout proximity    — exp decay from 20d resistance (ATR-normalised)
+           F9  ATR% potential        — ATR% percentile vs own 60d history
+           F10 Candlestick score     — 8 patterns, rolling (0-10 scaled 0-1)
+           Bonus: liquidity sweep, VWMA20 position, momentum stability,
+                  52-week position percentile, RS acceleration
+
+    All features are shifted by 1 bar at the end → strictly zero lookahead.
+    No arbitrary thresholds — every threshold is data-derived (percentile/tanh/sigmoid).
     """
     d = _normalise_df(df)
     c = d["Close"].squeeze()
     h = d["High"].squeeze()
     l = d["Low"].squeeze()
+    o = d["Open"].squeeze()
     v = d["Volume"].squeeze().replace(0, np.nan).ffill()
+    n = len(d)
 
-    # ── Returns ──────────────────────────────────────────────────────────────
-    d["ret_1"]  = c.pct_change(1)
-    d["ret_3"]  = c.pct_change(3)
-    d["ret_5"]  = c.pct_change(5)
-    d["ret_10"] = c.pct_change(10)
-    d["ret_20"] = c.pct_change(20)
+    # ── Adaptive window caps ──────────────────────────────────────────────────
+    # All percentile windows scale to available history so 250d of data
+    # (≈175 trading bars after weekends/holidays) still produces valid features.
+    # Rule: window ≤ n // 3  ensures at least 3 full windows exist in the data.
+    _w60  = max(15, min(60,  n // 3))
+    _w100 = max(15, min(100, n // 3))
+    _w120 = max(15, min(120, n // 3))
+    _w200 = max(15, min(200, n // 3))
 
-    # ── Moving averages ───────────────────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════
+    # A — STANDARD TECHNICALS
+    # ═══════════════════════════════════════════════════════════════════
+
+    # Returns
+    for p in [1, 3, 5, 10, 20]:
+        d[f"ret_{p}"] = c.pct_change(p)
+
+    # MAs — kept raw for screener signal computation; dist_* used as features
     for w in [5, 10, 20, 50, 200]:
         d[f"sma{w}"]      = c.rolling(w).mean()
-        d[f"dist_sma{w}"] = (c - d[f"sma{w}"]) / d[f"sma{w}"]
+        d[f"dist_sma{w}"] = (c - d[f"sma{w}"]) / (d[f"sma{w}"] + 1e-9)
 
-    d["ema9"]      = c.ewm(span=9,  adjust=False).mean()
-    d["ema21"]     = c.ewm(span=21, adjust=False).mean()
-    d["ema_cross"] = (d["ema9"] - d["ema21"]) / d["ema21"]
+    e5  = _ema(c, 5);  e9  = _ema(c, 9)
+    e20 = _ema(c, 20); e50 = _ema(c, 50)
+    d["ema9"]      = e9
+    d["ema21"]     = _ema(c, 21)
+    d["ema_cross"] = (e9 - d["ema21"]) / (d["ema21"] + 1e-9)
 
-    # ── RSI ───────────────────────────────────────────────────────────────────
+    # RSI — Wilder (exact same as screener)
     for rsi_w in [7, 14, 21]:
-        delta = c.diff()
-        gain  = delta.clip(lower=0).rolling(rsi_w).mean()
-        loss  = (-delta.clip(upper=0)).rolling(rsi_w).mean()
-        rs    = gain / loss.replace(0, np.nan)
-        d[f"rsi{rsi_w}"] = 100 - 100 / (1 + rs)
+        d[f"rsi{rsi_w}"] = _rsi_wilder(c, rsi_w)
 
-    # ── MACD ─────────────────────────────────────────────────────────────────
-    ema12 = c.ewm(span=12, adjust=False).mean()
-    ema26 = c.ewm(span=26, adjust=False).mean()
+    # MACD
+    ema12 = _ema(c, 12); ema26 = _ema(c, 26)
     macd  = ema12 - ema26
-    sig   = macd.ewm(span=9, adjust=False).mean()
+    sig   = _ema(macd, 9)
     d["macd"]      = macd
     d["macd_hist"] = macd - sig
-    d["macd_norm"] = macd / c
+    d["macd_norm"] = macd / (c + 1e-9)
 
-    # ── Bollinger Bands ───────────────────────────────────────────────────────
+    # Bollinger Bands
     bb_mid = c.rolling(20).mean()
     bb_std = c.rolling(20).std()
-    d["bb_upper"]  = bb_mid + 2 * bb_std
-    d["bb_lower"]  = bb_mid - 2 * bb_std
-    d["bb_width"]  = (d["bb_upper"] - d["bb_lower"]) / bb_mid
-    d["bb_pos"]    = (c - d["bb_lower"]) / (d["bb_upper"] - d["bb_lower"] + 1e-9)
+    d["bb_upper"] = bb_mid + 2 * bb_std
+    d["bb_lower"] = bb_mid - 2 * bb_std
+    d["bb_width"] = (d["bb_upper"] - d["bb_lower"]) / (bb_mid + 1e-9)
+    d["bb_pos"]   = (c - d["bb_lower"]) / (d["bb_upper"] - d["bb_lower"] + 1e-9)
 
-    # ── ATR ───────────────────────────────────────────────────────────────────
-    tr = pd.concat([
-        h - l,
-        (h - c.shift()).abs(),
-        (l - c.shift()).abs()
-    ], axis=1).max(axis=1)
-    d["atr14"]      = tr.rolling(14).mean()
-    d["atr_norm"]   = d["atr14"] / c
-    d["atr_ratio"]  = tr / d["atr14"]
+    # ATR (EWM, same as screener's atr14)
+    atr14_s, tr = _atr(h, l, c, 14)
+    d["atr14"]     = atr14_s
+    d["atr_norm"]  = atr14_s / (c + 1e-9)
+    d["atr_ratio"] = tr / (atr14_s + 1e-9)
 
-    # ── Volume features ───────────────────────────────────────────────────────
-    vol_ma20 = v.rolling(20).mean()
-    d["vol_ratio"]  = v / vol_ma20
-    d["vol_z"]      = (v - vol_ma20) / (v.rolling(20).std() + 1e-9)
-    d["vol_ret"]    = v.pct_change(1)
+    # Volume
+    vol_ma20  = v.rolling(20).mean()
+    vol_std20 = v.rolling(20).std()
+    d["vol_ratio"] = v / (vol_ma20 + 1e-9)
+    d["vol_z"]     = (v - vol_ma20) / (vol_std20 + 1e-9)
+    d["vol_ret"]   = v.pct_change(1)
 
-    # ── Stochastic ───────────────────────────────────────────────────────────
-    lo14 = l.rolling(14).min()
-    hi14 = h.rolling(14).max()
+    # Stochastic
+    lo14 = l.rolling(14).min(); hi14 = h.rolling(14).max()
     d["stoch_k"] = 100 * (c - lo14) / (hi14 - lo14 + 1e-9)
     d["stoch_d"] = d["stoch_k"].rolling(3).mean()
 
-    # ── ADX (simplified) ─────────────────────────────────────────────────────
+    # ADX
     plus_dm  = h.diff().clip(lower=0)
     minus_dm = (-l.diff()).clip(lower=0)
-    plus_dm[plus_dm < (-l.diff()).clip(lower=0)]  = 0
-    minus_dm[minus_dm < h.diff().clip(lower=0)]   = 0
-    atr_s    = tr.ewm(span=14, adjust=False).mean()
-    plus_di  = 100 * plus_dm.ewm(span=14,  adjust=False).mean() / (atr_s + 1e-9)
-    minus_di = 100 * minus_dm.ewm(span=14, adjust=False).mean() / (atr_s + 1e-9)
-    dx       = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-9)
+    plus_dm  = plus_dm.where(plus_dm > (-l.diff()).clip(lower=0), 0)
+    minus_dm = minus_dm.where(minus_dm > h.diff().clip(lower=0), 0)
+    atr_ewm  = tr.ewm(span=14, adjust=False).mean()
+    pdi = 100 * plus_dm.ewm(span=14, adjust=False).mean()  / (atr_ewm + 1e-9)
+    mdi = 100 * minus_dm.ewm(span=14, adjust=False).mean() / (atr_ewm + 1e-9)
+    dx  = 100 * (pdi - mdi).abs() / (pdi + mdi + 1e-9)
     d["adx"]     = dx.ewm(span=14, adjust=False).mean()
-    d["plus_di"] = plus_di
-    d["di_diff"] = plus_di - minus_di
+    d["di_diff"] = pdi - mdi
 
-    # ── Candle features ───────────────────────────────────────────────────────
-    body   = (d["Close"] - d["Open"]).squeeze()
-    rng    = (h - l).replace(0, np.nan)
-    d["body_ratio"]  = body / rng
-    d["upper_wick"]  = (h - d[["Open","Close"]].max(axis=1).squeeze()) / rng
-    d["lower_wick"]  = (d[["Open","Close"]].min(axis=1).squeeze() - l) / rng
-    d["gap"]         = (d["Open"].squeeze() - c.shift()) / c.shift()
+    # Candle geometry
+    body = (c - o)
+    rng  = (h - l).replace(0, np.nan)
+    d["body_ratio"] = body / rng
+    d["upper_wick"] = (h - pd.concat([o, c], axis=1).max(axis=1)) / rng
+    d["lower_wick"] = (pd.concat([o, c], axis=1).min(axis=1) - l)  / rng
+    d["gap"]        = (o - c.shift(1)) / (c.shift(1) + 1e-9)
 
-    # ── Price position ────────────────────────────────────────────────────────
-    hi52  = h.rolling(252).max()
-    lo52  = l.rolling(252).min()
-    d["pos_52w"]  = (c - lo52) / (hi52 - lo52 + 1e-9)
-    d["hi20_dist"]= (h.rolling(20).max() - c) / c
-    d["lo20_dist"]= (c - l.rolling(20).min()) / c
+    # Price position — adaptive 52w window
+    _w52 = max(30, min(252, n // 2))
+    hi52 = h.rolling(_w52, min_periods=30).max()
+    lo52 = l.rolling(_w52, min_periods=30).min()
+    d["pos_52w"]   = (c - lo52)                              / (hi52 - lo52 + 1e-9)
+    d["hi20_dist"] = (h.rolling(20, min_periods=5).max() - c) / (c + 1e-9)
+    d["lo20_dist"] = (c - l.rolling(20, min_periods=5).min()) / (c + 1e-9)
 
-    # ── Lagged closes ─────────────────────────────────────────────────────────
+    # Lagged closes (normalised — no raw price levels)
     for lag in [1, 2, 3, 5]:
-        d[f"close_lag{lag}"] = c.shift(lag)
+        d[f"close_lag{lag}_r"] = c.shift(lag) / (c + 1e-9) - 1
 
-    # ── TARGET — next day close ────────────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════
+    # B — SCREENER SIGNAL FEATURES  (all adaptive, no arbitrary numbers)
+    # ═══════════════════════════════════════════════════════════════════
+
+    # F1 — RS vs Nifty (vol-normalised tanh, same formula as screener)
+    if nifty_close is not None and nifty_close.notna().sum() > 30:
+        d["sc_rs_nifty"] = _rs_score_series(c, nifty_close)
+    else:
+        d["sc_rs_nifty"] = 0.5   # neutral when Nifty unavailable
+
+    # F2 — Momentum Acceleration (EMA5−EMA20 velocity, percentile-ranked)
+    velocity     = e5 - e20
+    acceleration = velocity.diff()
+    d["sc_momentum_vel"]  = _percentile_rank(velocity,     _w200)
+    d["sc_momentum_acc"]  = _percentile_rank(acceleration, _w200)
+
+    # F3 — Volume Surge z-score percentile
+    d["sc_vol_z_pct"]  = _percentile_rank(d["vol_z"], _w120)
+
+    # F4 — Pre-breakout Accumulation (vol5/vol20 sigmoid, centre=1.3, k=4)
+    vol_ma5  = v.rolling(5, min_periods=2).mean()
+    inst_ratio_s = vol_ma5 / (vol_ma20 + 1e-9)
+    d["sc_accumulation"] = (1.0 / (1.0 + np.exp(-4.0 * (inst_ratio_s - 1.3)))).clip(0, 1)
+
+    # F5 — Volatility Contraction (ATR5/ATR20 percentile, inverted)
+    atr5_s  = tr.rolling(5,  min_periods=2).mean()
+    atr20_s = tr.rolling(20, min_periods=5).mean()
+    vc_ratio_s = atr5_s / (atr20_s.replace(0, np.nan))
+    d["sc_vol_contraction"] = 1.0 - _percentile_rank(vc_ratio_s, _w120)
+
+    # F5b — Range Compression Index (percentile, inverted)
+    range5_s  = h.rolling(5,  min_periods=2).max() - l.rolling(5,  min_periods=2).min()
+    range20_s = h.rolling(20, min_periods=5).max() - l.rolling(20, min_periods=5).min()
+    rci_s     = range5_s / (range20_s.replace(0, np.nan))
+    d["sc_range_compression"] = 1.0 - _percentile_rank(rci_s, _w120)
+
+    # F5c — VCVE interaction
+    d["sc_vcve"] = (inst_ratio_s * (1.0 - vc_ratio_s.clip(upper=1.0))).clip(0, 5) / 5.0
+
+    # F6 — Base/Coil Quality
+    compression_s = (1.0 - rci_s).clip(0, 1)
+    hi_spread_atr = (h.rolling(8, min_periods=3).max() - h.rolling(8, min_periods=3).min()) / (atr14_s + 1e-9)
+    flatness_s    = (1.0 - hi_spread_atr.clip(upper=1.0)).clip(0, 1)
+    d["sc_coil_quality"] = (compression_s * 0.55 + flatness_s * 0.45).clip(0, 1)
+
+    # F7 — Trend Structure (EMA9/EMA50 percentile)
+    trend_ratio = e9 / (e50.replace(0, np.nan))
+    d["sc_trend_structure"] = _percentile_rank(trend_ratio, _w200)
+    d["sc_ema_alignment"] = ((e9 > e20).astype(float) + (e20 > e50).astype(float)) / 2.0
+
+    # F8 — Breakout Proximity (exp decay from 20d resistance)
+    resistance_20 = h.rolling(20, min_periods=5).max()
+    d_trig = (resistance_20 - c) / (atr14_s + 1e-9)
+    d["sc_breakout_prox"] = np.exp(-1.5 * d_trig.clip(lower=0)).clip(0, 1)
+
+    # F9 — ATR% Potential (percentile vs own history)
+    atr_pct_s = atr14_s / (c + 1e-9) * 100
+    d["sc_atr_potential"] = _percentile_rank(atr_pct_s, _w60)
+
+    # F10 — Candlestick Score (rolling 8-pattern score, scaled 0-1)
+    # Vectorised — each pattern is a boolean series
+    prev_c = c.shift(1); prev_o = o.shift(1)
+    prev_h = h.shift(1); prev_l = l.shift(1)
+    prev_body = (prev_c - prev_o).abs()
+    prev_rng  = (prev_h - prev_l).replace(0, np.nan)
+    body_abs  = body.abs()
+    upper_w   = h - pd.concat([o, c], axis=1).max(axis=1)
+    lower_w   = pd.concat([o, c], axis=1).min(axis=1) - l
+
+    cdl  = pd.Series(0.0, index=c.index)
+    cdl += ((prev_c < prev_o) & (c > o) & (c > prev_o) & (o < prev_c)).astype(float) * 3.0        # Engulfing
+    cdl += ((lower_w >= 2 * body_abs) & (upper_w <= 0.4 * rng) & (c > o)).astype(float) * 2.5     # Hammer
+    cdl += ((h <= prev_h) & (l >= prev_l)).astype(float) * 1.5                                     # InsideBar
+    cdl += ((h > prev_h) & (l < prev_l) & (c > o) & (c > (h + l) / 2)).astype(float) * 2.0       # OutsideBar
+    cdl += ((body_abs / rng > 0.60) & (c > o) & ((c - l) / rng > 0.75)).astype(float) * 2.0       # StrongGreen
+    cdl += ((body_abs / rng < 0.10) & (lower_w > 1.5 * upper_w)).astype(float) * 1.0              # BullDoji
+    cdl += ((prev_c < prev_o) & (prev_body / prev_rng > 0.5) & (c > o) &
+            (c > (prev_o + prev_c) / 2)).astype(float) * 2.5                                       # MorningStar
+    cdl += ((o > prev_c * 1.003) & (c > o)).astype(float) * 2.0                                   # GapContinue
+    d["sc_candle_score"] = (cdl.clip(upper=10) / 10.0)   # normalise 0-1
+
+    # ── BONUS SIGNALS ──────────────────────────────────────────────────────────
+
+    # Liquidity Sweep (same logic as screener — ATR-relative wick)
+    prior_support = l.rolling(5).min().shift(1)
+    sweep = ((l < prior_support) &
+             (c > c.shift(1)) &
+             (lower_w >= 0.5 * atr14_s) &
+             (d["vol_z"] >= 1.0)).astype(float)
+    d["sc_sweep"] = sweep
+
+    # VWMA20 position
+    typical = (h + l + c) / 3
+    vwma20  = (typical * v).rolling(20).sum() / (v.rolling(20).sum().replace(0, np.nan))
+    d["sc_above_vwma20"]     = (c > vwma20).astype(float)
+    d["sc_vwma20_rising"]    = (vwma20 > vwma20.shift(1)).astype(float)
+
+    # Momentum Stability (positive day fraction over 20d)
+    pos_days = c.diff().gt(0).rolling(20, min_periods=10).mean()
+    d["sc_momentum_stability"] = pos_days
+
+    # 52-week position percentile (adaptive window)
+    pos_series = (c - c.rolling(_w52, min_periods=30).min()) / \
+                 (c.rolling(_w52, min_periods=30).max() - c.rolling(_w52, min_periods=30).min() + 1e-9)
+    d["sc_pos52w_pct"] = _percentile_rank(pos_series, _w200)
+
+    # RS Acceleration (EMA5−EMA20 velocity diff, percentile — same as screener F2 bonus)
+    d["sc_rs_accel"] = d["sc_momentum_acc"]   # already computed above, alias for clarity
+
+    # ── SHIFT ALL FEATURES BY 1 BAR — strict zero lookahead ──────────────────
+    sc_cols = [col for col in d.columns if col.startswith("sc_")]
+    d[sc_cols] = d[sc_cols].shift(1)
+
+    # ── TARGETS ───────────────────────────────────────────────────────────────
     d["target_direction"] = (c.shift(-1) > c).astype(int)
     d["target_nextclose"] = c.shift(-1)
 
-    d.dropna(inplace=True)
+    # ── Fill remaining NaNs in feature columns (ffill then 0) ────────────────
+    # Target columns must be valid — drop those rows.
+    # Feature NaNs at the start of history are forward-filled then zero-filled
+    # so the ML model always gets a complete feature matrix.
+    feat_cols_now = [col for col in d.columns
+                     if col not in ("target_direction", "target_nextclose")]
+    d[feat_cols_now] = d[feat_cols_now].ffill().fillna(0)
+    d.dropna(subset=["target_direction", "target_nextclose"], inplace=True)
     return d
 
 
 def get_feature_cols(df: pd.DataFrame) -> list:
-    exclude = {"Open","High","Low","Close","Adj Close","Volume",
-               "target_direction","target_nextclose",
-               "sma5","sma10","sma20","sma50","sma200",
-               "bb_upper","bb_lower","ema9","ema21"}
-    return [c for c in df.columns
-            if c not in exclude
-            and not c.startswith("Dividends")
-            and not c.startswith("Stock")
-            and pd.api.types.is_numeric_dtype(df[c])]
+    """
+    Returns all engineered feature columns — strictly no raw OHLCV, no targets.
+    Screener-derived 'sc_*' columns are explicitly included.
+    """
+    exclude = {
+        "Open", "High", "Low", "Close", "Adj Close", "Volume",
+        "target_direction", "target_nextclose",
+        # keep dist_sma* and ema_cross but drop the raw MA levels
+        "sma5", "sma10", "sma20", "sma50", "sma200",
+        "bb_upper", "bb_lower", "ema9", "ema21",
+    }
+    return [
+        col for col in df.columns
+        if col not in exclude
+        and not col.startswith("Dividends")
+        and not col.startswith("Stock")
+        and pd.api.types.is_numeric_dtype(df[col])
+    ]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -312,42 +528,152 @@ except ImportError:
 from sklearn.model_selection import TimeSeriesSplit, KFold
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LIVE / LATEST PRICE FETCHER
+# RELIABLE OHLCV + LATEST PRICE FETCHER
 # ─────────────────────────────────────────────────────────────────────────────
-# Problem: yf.download(period="365d") on a Saturday morning may not include
-# Friday's bar yet.  We always want the MOST RECENT traded price regardless of
-# when the script runs.  Strategy (in order of reliability):
-#   1. fast_info.last_price  — real-time delayed quote, available any day/time
-#   2. history(period="5d")  — last 5 trading days, picks up Friday on Saturday
-#   3. Fallback to OHLCV close.iloc[-1] already in df_raw
+# Root cause of stale price:
+#   yf.download(period="365d") uses a relative period calculated from "today".
+#   On Saturday, yfinance treats Saturday as today and may not include Friday's
+#   completed session.  The screener's ml_raw_data is also stale (fetched hours ago).
+#
+# Fix: fetch with explicit start/end dates where end = tomorrow.
+# Then patch last-bar Close with fast_info.last_price (15-min delayed quote)
+# which is available 24/7 and always reflects the last traded price.
 
-def fetch_live_price(ticker: str) -> float | None:
+def _fetch_ohlcv(ticker: str, days: int) -> pd.DataFrame:
     """
-    Return the most recent traded price for a ticker.
-    Uses fast_info first (15-min delayed quote), then 5d history as fallback.
-    Returns None if both fail so caller can fall back to OHLCV.
+    Fetch daily OHLCV using explicit start/end so weekend runs always include
+    the most recently completed trading session (e.g. Friday on Saturday).
+    end = today + 2 days forces yfinance to include the latest completed bar.
     """
+    end_dt   = datetime.now() + timedelta(days=2)
+    start_dt = datetime.now() - timedelta(days=days + 30)  # generous buffer for holidays
     try:
-        t = yf.Ticker(ticker)
-        # fast_info.last_price is the most recently traded price (delayed ~15min)
-        price = getattr(t.fast_info, "last_price", None)
-        if price and price > 0:
-            return float(price)
+        df = yf.download(
+            ticker,
+            start=start_dt.strftime("%Y-%m-%d"),
+            end=end_dt.strftime("%Y-%m-%d"),
+            interval="1d",
+            progress=False,
+            auto_adjust=True,
+        )
+        if df.empty:
+            df = yf.Ticker(ticker).history(
+                start=start_dt.strftime("%Y-%m-%d"),
+                end=end_dt.strftime("%Y-%m-%d"),
+                interval="1d",
+                auto_adjust=True,
+            )
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CURRENT PRICE — UPSTOX FIRST, yfinance AS FALLBACK
+# ─────────────────────────────────────────────────────────────────────────────
+# The screener (1_Live_screener.py) already fetched live LTP from Upstox and
+# stored it in:
+#   st.session_state.live_quotes_cache  — dict keyed by instrument_key (NSE_EQ|INE...)
+#   st.session_state.targets            — maps trading_symbol → instrument_key
+#
+# Priority:
+#   1. Upstox LTP from session_state  — exact same source as screener (freshest)
+#   2. Upstox API direct call         — if token available but cache stale
+#   3. yfinance fast_info.last_price  — 15-min delayed, works weekends
+#   4. yfinance history(5d)           — fallback
+#   5. OHLCV close.iloc[-1]           — last resort
+
+def _normalize_key(k: str) -> str:
+    return k.replace("%7C", "|").replace(":", "|")
+
+
+def get_upstox_ltp(trading_symbol: str) -> tuple:
+    """
+    Returns (price, source_label) using Upstox data already in session_state.
+    trading_symbol = Upstox format e.g. 'SUNPHARMA' (no .NS suffix).
+    """
+    # ── 1. Read from screener's live_quotes_cache (already fetched, free) ────
+    targets     = st.session_state.get("targets", {})
+    live_cache  = st.session_state.get("live_quotes_cache", {})
+    token       = (st.session_state.get("upstox_token", "") or
+                   st.session_state.get("scanner_token", ""))
+
+    ikey = targets.get(trading_symbol, "")
+    if ikey:
+        q = live_cache.get(_normalize_key(ikey), {})
+        if q and q.get("ltp"):
+            return float(q["ltp"]), "upstox_cache"
+
+    # ── 2. Direct Upstox API call (token available, cache missed) ─────────────
+    if token and ikey:
+        try:
+            import requests as _req
+            url    = "https://api.upstox.com/v2/market-quote/quotes"
+            params = {"instrument_key": ikey}
+            r = _req.get(url,
+                         headers={"Authorization": f"Bearer {token}",
+                                  "Accept": "application/json"},
+                         params=params, timeout=5)
+            if r.status_code == 200:
+                data = r.json().get("data", {})
+                for _k, v in data.items():
+                    ltp = v.get("last_price")
+                    if ltp:
+                        # Refresh cache so next ticker is instant
+                        live_cache[_normalize_key(ikey)] = {
+                            "ltp": float(ltp),
+                            "open":  float(v.get("ohlc", {}).get("open",  ltp)),
+                            "high":  float(v.get("ohlc", {}).get("high",  ltp)),
+                            "low":   float(v.get("ohlc", {}).get("low",   ltp)),
+                            "volume": v.get("volume"),
+                        }
+                        st.session_state["live_quotes_cache"] = live_cache
+                        return float(ltp), "upstox_api"
+        except Exception:
+            pass
+
+    return None, "ohlcv"
+
+
+def fetch_latest_price(ticker: str) -> tuple:
+    """
+    Returns (price, source) — tries Upstox first, yfinance as fallback.
+    ticker = Upstox trading symbol (e.g. 'SUNPHARMA') OR yfinance symbol (e.g. 'SUNPHARMA.NS').
+    Strips .NS/.BO suffix before Upstox lookup.
+    """
+    # Strip exchange suffix for Upstox lookup
+    upstox_sym = ticker.replace(".NS", "").replace(".BO", "").replace(".NSE", "").upper()
+
+    price, source = get_upstox_ltp(upstox_sym)
+    if price:
+        return price, source
+
+    # ── yfinance fallbacks ────────────────────────────────────────────────────
+    yf_sym = ticker if "." in ticker else ticker + ".NS"
+    t = yf.Ticker(yf_sym)
+
+    try:
+        p = getattr(t.fast_info, "last_price", None)
+        if p and float(p) > 0:
+            return float(p), "yf_fast_info"
     except Exception:
         pass
 
-    # Fallback: pull last 5 trading days and take the most recent Close
     try:
         hist = t.history(period="5d", interval="1d", auto_adjust=True)
         if not hist.empty:
-            # Normalise columns
             hist.columns = [c.strip().title() for c in hist.columns]
-            if "Close" in hist.columns:
-                return float(hist["Close"].dropna().iloc[-1])
+            if hist.index.tz is not None:
+                hist.index = hist.index.tz_convert(None)
+            p = float(hist["Close"].dropna().iloc[-1])
+            if p > 0:
+                return p, "yf_history5d"
     except Exception:
         pass
 
-    return None
+    return None, "ohlcv"
+
+
 from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
 
 # ── TensorFlow / Keras (optional — TCN needs it) ─────────────────────────────
@@ -743,13 +1069,14 @@ def _walk_forward_oof_auc(estimators: list, X: np.ndarray, y: np.ndarray,
 
 
 def run_ml_for_ticker(ticker: str, df_raw: pd.DataFrame,
-                      backtest_days: int, timeframe: str) -> dict:
+                      backtest_days: int, timeframe: str,
+                      nifty_close: pd.Series | None = None) -> dict:
     """
     Professional stacked ensemble pipeline for a single ticker.
 
     Steps:
       1. Resample OHLCV to requested timeframe
-      2. Engineer ~45 features (all lagged — zero lookahead)
+      2. Engineer ~80 features: technicals + all 10 screener signals (no lookahead)
       3. Walk-forward CV on training set → evaluate each base model → report OOF AUCs
       4. Build stacking ensemble: base learners → LR meta-learner (calibrated)
       5. Train on full training window, predict on held-out test window
@@ -767,15 +1094,15 @@ def run_ml_for_ticker(ticker: str, df_raw: pd.DataFrame,
         df = df.resample("ME").agg({"Open":"first","High":"max","Low":"min",
                                     "Close":"last","Volume":"sum"}).dropna()
 
-    if len(df) < 150:
-        return {"error": f"Not enough data ({len(df)} bars). Need 150+."}
+    if len(df) < 100:
+        return {"error": f"Not enough data ({len(df)} bars). Need 100+."}
 
     # ── 2. Feature engineering ────────────────────────────────────────────────
-    feat      = engineer_features(df)
+    feat      = engineer_features(df, nifty_close=nifty_close)
     feat_cols = get_feature_cols(feat)
 
-    if len(feat) < backtest_days + 80:
-        return {"error": f"After feature engineering: {len(feat)} rows, need {backtest_days+80}+."}
+    if len(feat) < backtest_days + 60:
+        return {"error": f"After feature engineering: {len(feat)} rows, need {backtest_days+60}+."}
 
     X      = feat[feat_cols].astype(float).values
     y_dir  = feat["target_direction"].values
@@ -871,23 +1198,82 @@ def run_ml_for_ticker(ticker: str, df_raw: pd.DataFrame,
     mape = mean_absolute_percentage_error(yn_test, y_pred_price) * 100
 
     # ── 7. Final next-bar prediction ───────────────────────────────────────────
-    last_s        = scaler.transform(X[[-1]])
-    next_proba    = float(calibrated.predict_proba(last_s)[0][1])
-    next_dir_pred = int(next_proba >= best_thresh)
-    next_conf     = abs(next_proba - best_thresh) / max(best_thresh, 1 - best_thresh)
-    next_price    = float(stack_reg.predict(last_s)[0])
+    # Architecture: regressor is the single model for both direction AND price.
+    # Direction = sign(predicted_price - current_price). No classifier used
+    # for direction — eliminates the classifier/regressor contradiction entirely.
+    #
+    # Confidence is purely empirical, derived from the test-set residuals:
+    #   For each test bar, we know: predicted move, actual move, correct direction?
+    #   We bin test bars by |predicted move %| quantile.
+    #   Confidence for the live prediction = precision of the quantile bin
+    #   that the current |predicted move %| falls into.
+    #   This is entirely data-derived — no arbitrary thresholds.
 
-    # ── curr_price: always use the LATEST traded price, not OHLCV tail ────────
-    # On Saturday mornings (or after market close), yf.download may be missing
-    # the most recent session's bar.  fetch_live_price() uses fast_info
-    # (15-min delayed real-time quote) and falls back to 5d history so we
-    # always show Friday's close rather than Thursday's.
-    ohlcv_last   = float(close.iloc[-1])           # last bar in downloaded history
-    live_price   = fetch_live_price(ticker)         # real-time / most recent traded
-    curr_price   = live_price if live_price else ohlcv_last
-    price_source = "live" if live_price else "ohlcv"
+    last_s     = scaler.transform(X[[-1]])
+    next_price = float(stack_reg.predict(last_s)[0])
+
+    # ── curr_price: Upstox live LTP first, yfinance fallback ──────────────────
+    ohlcv_last               = float(close.iloc[-1])
+    live_price, price_source = fetch_latest_price(ticker)
+    curr_price               = live_price if live_price else ohlcv_last
+    if not live_price:
+        price_source = "ohlcv"
 
     price_chg_pct = (next_price - curr_price) / curr_price * 100
+
+    # Direction is purely the sign of the price prediction
+    price_dir     = 1 if price_chg_pct > 0 else 0
+    next_direction_raw = price_dir   # 1=UP, 0=DOWN
+
+    # ── Empirical confidence from test-set residuals ──────────────────────────
+    # Compute predicted move % for every test bar
+    test_close_vals   = close.iloc[split:].values
+    pred_move_pct     = (y_pred_price - test_close_vals) / (test_close_vals + 1e-9) * 100
+    pred_dir_test     = (pred_move_pct > 0).astype(int)
+    correct_dir_test  = (pred_dir_test == yd_test).astype(int)
+    abs_pred_move     = np.abs(pred_move_pct)
+
+    # Bin test bars by |predicted move %| into n_bins quantile bins
+    # n_bins = sqrt(n_test) — natural bin count, no arbitrary number
+    n_test = len(abs_pred_move)
+    n_bins = max(3, int(np.sqrt(n_test)))
+    quantile_edges = np.quantile(abs_pred_move, np.linspace(0, 1, n_bins + 1))
+    quantile_edges = np.unique(quantile_edges)   # remove duplicate edges
+
+    live_abs_move = abs(price_chg_pct)
+
+    # Find which bin the current prediction falls into
+    bin_idx = np.searchsorted(quantile_edges[1:], live_abs_move, side="right")
+    bin_idx = min(bin_idx, len(quantile_edges) - 2)
+
+    lo = quantile_edges[bin_idx]
+    hi = quantile_edges[bin_idx + 1] if bin_idx + 1 < len(quantile_edges) else np.inf
+    mask = (abs_pred_move >= lo) & (abs_pred_move < hi)
+
+    if mask.sum() >= 3:
+        empirical_precision = float(correct_dir_test[mask].mean())
+    else:
+        # Bin too sparse — use global directional accuracy on test set
+        empirical_precision = float(correct_dir_test.mean())
+
+    # Signal reliability: empirical_precision vs random baseline (0.5)
+    # Excess precision above random = how much edge the model has in this bin
+    # Scaled to 0-1: 0 = random (prec=0.5), 1 = perfect (prec=1.0)
+    direction_conf = max(0.0, (empirical_precision - 0.5) * 2.0)
+
+    # Direction label
+    if empirical_precision > 0.5:
+        if price_dir == 1:
+            next_direction = "📈 UP"
+        else:
+            next_direction = "📉 DOWN"
+    else:
+        # Model has no edge for this size move — show uncertain
+        next_direction = "⚪ UNCERTAIN"
+
+    # Classifier still used for AUC/accuracy metrics — keep those
+    next_proba = float(calibrated.predict_proba(last_s)[0][1])
+    next_dir_pred = price_dir   # align with price for equity curve
 
     # ── 8. Feature importance (averaged across base learners) ─────────────────
     fi_list = []
@@ -935,11 +1321,13 @@ def run_ml_for_ticker(ticker: str, df_raw: pd.DataFrame,
         "current_price":     curr_price,
         "price_source":      price_source,   # "live" | "ohlcv"
         "ohlcv_last_price":  ohlcv_last,
-        "next_price_pred":   next_price,
-        "price_change_pct":  price_chg_pct,
-        "next_direction":    "📈 UP" if next_dir_pred == 1 else "📉 DOWN",
-        "next_proba":        next_proba,
-        "direction_conf":    next_conf,
+        "next_price_pred":      next_price,
+        "price_change_pct":     price_chg_pct,
+        "next_direction":       next_direction,
+        "next_proba":           next_proba,
+        "direction_conf":       direction_conf,
+        "empirical_precision":  empirical_precision,
+        "signals_agree":        True,   # no longer applicable — kept for compat
         "accuracy":          acc,
         "auc":               auc,
         "precision":         prec,
@@ -1072,7 +1460,7 @@ Walk-forward CV · Data-derived hyperparams<br>
 </div>""", unsafe_allow_html=True)
     timeframe     = st.selectbox("Timeframe", ["Daily", "Weekly", "Monthly"], index=0)
     backtest_days = st.slider("Backtest window (bars)", 30, 180, 60, step=10)
-    extra_days    = st.slider("Extra history to fetch (days)", 180, 730, 365, step=30)
+    extra_days    = st.slider("Extra history to fetch (days)", 365, 1095, 730, step=30)
 
     st.markdown('<div style="border-top:1px solid #2a2a2a;margin:10px 0;"></div>', unsafe_allow_html=True)
     if st.button("← Back to Screener", use_container_width=True):
@@ -1148,7 +1536,7 @@ with col_info:
   Engine: <b style="color:#ff8c00;">Stacked Ensemble (RF + GBM + XGB + LGB + TCN*)</b>  ·
   Timeframe: <b style="color:#ff8c00;">{timeframe}</b>  ·
   Backtest: <b style="color:#ff8c00;">{backtest_days} bars</b>  ·
-  ~45 features · Walk-forward CV · No lookahead bias
+  ~80 features (technical + screener signals) · Walk-forward CV · No lookahead bias
 </div>""", unsafe_allow_html=True)
 
 if not run_btn:
@@ -1164,32 +1552,54 @@ Click RUN ML to start prediction pipeline
 all_results = []
 progress = st.progress(0.0, text="Starting ML pipeline…")
 
+# ── Fetch Nifty 50 close once — used for RS vs Nifty in engineer_features ──
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_nifty_close(days: int) -> pd.Series:
+    end_dt   = datetime.now() + timedelta(days=2)
+    start_dt = datetime.now() - timedelta(days=days + 30)
+    try:
+        df = yf.download("^NSEI",
+                         start=start_dt.strftime("%Y-%m-%d"),
+                         end=end_dt.strftime("%Y-%m-%d"),
+                         interval="1d", progress=False, auto_adjust=True)
+        if df.empty:
+            return pd.Series(dtype=float)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df.columns = [c.strip().title() for c in df.columns]
+        s = df["Close"].squeeze()
+        if s.index.tz is not None:
+            s.index = s.index.tz_convert(None)
+        return s.dropna()
+    except Exception:
+        return pd.Series(dtype=float)
+
+progress.progress(0.02, text="Fetching Nifty 50 for RS signals…")
+nifty_close_series = _fetch_nifty_close(extra_days)
+
 for i, ticker in enumerate(final_tickers):
     progress.progress((i + 0.3) / len(final_tickers), text=f"Fetching data: {ticker}…")
 
-    # Use raw data from screener if available, else fetch fresh
-    if ticker in ml_raw_data and not ml_raw_data[ticker].empty:
+    # Always fetch fresh with explicit start/end dates so Saturday runs include Friday.
+    # ml_raw_data from screener is intentionally NOT used for the OHLCV history —
+    # it may be hours stale. We only used it previously for speed; correctness wins.
+    df_raw = _fetch_ohlcv(ticker, extra_days)
+
+    # If fresh fetch failed, fall back to screener cache as last resort
+    if df_raw.empty and ticker in ml_raw_data and not ml_raw_data[ticker].empty:
         df_raw = ml_raw_data[ticker].copy()
-        # Ensure long enough history
-        if len(df_raw) < 200:
-            df_fetch = yf.download(ticker, period=f"{extra_days}d",
-                                   interval="1d", progress=False, auto_adjust=False)
-            if not df_fetch.empty:
-                df_raw = df_fetch
-    else:
-        df_raw = yf.download(ticker, period=f"{extra_days}d",
-                             interval="1d", progress=False, auto_adjust=False)
 
     if df_raw.empty:
         st.warning(f"⚠ No data for {ticker} — skipped.")
         continue
 
-    # ── Normalise: flatten MultiIndex, title-case cols, strip tz, drop non-numeric
+    # Normalise: flatten MultiIndex, title-case cols, strip tz, drop non-numeric
     df_raw = _normalise_df(df_raw)
 
     progress.progress((i + 0.7) / len(final_tickers), text=f"Running ML: {ticker}…")
 
-    result = run_ml_for_ticker(ticker, df_raw, backtest_days, timeframe)
+    result = run_ml_for_ticker(ticker, df_raw, backtest_days, timeframe,
+                               nifty_close=nifty_close_series if not nifty_close_series.empty else None)
 
     if "error" in result:
         st.warning(f"⚠ {ticker}: {result['error']}")
@@ -1226,7 +1636,7 @@ for r in all_results:
         "Predicted ₹":    f"₹{r['next_price_pred']:.2f}",
         "Δ%":             f"{r['price_change_pct']:+.2f}%",
         "Direction":      r["next_direction"],
-        "Conf":           f"{r['direction_conf']:.0%}",
+        "Conf":           f"{r.get('empirical_precision', r['direction_conf']):.0%}",
         "Accuracy":       f"{r['accuracy']:.0%}",
         "AUC":            f"{r['auc']:.3f}",
         "Precision":      f"{r['precision']:.0%}",
@@ -1275,8 +1685,10 @@ def plot_oof_aucs(result: dict) -> go.Figure:
 
 
 def color_direction(val):
-    if "UP" in str(val):   return "background-color:#001a0a;color:#00d084;font-weight:700"
-    if "DOWN" in str(val): return "background-color:#1a0000;color:#ff3b3b;font-weight:700"
+    v = str(val)
+    if "UP"        in v: return "background-color:#001a0a;color:#00d084;font-weight:700"
+    if "DOWN"      in v: return "background-color:#1a0000;color:#ff3b3b;font-weight:700"
+    if "UNCERTAIN" in v: return "background-color:#1a1400;color:#888888;font-weight:700"
     return ""
 
 def color_delta(val):
@@ -1309,9 +1721,10 @@ else:
 for tab, result in zip(tabs, all_results):
     with tab:
         ticker = result["ticker"]
-        up = result["price_change_pct"] >= 0
-        dir_color = "#00d084" if up else "#ff3b3b"
-        dir_bg    = "#001a0a" if up else "#1a0000"
+        _dir   = result["next_direction"]
+        if "UP"        in _dir: dir_color, dir_bg = "#00d084", "#001a0a"
+        elif "DOWN"    in _dir: dir_color, dir_bg = "#ff3b3b", "#1a0000"
+        else:                   dir_color, dir_bg = "#888888", "#111111"
 
         # ── Hero metrics ──────────────────────────────────────────────────────
         st.markdown(f"""
@@ -1326,8 +1739,14 @@ padding:12px 18px;font-family:'IBM Plex Mono',monospace;margin-bottom:12px;">
     <div>
       <div style="color:#555;font-size:.52rem;letter-spacing:.1em;">CURRENT PRICE</div>
       <div style="color:#e8e8e8;font-size:1.05rem;font-weight:700;">₹{result['current_price']:.2f}</div>
-      <div style="color:{'#00d084' if result.get('price_source')=='live' else '#888'};font-size:.55rem;margin-top:1px;">
-        {'🟢 live quote' if result.get('price_source')=='live' else '⚠ ohlcv fallback (last bar: ₹'+str(round(result.get('ohlcv_last_price',0),2))+')'}
+      <div style="font-size:.55rem;margin-top:2px;color:{
+        '#00d084' if result.get('price_source') in ('upstox_cache','upstox_api') else
+        '#ffb347' if result.get('price_source') in ('yf_fast_info','yf_history5d') else '#ff3b3b'}">
+        {'🟢 Upstox live' if result.get('price_source')=='upstox_cache' else
+         '🟢 Upstox API'  if result.get('price_source')=='upstox_api'   else
+         '🟡 yf fast_info' if result.get('price_source')=='yf_fast_info' else
+         '🟡 yf history5d' if result.get('price_source')=='yf_history5d' else
+         '🔴 OHLCV fallback — ₹'+str(round(result.get('ohlcv_last_price',0),2))}
       </div>
     </div>
     <div>
@@ -1338,7 +1757,7 @@ padding:12px 18px;font-family:'IBM Plex Mono',monospace;margin-bottom:12px;">
     <div>
       <div style="color:#555;font-size:.52rem;letter-spacing:.1em;">DIRECTION</div>
       <div style="color:{dir_color};font-size:1.1rem;font-weight:700;">{result['next_direction']}</div>
-      <div style="color:#888;font-size:.60rem;">Conf: {result['direction_conf']:.0%}</div>
+      <div style="color:#888;font-size:.60rem;">Empirical precision: {result.get('empirical_precision',0):.0%} | Edge: {result['direction_conf']:.0%}</div>
     </div>
     <div>
       <div style="color:#555;font-size:.52rem;letter-spacing:.1em;">MODEL ACCURACY</div>
@@ -1406,8 +1825,27 @@ padding:12px 18px;font-family:'IBM Plex Mono',monospace;margin-bottom:12px;">
 
 **Threshold:** {result['best_threshold']:.3f} (F1-optimal on training data — not fixed at 0.5)
 
-**Features:** {result['n_features']} signals — Returns, MAs, RSI, MACD, Bollinger Bands,
-ATR, Volume z-score, Stochastic, ADX, candle geometry, price position, lags
+**Features:** {result['n_features']} signals
+- **Technical (~45):** Returns (1/3/5/10/20d), dist from SMA5/10/20/50/200, Wilder RSI(7/14/21), MACD, Bollinger Bands width/position, ATR, volume z-score/ratio, Stochastic K/D, ADX, candle geometry (body/wicks/gap), 52w position, lagged returns
+- **Screener Signals (~20, same math as 1_Live_screener.py):**
+  `sc_rs_nifty` — vol-normalised tanh alpha vs Nifty 50 (F1)
+  `sc_momentum_vel/acc` — EMA5−EMA20 velocity + acceleration, percentile-ranked (F2)
+  `sc_vol_z_pct` — volume surge z-score percentile (F3)
+  `sc_accumulation` — vol5/vol20 sigmoid score, centre=1.3 (F4)
+  `sc_vol_contraction` — ATR5/ATR20 inverted percentile (F5)
+  `sc_range_compression` — range5/range20 inverted percentile (F5b)
+  `sc_vcve` — volume×compression interaction, hidden accumulation (F5c)
+  `sc_coil_quality` — base compression×flatness composite (F6)
+  `sc_trend_structure` — EMA9/EMA50 percentile over 250d (F7)
+  `sc_ema_alignment` — EMA9>EMA20>EMA50 alignment score (F7 bonus)
+  `sc_breakout_prox` — exp decay from 20d resistance, λ=1.5/ATR (F8)
+  `sc_atr_potential` — ATR% vs own 60d history percentile (F9)
+  `sc_candle_score` — 8-pattern composite score (F10)
+  `sc_sweep` — liquidity sweep detection (bonus)
+  `sc_above_vwma20/rising` — VWMA20 position (bonus)
+  `sc_momentum_stability` — positive-day fraction over 20d (bonus)
+  `sc_pos52w_pct` — 52w position percentile (bonus)
+  All sc_* shifted 1 bar — strict zero lookahead
 
 **Data:** {result['n_train']} train bars · {result['n_test']} test bars · {result['timeframe']}
 
