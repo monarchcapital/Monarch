@@ -186,6 +186,22 @@ hr { border-color: #1e1e1e !important; margin: 10px 0 !important; }
     text-transform: uppercase !important; border-radius: 0 !important;
     border: 1px solid var(--bb-border) !important;
 }
+/* Kill every possible form of the Streamlit expander arrow icon:
+   - SVG element (newer Streamlit)
+   - Material Icons <span> that renders "keyboard_arrow_right" / "keyboard_arrow_down"
+   - Any <span> inside summary that uses icon fonts */
+[data-testid="stExpander"] summary svg,
+[data-testid="stExpander"] summary .material-icons,
+[data-testid="stExpander"] summary span[data-testid="stExpanderToggleIcon"],
+[data-testid="stExpander"] summary > div > span:first-child,
+[data-testid="stExpander"] summary > span:first-child {
+    display: none !important;
+    visibility: hidden !important;
+    width: 0 !important;
+    overflow: hidden !important;
+    font-size: 0 !important;
+    color: transparent !important;
+}
 [data-testid="stExpander"] [data-testid="stMarkdownContainer"] p,
 [data-testid="stExpander"] [data-testid="stMarkdownContainer"] li,
 [data-testid="stExpander"] [data-testid="stMarkdownContainer"] td {
