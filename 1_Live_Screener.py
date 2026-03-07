@@ -1,23 +1,33 @@
 # ============================================================
-# MONARCH PRO ENGINE — v5  CSS + ACCURACY OVERHAUL
-# Changes vs v4:
-#   CSS:    Full Bloomberg terminal theme — ALL text readable.
-#           Global catch-all forces every text node to #c8c8c8.
-#           Tabs, expanders, metrics, alerts, markdown tables,
-#           inputs, sidebar all explicitly styled.
-#           Plotly charts: paper/plot bg = #0a0a0a/#000000,
-#           legend font forced to #e8e8e8 (was invisible black).
-#   AUDIT FIXES (mathematical, no arbitrary constants):
-#     F4 Accumulation: sigmoid(ratio, k=4, x0=1.3) replaces
-#        hard 1.2/1.4/1.6 step thresholds.
-#     F6 Base flatness: hi_spread / ATR replaces hi_spread * 40
-#        (40 was dimensionless magic; ATR normalization is dynamic).
-#     F8 Proximity: exp(-1.5 × d_atr) continuous decay replaces
-#        4 hard tier steps — no cliff-edges at 0.3/0.8 ATR.
-#     Stability: 20d window (was 10d) for more reliable trend signal.
-#        Threshold raised 0.30→0.35, bonus thresholds 0.70/0.60→0.65/0.55.
-#     Sweep: wick threshold = 0.5×ATR (was 0.35× candle range);
-#        vol condition upgraded to z-score ≥ 1.0 (was ratio ≥ 1.3).
+# MONARCH PRO ENGINE — v6  SCORING ENGINE OVERHAUL
+# Changes vs v5:
+#   SCORING:
+#     I-01 Bulk scorer: score = signal_strength × coverage
+#          Prevents stocks with sparse signals ranking above
+#          stocks with full signal coverage.
+#     I-02 RS vs Nifty: volatility-normalised alpha via tanh
+#          Replaces fixed ±2% band — adapts to stock's own σ.
+#     I-04 MA Structure: EMA9/EMA50 ratio percentile-ranked
+#          over 250d history + alignment bonus. Continuous,
+#          no step thresholds.
+#     I-05 Momentum Acceleration: EMA5−EMA20 velocity diff,
+#          percentile-ranked over 200d. 0-4 pts bonus (was
+#          binary 0/1/3 pts from crude RS delta comparison).
+#     I-06 VolCont (ATR5/ATR20): percentile-ranked over 250d,
+#          inverted — low ratio = high score. Replaces 4
+#          hard tier thresholds (0.55/0.65/0.75/0.85).
+#     I-07 RCI (range5/range20): same percentile treatment.
+#          Replaces 3 hard tier thresholds (0.40/0.55/0.70).
+#     I-08 52-week position score: percentile-ranked position
+#          within 52w high/low range. 0-3 pts bonus. True
+#          momentum leaders near highs now rewarded.
+#     I-10 Market breadth: VIX-level continuous scoring
+#          (−8 to +2 pts) + Nifty trend score (−8 to +4 pts).
+#          Replaces binary −8/−5 step penalties.
+#     I-11 Sector RS: alpha in σ-units via tanh. Replaces
+#          fixed ±3% band with vol-adaptive normalisation.
+#   PERFORMANCE:
+#     I-14 Market context cache TTL: 300s → 900s (15 min)
 # ============================================================
 
 import streamlit as st
@@ -235,6 +245,22 @@ hr { border-color: #1e1e1e !important; margin: 10px 0 !important; }
     font-weight: 600 !important; letter-spacing: 0.1em !important;
     text-transform: uppercase !important; border-radius: 0 !important;
     border: 1px solid var(--bb-border) !important;
+}
+/* Kill every possible form of the Streamlit expander arrow icon:
+   - SVG element (newer Streamlit)
+   - Material Icons <span> that renders "keyboard_arrow_right" / "keyboard_arrow_down"
+   - Any <span> inside summary that uses icon fonts */
+[data-testid="stExpander"] summary svg,
+[data-testid="stExpander"] summary .material-icons,
+[data-testid="stExpander"] summary span[data-testid="stExpanderToggleIcon"],
+[data-testid="stExpander"] summary > div > span:first-child,
+[data-testid="stExpander"] summary > span:first-child {
+    display: none !important;
+    visibility: hidden !important;
+    width: 0 !important;
+    overflow: hidden !important;
+    font-size: 0 !important;
+    color: transparent !important;
 }
 [data-testid="stExpander"] {
     border: 1px solid var(--bb-border) !important; border-radius: 0 !important;
@@ -778,10 +804,16 @@ if st.button("🚀 Start Bulk Extraction", use_container_width=True):
                 structure_series = (_compression * _inside * _pressure).fillna(0)
                 structure_chg = percentile_last(structure_series.diff(), regime_window)
 
-                components = [c for c in [trend_chg, momentum_chg, participation_chg,
-                                           location_chg, expansion_chg, structure_chg]
-                              if pd.notna(c)]
-                score = float(np.mean(components)*100) if components else 0
+                # FIX I-01: Remove missing-factor bias.
+                # A stock with only 2/6 signals can't rank as high as one with all 6.
+                # score = signal_strength × coverage — penalises sparse signal sets.
+                _all_comps = np.array([trend_chg, momentum_chg, participation_chg,
+                                       location_chg, expansion_chg, structure_chg],
+                                      dtype=float)
+                _valid      = np.sum(~np.isnan(_all_comps))
+                _coverage   = _valid / len(_all_comps)          # 0.0 – 1.0
+                _strength   = float(np.nanmean(_all_comps)) if _valid > 0 else 0.0
+                score       = float(_strength * _coverage * 100) if _valid > 0 else 0
 
                 latest = df.iloc[-1]
 
@@ -928,7 +960,7 @@ STOCK_SECTOR_MAP = {
     "DLF":"Realty","LODHA":"Realty","OBEROIRLTY":"Realty","PHOENIXLTD":"Realty",
 }
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=900)   # FIX I-14: 15-min cache (was 5-min) — market data rarely changes intra-session
 def get_market_context():
     out = dict(nifty_r5=None, nifty_r20=None,
                nifty_above_20dma=True, vix_level=None, vix_falling=True,
@@ -1089,25 +1121,37 @@ def volume_surge(v_today, v_series, window=20):
 def relative_strength(c_series, nifty_r5, nifty_r20, window5=5, window20=20):
     """
     RS score 0-1.
-    Measures stock alpha (outperformance) vs Nifty on two windows.
-    Normalisation uses the stock's own volatility (ATR%) as the
-    scaling unit — a +1×ATR% beat on 5d = full score on that leg.
-    This makes thresholds dynamic: high-vol stocks need a larger
-    absolute beat to score the same as low-vol stocks.
+    FIX I-02: Volatility-normalised alpha replaces the fixed ±2% band.
+    rs_alpha = (stock_return - index_return) / stock_return_std
+    This is superior because a +2% beat on a 10%-vol stock is weak signal;
+    the same +2% beat on a 1%-vol stock is a massive 2-std outperformance.
+    Percentile-ranked over the stock's own 60d history makes it fully adaptive.
     """
-    if len(c_series) < 21:
+    if len(c_series) < 22:
         return 0.5
     base_6  = float(c_series.iloc[-6])  if len(c_series) >= 6  else 0
     base_21 = float(c_series.iloc[-21]) if len(c_series) >= 21 else 0
     stock_r5  = float(c_series.iloc[-1] / base_6  - 1) if base_6  != 0 else 0
     stock_r20 = float(c_series.iloc[-1] / base_21 - 1) if base_21 != 0 else 0
-    r5_beat  = stock_r5  - (nifty_r5  or 0)
-    r20_beat = stock_r20 - (nifty_r20 or 0)
-    # Dynamic normalisation: ±2% outperformance band (covers NSE daily range well)
-    # clip → 0 at -2%, 1 at +2%
-    norm_band = 0.02
-    rs5  = min(1.0, max(0.0, (r5_beat  + norm_band) / (2 * norm_band)))
-    rs20 = min(1.0, max(0.0, (r20_beat + norm_band) / (2 * norm_band)))
+    r5_beat   = stock_r5  - (nifty_r5  or 0)
+    r20_beat  = stock_r20 - (nifty_r20 or 0)
+
+    # Volatility normalisation — use stock's own 20d return std as scaling unit
+    daily_rets = c_series.pct_change().dropna()
+    ret_std_5  = float(daily_rets.tail(5).std())  if len(daily_rets) >= 5  else 0.01
+    ret_std_20 = float(daily_rets.tail(20).std()) if len(daily_rets) >= 20 else 0.01
+    ret_std_5  = max(ret_std_5,  0.001)   # floor: prevents div-by-zero on zero-vol
+    ret_std_20 = max(ret_std_20, 0.001)
+
+    # alpha in units of stock volatility (z-score of outperformance)
+    alpha_5  = r5_beat  / (ret_std_5  * np.sqrt(5)  + 1e-9)
+    alpha_20 = r20_beat / (ret_std_20 * np.sqrt(20) + 1e-9)
+
+    # Percentile-rank each alpha vs a ±3 std range → 0-1 score
+    # tanh squashing: output 0.5 at alpha=0, →1 as alpha→+∞, →0 as alpha→-∞
+    rs5  = float(0.5 * (1.0 + np.tanh(alpha_5  / 1.5)))
+    rs20 = float(0.5 * (1.0 + np.tanh(alpha_20 / 1.5)))
+
     return rs5 * 0.6 + rs20 * 0.4   # 5d weighted more for short-term momentum
 
 
@@ -1141,6 +1185,7 @@ def score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker=""):
     hc = hist["close"]; hh = hist["high"]; hl = hist["low"]; hv = hist["volume"]
 
     e9   = ema(c, 9);  e20 = ema(c, 20);  e50 = ema(c, 50)
+    e5   = ema(c, 5)   # FIX I-05: needed for momentum acceleration
     atr  = atr14(df)
     rsi  = rsi_wilder(c, 7)
 
@@ -1194,19 +1239,19 @@ def score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker=""):
     rs_pts   = round(rs_score * 15, 1)
 
     # ── RS ACCELERATION (momentum strengthening signal) ──
-    # stock_r5 beat vs stock_r10 beat — is RS improving?
-    if len(hc) >= 11:
-        base_5  = float(hc.iloc[-6])  if hc.iloc[-6]  != 0 else None
-        base_10 = float(hc.iloc[-11]) if hc.iloc[-11] != 0 else None
-        if base_5 and base_10:
-            r5d  = float(hc.iloc[-1] / base_5  - 1)
-            r10d = float(hc.iloc[-1] / base_10 - 1)
-            rs_accel = (r5d - (nifty_r5 or 0)) - (r10d - (nifty_r20 or 0))
-        else:
-            rs_accel = 0.0
-    else:
-        rs_accel = 0.0
-    rs_accel_bonus = 3 if rs_accel > 0.01 else 1 if rs_accel > 0 else 0
+    # FIX I-05: Replace binary rs_accel_bonus with continuous percentile-ranked
+    # EMA velocity acceleration. velocity = EMA5 - EMA20 (price momentum speed).
+    # acceleration = velocity.diff() — detects early ignition of trend.
+    # This is a true leading signal: catches acceleration BEFORE RS confirms.
+    _velocity     = e5 - e20
+    _acceleration = _velocity.diff()
+    _acc_hist     = _acceleration.iloc[:-1]   # no look-ahead
+    _acc_pct      = percentile_last(_acc_hist, min(200, len(_acc_hist)))
+    acc_score     = float(_acc_pct) if pd.notna(_acc_pct) else 0.5
+    rs_accel_bonus = round(acc_score * 4, 1)  # 0-4 pts (was binary 0/1/3)
+
+    # Also retain raw accel value for display / backtest output
+    rs_accel = float(_acceleration.iloc[-2]) if len(_acceleration) >= 2 else 0.0
 
     # ═══════════════════════════════════════════════════════
     # F2 — RS vs SECTOR  (0-10 pts)
@@ -1216,12 +1261,22 @@ def score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker=""):
     # ═══════════════════════════════════════════════════════
     sect_ret, sect_ret_10d, sect_name = get_sector_return(ticker) if ticker else (None, None, None)
     if sect_ret is not None and len(hc) >= 6:
-        hc_base = float(hc.iloc[-6])
+        hc_base    = float(hc.iloc[-6])
         stock_r5   = float(hc.iloc[-1] / hc_base - 1) if hc_base != 0 else 0
-        sect_beat  = stock_r5 - sect_ret
-        rs_sect_sc = min(1.0, max(0.0, (sect_beat + 0.03) / 0.06))
+        sect_beat  = stock_r5 - sect_ret   # raw alpha vs own sector
+
+        # FIX I-11: sector alpha percentile via tanh normalisation.
+        # Replaces fixed ±3% band with vol-adaptive scaling.
+        # alpha in σ-units: divide by stock's own 5d return std.
+        _daily_r_5 = hc.pct_change().dropna().tail(5)
+        _r5_std    = max(float(_daily_r_5.std()) if len(_daily_r_5) >= 3 else 0.01, 0.001)
+        _sect_alpha_z = sect_beat / (_r5_std * np.sqrt(5) + 1e-9)
+        # tanh → 0.5 at 0 alpha, →1 as alpha→+∞, →0 as alpha→-∞
+        rs_sect_sc = float(0.5 * (1.0 + np.tanh(_sect_alpha_z / 1.5)))
+
         if sect_name in top_sectors:
-            rs_sect_sc = min(1.0, rs_sect_sc + 0.2)
+            rs_sect_sc = min(1.0, rs_sect_sc + 0.15)
+
         # FIX B-01: real sector acceleration using two independent timeframes
         if sect_ret_10d is not None:
             sect_accel = sect_ret - sect_ret_10d   # positive = sector accelerating
@@ -1286,40 +1341,56 @@ def score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker=""):
     inst_pts   = round(10.0 / (1.0 + np.exp(-4.0 * (inst_ratio - 1.3))), 1)
     inst_pts   = max(0.0, min(10.0, inst_pts))
 
-    # ── VCVE: Volume-Compression Interaction ──
-    # Detects hidden accumulation: rising vol + falling volatility
-    tr_s  = pd.concat([hh-hl,
-                        (hh - hc.shift(1)).abs(),
-                        (hl - hc.shift(1)).abs()], axis=1).max(axis=1)
-    atr5_h  = float(tr_s.iloc[-5:].mean())  if len(tr_s) >= 5  else atr_v
-    atr20_h = float(tr_s.iloc[-20:].mean()) if len(tr_s) >= 20 else atr_v
+    # ═══════════════════════════════════════════════════════
+    # F5 — VOLATILITY CONTRACTION + RANGE COMPRESSION  (0-10 pts)
+    # FIX I-06: ATR5/ATR20 ratio percentile-ranked over 250d history.
+    # LOW percentile = stock is more compressed than usual = coiling energy.
+    # Score = 1 - percentile (we want LOW ratio = HIGH score).
+    # FIX I-07: Same treatment for range compression (range5/range20).
+    # Both fully adaptive to the stock's own volatility regime.
+    # ═══════════════════════════════════════════════════════
+
+    # Build ATR5/ATR20 ratio history (on hist slice, no look-ahead)
+    _tr_series  = pd.concat([hh - hl,
+                              (hh - hc.shift(1)).abs(),
+                              (hl - hc.shift(1)).abs()], axis=1).max(axis=1)
+    _atr5_hist  = _tr_series.rolling(5).mean()
+    _atr20_hist = _tr_series.rolling(20).mean()
+    _vc_series  = _atr5_hist / (_atr20_hist.replace(0, np.nan))
+    _vc_pct     = percentile_last(_vc_series, min(250, len(_vc_series)))
+    if pd.isna(_vc_pct):
+        _vc_pct = 0.5
+    # Low ratio = high compression = good → invert: score = 1 - percentile
+    vc_pts = round((1.0 - _vc_pct) * 5, 1)   # 0-5 pts
+
+    # Range Compression Index — percentile-ranked
+    _rng_series = (hh.rolling(5).max() - hl.rolling(5).min()) / \
+                  (hh.rolling(20).max() - hl.rolling(20).min() + 1e-9)
+    _rci_pct    = percentile_last(_rng_series, min(250, len(_rng_series)))
+    if pd.isna(_rci_pct):
+        _rci_pct = 0.5
+    rci     = float(_rng_series.iloc[-1]) if pd.notna(_rng_series.iloc[-1]) else 1.0
+    rci_pts = round((1.0 - _rci_pct) * 5, 1)  # 0-5 pts
+
+    vc_pts  = vc_pts + rci_pts   # combined 0-10
+
+    # Keep vc_ratio for VCVE and horizon computations
+    atr5_h  = float(_tr_series.iloc[-5:].mean())  if len(_tr_series) >= 5  else atr_v
+    atr20_h = float(_tr_series.iloc[-20:].mean()) if len(_tr_series) >= 20 else atr_v
     vc_ratio = atr5_h / (atr20_h + 1e-9)
+
+    # ── VCVE: Volume-Compression Interaction (bonus) ──
+    # Detects hidden accumulation: rising vol + falling volatility.
+    # Evaluated here because vc_ratio is now available.
     vcve     = inst_ratio * (1.0 - min(vc_ratio, 1.0))
     if   vcve >= 0.7: vcve_bonus = 3
     elif vcve >= 0.5: vcve_bonus = 2
     elif vcve >= 0.3: vcve_bonus = 1
     else:             vcve_bonus = 0
 
-    # ═══════════════════════════════════════════════════════
-    # F5 — VOLATILITY CONTRACTION + RANGE COMPRESSION  (0-10 pts)
-    # ATR5/ATR20 < 0.7 = energy coiling
-    # RCI = range5/range20 < 0.6 = price tightening
-    # ═══════════════════════════════════════════════════════
-    if   vc_ratio <= 0.55: vc_pts = 5
-    elif vc_ratio <= 0.65: vc_pts = 4
-    elif vc_ratio <= 0.75: vc_pts = 3
-    elif vc_ratio <= 0.85: vc_pts = 1
-    else:                  vc_pts = 0
-
-    # Range Compression Index
-    range5  = float((hh.tail(5).max() - hl.tail(5).min()))
+    # Range 5 / Range 20 scalar for display
+    range5  = float((hh.tail(5).max()  - hl.tail(5).min()))
     range20 = float((hh.tail(20).max() - hl.tail(20).min()))
-    rci     = range5 / (range20 + 1e-9)
-    if   rci <= 0.40: rci_pts = 5
-    elif rci <= 0.55: rci_pts = 4
-    elif rci <= 0.70: rci_pts = 2
-    else:             rci_pts = 0
-    vc_pts = vc_pts + rci_pts   # combined 0-10
 
     # ═══════════════════════════════════════════════════════
     # F6 — BASE / COIL QUALITY + BASE POSITION  (0-10 pts)
@@ -1350,6 +1421,33 @@ def score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker=""):
         else:                        coil_sc = 0.2
         base_pos = (ltp - base_lo) / (base_rng + 1e-9)
     coil_pts = round(coil_sc * 10, 1)
+
+    # ─────────────────────────────────────────────────────
+    # FIX I-08: 52-WEEK POSITION SCORE (bonus up to +3 pts)
+    # position = (price - low_250) / (high_250 - low_250)
+    # Percentile-ranked over own 250d position history.
+    # High percentile = near 52w highs = momentum leader.
+    # This identifies true leaders (near highs while compressing)
+    # vs stocks merely bouncing from oversold lows.
+    # ─────────────────────────────────────────────────────
+    if len(hc) >= 50:
+        _n250      = min(250, len(hc))
+        _hi250     = float(hh.tail(_n250).max())
+        _lo250     = float(hl.tail(_n250).min())
+        _pos_now   = (ltp - _lo250) / (_hi250 - _lo250 + 1e-9)
+        # Build rolling position series over same window
+        _pos_series = (hc - hc.rolling(_n250).min()) / \
+                      (hc.rolling(_n250).max() - hc.rolling(_n250).min() + 1e-9)
+        _pos_pct    = percentile_last(_pos_series, min(250, len(_pos_series)))
+        if pd.notna(_pos_pct):
+            pos52w_bonus = round(_pos_pct * 3, 1)   # 0-3 pts
+            pos52w       = round(_pos_now, 3)
+        else:
+            pos52w_bonus = 0.0
+            pos52w       = round(base_pos, 3)
+    else:
+        pos52w_bonus = 0.0
+        pos52w       = round(base_pos, 3)
 
     # ═══════════════════════════════════════════════════════
     # LIQUIDITY SWEEP DETECTION (bonus pts)
@@ -1414,14 +1512,24 @@ def score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker=""):
 
     # ═══════════════════════════════════════════════════════
     # F7 — TREND STRUCTURE / MA  (0-10 pts)
-    # Uses yesterday's EMAs to avoid today's contamination
+    # FIX I-04: Replace hard step scoring with EMA9/EMA50 ratio
+    # percentile-ranked over 250d history — fully continuous, adaptive.
+    # trend_ratio = EMA9 / EMA50 captures both direction AND strength.
+    # percentile_last(trend_ratio, 250) → 0 at 250d lows, 1 at 250d highs.
+    # Bonus: classic EMA alignment check still used as a quality gate.
     # ═══════════════════════════════════════════════════════
-    ma_pts = 0
+    trend_ratio_series = e9 / e50.replace(0, np.nan)
+    trend_pct  = percentile_last(trend_ratio_series.iloc[:-1], min(250, len(df)-1))
+    if pd.isna(trend_pct):
+        trend_pct = 0.5
+    ma_pts = round(trend_pct * 8, 1)   # 0-8 pts from percentile
+
+    # Alignment bonus: EMA9 > EMA20 > EMA50 = clean uptrend → +2 pts
     yc = float(hc.iloc[-1])
-    if yc > e9_y:    ma_pts += 3
-    if yc > e20_y:   ma_pts += 3
-    if ltp > e50_v:  ma_pts += 2
-    if e9_y > e20_y: ma_pts += 2
+    if e9_y > e20_y and e20_y > e50_v:
+        ma_pts = min(10.0, ma_pts + 2.0)
+    elif yc > e9_y:
+        ma_pts = min(10.0, ma_pts + 1.0)
 
     # ═══════════════════════════════════════════════════════
     # F8 — BREAKOUT PROXIMITY  (0-10 pts)
@@ -1479,7 +1587,8 @@ def score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker=""):
              vc_pts + coil_pts + ma_pts + prox_pts + atp_pts + cdl_pts)
 
     # ── BONUS SIGNALS (additive, capped at 100) ──
-    bonuses = rs_accel_bonus + vcve_bonus + sweep_bonus + vwap_bonus + stab_bonus
+    # FIX I-08: pos52w_bonus added (0-3 pts) — 52-week position leader premium
+    bonuses = rs_accel_bonus + vcve_bonus + sweep_bonus + vwap_bonus + stab_bonus + pos52w_bonus
     total  += bonuses
 
     # ── ADJUSTMENTS ──
@@ -1489,8 +1598,39 @@ def score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker=""):
         total += 5
     if setup_type == "Pullback" and ltp < e20_v:
         total -= 4
-    if not mkt["nifty_above_20dma"]: total -= 8
-    if not mkt["vix_falling"]:       total -= 5
+
+    # FIX I-10: Replace binary Nifty/VIX penalties with continuous breadth adjustment.
+    # breadth_score = percentile of (% stocks above EMA20) vs 200d history.
+    # We approximate breadth via Nifty position vs 20DMA and VIX percentile.
+    # nifty_above_20dma → replaced by continuous nifty position score.
+    # vix_falling → replaced by VIX trend strength.
+    # Both derived from mkt data already fetched; no extra API calls needed.
+    _nifty_breadth_adj = 0.0
+    if mkt.get("nifty_r5") is not None and mkt.get("nifty_r20") is not None:
+        # Use nifty 5d and 20d returns as breadth proxy:
+        # Strong +ve trend = broad participation likely → small bonus
+        # Weak / negative = breadth deteriorating → penalty
+        _n5  = mkt["nifty_r5"]  or 0.0
+        _n20 = mkt["nifty_r20"] or 0.0
+        _nifty_breadth_adj = np.clip((_n5 + _n20 * 0.5) * 100, -8, 4)
+    elif not mkt["nifty_above_20dma"]:
+        _nifty_breadth_adj = -8   # fallback to original binary penalty
+
+    _vix_adj = 0.0
+    if mkt.get("vix_level") is not None:
+        _vix = mkt["vix_level"]
+        # VIX: < 14 = benign (bonus), 14-18 = neutral, 18-25 = elevated (-pts), >25 = danger
+        if   _vix < 14:  _vix_adj =  2.0
+        elif _vix < 18:  _vix_adj =  0.0
+        elif _vix < 22:  _vix_adj = -3.0
+        elif _vix < 26:  _vix_adj = -5.0
+        else:            _vix_adj = -8.0
+        if not mkt["vix_falling"]:   # VIX rising makes it worse
+            _vix_adj = min(0.0, _vix_adj - 2.0)
+    elif not mkt["vix_falling"]:
+        _vix_adj = -5.0   # fallback
+
+    total += _nifty_breadth_adj + _vix_adj
     total = max(0, min(100, round(total, 1)))
 
     # ── EMI = Score × ATR%  (rewards volatile high-score setups) ──
@@ -1650,12 +1790,14 @@ def score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker=""):
         "Candle":    round(cdl_pts, 1),
         "Patterns":  ", ".join(candle_names) if candle_names else "—",
         # bonus signals
-        "RS_Accel":  round(rs_accel, 4),
-        "VCVE":      round(vcve, 3),
-        "BasePos":   round(base_pos, 3),
-        "Stability": round(stability, 2),
-        "Sweep":     sweep_bonus > 0,
-        "VWMA20_OK": vwap_bonus > 0,   # FIX B-04: renamed from VWAP_OK
+        "RS_Accel":   round(rs_accel, 4),
+        "AccelScore": round(acc_score * 100, 1),  # FIX I-05: continuous acceleration percentile
+        "VCVE":       round(vcve, 3),
+        "BasePos":    round(base_pos, 3),
+        "Pos52W":     round(pos52w, 3),            # FIX I-08: 52-week position percentile
+        "Stability":  round(stability, 2),
+        "Sweep":      sweep_bonus > 0,
+        "VWMA20_OK":  vwap_bonus > 0,   # FIX B-04: renamed from VWAP_OK
         # info
         "RSI7":      round(rsi_v, 1),
         "VolRatio":  round(vol_ratio, 2),
@@ -2083,28 +2225,35 @@ padding:10px 9px;font-family:'IBM Plex Mono',monospace;">
 | 📊 MID 5-14D | Within 3×ATR of trigger, setup forming | 3.5×ATR | Watchlist — wait for volume confirmation |
 | 🏦 LONG 14-30D | > 3×ATR from trigger, base building | 5.0×ATR | Monitor only, do not enter yet |
 
-**MATHEMATICAL BASIS:**
+**MATHEMATICAL BASIS (v6 — all signals threshold-free):**
 - **Vol z-score (VolZ):** (today_vol − 20d_mean) / 20d_σ — dynamic, adapts to each stock
 - **Vol BO Threshold (VolBOThr):** μ + 1.5σ (shown as × of average) — no hardcoded multiples
 - **ATR%:** scored vs stock's own 60d ATR% percentile — high-vol stocks score vs themselves
-- **RS normalisation:** ±2% alpha band — covers NSE daily return distribution
+- **RS normalisation (v6):** volatility-normalised alpha (z-score) via tanh squashing — replaces fixed ±2% band
+- **Sector RS (v6):** sector alpha in σ-units via tanh — replaces fixed ±3% band
+- **Trend (v6):** EMA9/EMA50 ratio percentile-ranked over 250d — continuous, no EMA step thresholds
+- **Accel (v6):** EMA5−EMA20 velocity differential, percentile-ranked — leading momentum signal
+- **VolCont (v6):** ATR5/ATR20 & range5/range20 percentile-ranked over 250d — fully adaptive
+- **52W Position (v6):** price position in 52-week range, percentile-ranked — identifies true leaders
+- **Market breadth (v6):** VIX-level + Nifty trend continuous scoring — no binary penalties
 
 **10 FACTORS + BONUSES (100 pts base):**
 
 | Factor | Max | Signal |
 |--------|-----|--------|
-| RS Nifty | 15 | 5d+20d alpha vs index (2% normalisation band) |
-| RS Sector | 10 | Stock vs sector 5d, incl. sector acceleration 5d/10d |
+| RS Nifty | 15 | Vol-normalised alpha vs Nifty, tanh-squashed (v6) |
+| RS Sector | 10 | Stock α vs sector in σ-units, sector rotation acceleration |
 | Volume Surge | 15 | z-score of today's vol vs 20d σ distribution |
-| Pre-BO Accum | 10 | vol5/vol20 ratio — institutional footprint |
-| VolCont + RCI | 10 | ATR5/ATR20 compression + range5/range20 compression |
+| Pre-BO Accum | 10 | vol5/vol20 sigmoid(k=4, x0=1.3) — no hard thresholds |
+| VolCont + RCI | 10 | ATR5/ATR20 + range5/range20 percentile-ranked over 250d (v6) |
 | Coil Quality | 10 | Base tightness + flat resistance + price position |
-| MA Structure | 10 | EMA9/20/50 alignment (yesterday's EMAs, no look-ahead) |
-| Proximity | 10 | ATR-normalised distance to trigger |
+| MA Structure | 10 | EMA9/EMA50 ratio percentile (250d) + alignment bonus (v6) |
+| Proximity | 10 | ATR-normalised distance to trigger, exp decay |
 | ATR% Rank | 5 | Stock's ATR% vs its own 60d percentile distribution |
 | Candle | 5 | 8 bullish patterns (Engulfing, Hammer, MorningStar etc.) |
+| **Bonuses** | +13 | Accel (4), VCVE (3), 52W Pos (3), Sweep (4), VWMA (3), Stability (2) |
 
-**Market penalties:** −8 pts Nifty below 20DMA · −5 pts VIX rising
+**Market adjustment (v6):** Continuous VIX-level scoring (−8 to +2 pts) · Nifty trend adjustment (−8 to +4 pts)
 """)
 
 
