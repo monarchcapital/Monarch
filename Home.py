@@ -245,23 +245,75 @@ hr, [data-testid="stDivider"] hr { border-color: var(--bb-border) !important; }
 """, unsafe_allow_html=True)
 
 # ============================================================
-# UPSTOX CREDENTIALS — hardcoded from auth.json
+# ============================================================
+# UPSTOX CREDENTIALS
 # ============================================================
 UPSTOX_CLIENT_ID     = "e720544b-52d6-4f92-941a-9f2fecb1ec72"
 UPSTOX_CLIENT_SECRET = "eujrsvhzju"
 UPSTOX_REDIRECT_URI  = "http://127.0.0.1"
 UPSTOX_AUTH_URL      = "https://api.upstox.com/v2/login/authorization/dialog"
 UPSTOX_TOKEN_URL     = "https://api.upstox.com/v2/login/authorization/token"
+UPSTOX_TOKEN_REQ_URL = "https://api.upstox.com/v3/login/auth/token/request/{client_id}"
 TOKEN_FILE           = ".upstox_token_scanner"
-AUTH_CODE_FILE       = ".upstox_auth_code"   # temp file written by local redirect server
+WEBHOOK_TOKEN_FILE   = ".upstox_webhook_token"  # written by webhook receiver
+AUTH_CODE_FILE       = ".upstox_auth_code"
 
-# ============================================================
-# AUTO-LOGIN: local HTTP server to catch redirect code
-# ============================================================
 import socketserver, http.server, webbrowser
 
+# ============================================================
+# WEBHOOK RECEIVER — catches token pushed by Upstox after phone approval
+# Upstox POSTs {"access_token": "...", "message_type": "access_token"} to this URL
+# We run a tiny HTTP server on port 8765 to receive it
+# ============================================================
+WEBHOOK_PORT = 8765
+
+class _WebhookHandler(http.server.BaseHTTPRequestHandler):
+    """Receives POST from Upstox with access_token after user taps Approve."""
+    def do_POST(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body   = self.rfile.read(length)
+            data   = json.loads(body)
+            token  = data.get("access_token", "")
+            if token:
+                with open(WEBHOOK_TOKEN_FILE, "w") as f: f.write(token)
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"status":"ok"}')
+        except:
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"status":"ok"}')
+    def do_GET(self):
+        # Also handle redirect-based flow as fallback
+        try:
+            parsed = urllib.parse.urlparse(self.path)
+            params = urllib.parse.parse_qs(parsed.query)
+            code   = params.get("code", [""])[0]
+            if code:
+                with open(AUTH_CODE_FILE, "w") as f: f.write(code)
+            self.send_response(200)
+            self.send_header("Content-type", "text/html")
+            self.end_headers()
+            self.wfile.write(b"""<html><body style='background:#0a0a0a;color:#00d084;
+font-family:monospace;text-align:center;padding-top:80px;font-size:1.5rem;'>
+<b>&#10003; MONARCH PRO</b><br><span style='color:#888;font-size:1.1rem;'>
+Auth received. Return to the dashboard.</span></body></html>""")
+        except: pass
+    def log_message(self, *args): pass
+
+def _start_webhook_server():
+    """Start webhook receiver on port 8765 in background thread."""
+    try:
+        socketserver.TCPServer.allow_reuse_address = True
+        with socketserver.TCPServer(("0.0.0.0", WEBHOOK_PORT), _WebhookHandler) as srv:
+            srv.handle_request()
+    except Exception:
+        pass
+
+# ── Legacy redirect server for local fallback (port 80) ──
 class _OAuthHandler(http.server.BaseHTTPRequestHandler):
-    """Catches GET /?code=... from Upstox redirect and saves the code."""
     def do_GET(self):
         try:
             parsed = urllib.parse.urlparse(self.path)
@@ -273,29 +325,42 @@ class _OAuthHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-type", "text/html")
             self.end_headers()
             self.wfile.write(b"""<html><body style='background:#0a0a0a;color:#00d084;
-font-family:monospace;text-align:center;padding-top:80px;font-size:1.50rem;'>
-<b>&#10003; MONARCH PRO</b><br><span style='color:#888;font-size:1.12rem;'>
+font-family:monospace;text-align:center;padding-top:80px;font-size:1.5rem;'>
+<b>&#10003; MONARCH PRO</b><br><span style='color:#888;font-size:1.1rem;'>
 Auth code received. Return to the dashboard.</span></body></html>""")
         except: pass
     def log_message(self, *args): pass
 
 def _start_redirect_server():
-    """
-    Tries port 80 first (matches Upstox redirect URI http://127.0.0.1).
-    On Windows, port 80 requires admin rights — if it fails the sidebar
-    shows a fallback paste box so the user can copy the URL manually.
-    """
     try:
         socketserver.TCPServer.allow_reuse_address = True
         with socketserver.TCPServer(("127.0.0.1", 80), _OAuthHandler) as srv:
             srv.handle_request()
     except PermissionError:
-        # Port 80 blocked — write a sentinel so sidebar knows
         try:
             with open(AUTH_CODE_FILE, "w") as f: f.write("__PORT80_BLOCKED__")
         except: pass
     except Exception:
         pass
+
+def upstox_request_token_via_phone(client_id, notifier_url):
+    """
+    Calls Upstox Access Token Request API.
+    Upstox sends push notification + WhatsApp to the account holder.
+    On approval, token is POSTed to notifier_url.
+    Returns (success, message)
+    """
+    try:
+        url = UPSTOX_TOKEN_REQ_URL.format(client_id=client_id)
+        r = requests.post(url,
+            json={"notifier_url": notifier_url},
+            headers={"Content-Type": "application/json", "accept": "application/json"},
+            timeout=15)
+        if r.status_code == 200:
+            return True, r.json()
+        return False, r.text
+    except Exception as e:
+        return False, str(e)
 
 def upstox_get_access_token(client_id, client_secret, redirect_uri, code):
     try:
@@ -315,24 +380,28 @@ def upstox_get_access_token(client_id, client_secret, redirect_uri, code):
 
 def save_token(token):
     st.session_state.upstox_token = token
+    # Share to all other pages via session state
+    st.session_state.scanner_token      = token
+    st.session_state.opt_access_token   = token
     try:
         with open(TOKEN_FILE, "w") as f: f.write(token)
     except: pass
 
 # ── Load existing token on startup ──
 if "home_token_loaded" not in st.session_state:
-    if os.path.exists(TOKEN_FILE):
-        try:
-            with open(TOKEN_FILE) as f:
-                st.session_state.upstox_token = f.read().strip()
-        except:
-            st.session_state.upstox_token = ""
-    else:
-        st.session_state.upstox_token = ""
+    tok = ""
+    # 1. secrets
+    try: tok = st.secrets.get("upstox_token","")
+    except: pass
+    # 2. token file
+    if not tok and os.path.exists(TOKEN_FILE):
+        try: tok = open(TOKEN_FILE).read().strip()
+        except: pass
+    st.session_state.upstox_token = tok
     st.session_state.home_token_loaded = True
 
 # ── Session state defaults ──
-for k, v in [("ux_step","idle"), ("ux_server_started", False)]:
+for k, v in [("ux_step","idle"), ("ux_server_started",False), ("ux_webhook_started",False)]:
     if k not in st.session_state: st.session_state[k] = v
 
 # ============================================================
@@ -573,7 +642,7 @@ padding:4px 16px;display:flex;justify-content:space-between;align-items:center;m
 """, unsafe_allow_html=True)
 
 # ============================================================
-# SIDEBAR — Upstox Auto-Login (one-click)
+# SIDEBAR — Upstox Login (Phone Approval + OTP fallback)
 # ============================================================
 with st.sidebar:
     st.markdown("""
@@ -592,133 +661,181 @@ padding:10px 12px;font-family:'IBM Plex Mono',monospace;margin-bottom:10px;">
   <div style="color:#00d084;font-size:0.85rem;font-weight:700;letter-spacing:.1em;margin-bottom:4px;">
     ✔ UPSTOX CONNECTED
   </div>
-  <div style="color:#888;font-size:0.70rem;">
-    Token: <span style="color:#aaa;">{st.session_state.upstox_token[:20]}…</span>
-  </div>
-  <div style="color:#666;font-size:0.65rem;margin-top:3px;">Auto-refreshes daily on re-login</div>
+  <div style="color:#888;font-size:0.72rem;">Token: {st.session_state.upstox_token[:20]}…</div>
+  <div style="color:#555;font-size:0.65rem;margin-top:3px;">Valid until 3:30 AM · shared across all pages</div>
 </div>""", unsafe_allow_html=True)
         if st.button("↺  Disconnect / Re-login", key="re_login_btn", use_container_width=True):
             st.session_state.ux_step = "idle"
             st.session_state.ux_server_started = False
+            st.session_state.ux_webhook_started = False
             st.session_state.upstox_token = ""
-            try:
-                if os.path.exists(TOKEN_FILE): os.remove(TOKEN_FILE)
-                if os.path.exists(AUTH_CODE_FILE): os.remove(AUTH_CODE_FILE)
-            except: pass
+            st.session_state.scanner_token = ""
+            st.session_state.opt_access_token = ""
+            for f in [TOKEN_FILE, AUTH_CODE_FILE, WEBHOOK_TOKEN_FILE]:
+                try:
+                    if os.path.exists(f): os.remove(f)
+                except: pass
             st.rerun()
 
-    # ── Auto-login flow ──
     else:
-        # Check if the redirect server already caught a code
+        # ── Check if webhook already delivered a token ──
+        if os.path.exists(WEBHOOK_TOKEN_FILE):
+            try:
+                tok = open(WEBHOOK_TOKEN_FILE).read().strip()
+            except: tok = ""
+            if tok:
+                save_token(tok)
+                try: os.remove(WEBHOOK_TOKEN_FILE)
+                except: pass
+                st.session_state.ux_step = "idle"
+                st.session_state.ux_webhook_started = False
+                st.rerun()
+
+        # ── Check if redirect-based flow caught a code ──
         if os.path.exists(AUTH_CODE_FILE):
             try:
-                with open(AUTH_CODE_FILE) as f:
-                    caught_code = f.read().strip()
-            except:
-                caught_code = ""
-
-            if caught_code == "__PORT80_BLOCKED__":
+                caught = open(AUTH_CODE_FILE).read().strip()
+            except: caught = ""
+            if caught == "__PORT80_BLOCKED__":
                 try: os.remove(AUTH_CODE_FILE)
                 except: pass
                 st.session_state.ux_step = "port_blocked"
                 st.session_state.ux_server_started = False
                 st.rerun()
-            elif caught_code:
-                st.session_state.ux_step = "exchanging"
+            elif caught:
                 with st.spinner("🔑 Exchanging code for token…"):
                     ok, tok, resp = upstox_get_access_token(
                         UPSTOX_CLIENT_ID, UPSTOX_CLIENT_SECRET,
-                        UPSTOX_REDIRECT_URI, caught_code)
-                try:
-                    os.remove(AUTH_CODE_FILE)
+                        UPSTOX_REDIRECT_URI, caught)
+                try: os.remove(AUTH_CODE_FILE)
                 except: pass
                 if ok and tok:
                     save_token(tok)
                     st.session_state.ux_step = "idle"
                     st.session_state.ux_server_started = False
-                    st.success("✔ Connected to Upstox!")
-                    time.sleep(0.8)
                     st.rerun()
                 else:
                     st.session_state.ux_step = "idle"
-                    st.session_state.ux_server_started = False
-                    err = str(resp)[:300]
-                    st.markdown(f"""
-<div style="background:#1a0000;border:1px solid #ff3b3b;padding:8px 10px;
-font-size:0.72rem;color:#ff3b3b;margin-top:6px;">
-  <b>Token exchange failed</b><br/>
-  <span style="color:#aaa;font-size:0.68rem;">{err}</span><br/><br/>
-  <span style="color:#888;">Check Client Secret is correct, then try again.</span>
-</div>""", unsafe_allow_html=True)
+                    st.error(f"Token exchange failed: {str(resp)[:200]}")
 
-        # Show the one-click connect button
-        if not token_ok:
-            st.markdown("""
+        # ── Login mode selector ──
+        st.markdown("""
 <div style="background:#0a0800;border:1px solid #ff8c00;padding:10px 12px;margin-bottom:10px;">
-  <div style="color:#ffb347;font-size:0.75rem;font-weight:700;letter-spacing:.1em;margin-bottom:6px;">
-    ⚡ ONE-CLICK UPSTOX LOGIN
+  <div style="color:#ffb347;font-size:0.72rem;font-weight:700;letter-spacing:.1em;margin-bottom:6px;">
+    ⚡ UPSTOX LOGIN
   </div>
-  <div style="color:#888;font-size:0.69rem;line-height:1.8;">
-    1. Click <b style="color:#ff8c00;">CONNECT UPSTOX</b> below<br/>
-    2. Browser opens Upstox login page<br/>
-    3. Login with phone + OTP<br/>
-    4. Come back here — token auto-fetched ✔
+  <div style="color:#888;font-size:0.65rem;line-height:1.8;">
+    Choose how to connect each morning:
   </div>
 </div>""", unsafe_allow_html=True)
 
-            if st.button("⚡  CONNECT UPSTOX", key="auto_login_btn",
+        login_mode = st.radio("Login method", 
+            ["📱 Phone Approval (1 tap)", "🌐 OTP in Browser"],
+            key="login_mode_radio",
+            label_visibility="collapsed")
+
+        st.markdown('<div style="border-top:1px solid #1a1a1a;margin:8px 0;"></div>', unsafe_allow_html=True)
+
+        # ══════════════════════════════════════════════════════
+        # MODE 1: PHONE APPROVAL (semi-automated webhook flow)
+        # ══════════════════════════════════════════════════════
+        if login_mode == "📱 Phone Approval (1 tap)":
+            st.markdown("""
+<div style="background:#001520;border:1px solid #1e90ff;padding:9px 11px;margin-bottom:10px;
+font-family:'IBM Plex Mono',monospace;">
+  <div style="color:#1e90ff;font-size:0.72rem;font-weight:700;margin-bottom:5px;">HOW IT WORKS</div>
+  <div style="color:#888;font-size:0.62rem;line-height:1.9;">
+    1. Click <b style="color:#ff8c00;">REQUEST TOKEN</b><br/>
+    2. Check Upstox app / WhatsApp<br/>
+    3. Tap <b style="color:#00d084;">Approve</b> on the notification<br/>
+    4. Dashboard auto-connects ✔
+  </div>
+  <div style="color:#555;font-size:0.58rem;margin-top:5px;border-top:1px solid #1a1a1a;padding-top:4px;">
+    ⚠ Requires <b style="color:#ffb347;">Notifier Webhook URL</b> set in your<br/>
+    Upstox API app settings (see below)
+  </div>
+</div>""", unsafe_allow_html=True)
+
+            # The webhook URL — user needs to set their Streamlit app URL here
+            default_webhook = st.secrets.get("webhook_url", "") if True else ""
+            try: default_webhook = st.secrets.get("webhook_url","")
+            except: default_webhook = ""
+            
+            webhook_url = st.text_input("Your Webhook URL", key="webhook_url_inp",
+                value=default_webhook,
+                placeholder="https://your-app.streamlit.app/webhook")
+            st.markdown('<div style="color:#555;font-size:0.60rem;margin:-4px 0 8px;line-height:1.6;">' +
+                'Set this same URL as <b style="color:#ff8c00;">Notifier Webhook Endpoint</b> ' +
+                'in your Upstox Developer App settings.' +
+                '</div>', unsafe_allow_html=True)
+
+            if st.button("📱  REQUEST TOKEN — NOTIFY MY PHONE", key="phone_req_btn",
                          use_container_width=True, type="primary"):
-                # Start local redirect catcher in background thread
-                if not st.session_state.ux_server_started:
-                    t = threading.Thread(target=_start_redirect_server, daemon=True)
-                    t.start()
-                    st.session_state.ux_server_started = True
-                # Clean any stale code file
-                try:
-                    if os.path.exists(AUTH_CODE_FILE): os.remove(AUTH_CODE_FILE)
-                except: pass
-                # Build auth URL and open browser
-                params   = {"response_type": "code",
-                            "client_id":     UPSTOX_CLIENT_ID,
-                            "redirect_uri":  UPSTOX_REDIRECT_URI}
-                auth_url = UPSTOX_AUTH_URL + "?" + urllib.parse.urlencode(params)
-                webbrowser.open(auth_url)
-                st.session_state.ux_step = "waiting"
+                if not webhook_url.strip():
+                    st.error("Enter your webhook URL first.")
+                else:
+                    # Start local webhook listener
+                    if not st.session_state.ux_webhook_started:
+                        t = threading.Thread(target=_start_webhook_server, daemon=True)
+                        t.start()
+                        st.session_state.ux_webhook_started = True
+                    ok, resp = upstox_request_token_via_phone(UPSTOX_CLIENT_ID, webhook_url.strip())
+                    if ok:
+                        st.session_state.ux_step = "waiting_phone"
+                        st.rerun()
+                    else:
+                        st.error(f"Request failed: {str(resp)[:200]}")
+
+            if st.session_state.ux_step == "waiting_phone":
+                st.markdown("""
+<div style="background:#001520;border:1px solid #1e90ff;padding:10px;
+font-size:0.68rem;color:#1e90ff;margin-top:8px;text-align:center;">
+  <span class="blink">📱 Waiting for your approval…</span><br/>
+  <span style="color:#555;font-size:0.62rem;">Check Upstox app or WhatsApp notification</span>
+</div>""", unsafe_allow_html=True)
+                time.sleep(3)
                 st.rerun()
 
-            if st.session_state.ux_step == "port_blocked":
-                st.markdown("""
-<div style="background:#1a0800;border:1px solid #ff8c00;padding:8px 10px;
-font-size:0.72rem;color:#ff8c00;margin-top:8px;">
-  <b>⚠ Port 80 blocked</b> — Run as Administrator, or paste the redirect URL below after login.
+        # ══════════════════════════════════════════════════════
+        # MODE 2: OTP IN BROWSER — clickable link (works on Cloud)
+        # ══════════════════════════════════════════════════════
+        else:
+            # Build auth URL always so the link is ready
+            _params   = {"response_type": "code",
+                         "client_id":     UPSTOX_CLIENT_ID,
+                         "redirect_uri":  UPSTOX_REDIRECT_URI}
+            _auth_url = UPSTOX_AUTH_URL + "?" + urllib.parse.urlencode(_params)
+
+            st.markdown(f"""
+<div style="background:#0a0800;border:1px solid #ff8c00;padding:10px 12px;margin-bottom:10px;">
+  <div style="color:#ffb347;font-size:0.70rem;font-weight:700;letter-spacing:.08em;margin-bottom:6px;">
+    HOW IT WORKS
+  </div>
+  <div style="color:#888;font-size:0.65rem;line-height:1.9;">
+    1. Click the link below to open Upstox login<br/>
+    2. Login with your phone + OTP<br/>
+    3. After login, browser redirects to a URL like:<br/>
+    <span style="color:#ff8c00;">http://127.0.0.1/?code=XXXXXX</span><br/>
+    4. Copy that full URL and paste below
+  </div>
+  <a href="{_auth_url}" target="_blank"
+     style="display:block;margin-top:10px;background:#ff8c00;color:#000;
+     text-align:center;padding:9px;font-family:'IBM Plex Mono',monospace;
+     font-size:0.75rem;font-weight:700;letter-spacing:.1em;text-decoration:none;">
+    ↗ OPEN UPSTOX LOGIN PAGE
+  </a>
 </div>""", unsafe_allow_html=True)
 
-            if st.session_state.ux_step == "waiting":
-                st.markdown("""
-<div style="background:#001520;border:1px solid #1e90ff;padding:8px 10px;
-font-size:0.72rem;color:#1e90ff;margin-top:8px;text-align:center;">
-  <span class="blink">⏳ Waiting for Upstox login…</span><br/>
-  <span style="color:#666;font-size:0.65rem;">Complete login in the browser tab — token will auto-load</span>
-</div>""", unsafe_allow_html=True)
-                time.sleep(2)
-                st.rerun()
-
-            # Fallback: manual paste
-            st.markdown('<div style="border-top:1px solid #1a1a1a;margin:12px 0 8px;"></div>',
-                        unsafe_allow_html=True)
-            st.markdown('<div style="color:#555;font-size:0.68rem;margin-bottom:4px;">'
-                        'If auto-capture fails, paste the redirect URL here:</div>',
-                        unsafe_allow_html=True)
-            manual_url = st.text_input("Redirect URL (fallback)", key="manual_url",
-                                       placeholder="http://127.0.0.1/?code=AbCdEf…")
+            # Paste redirect URL
+            st.markdown('<div style="color:#888;font-size:0.65rem;margin-bottom:4px;">After login, paste the redirect URL here:</div>', unsafe_allow_html=True)
+            manual_url = st.text_input("Redirect URL", key="manual_url", label_visibility="collapsed",
+                                       placeholder="http://127.0.0.1/?code=…")
             if st.button("✔ Use This URL", key="manual_url_btn", use_container_width=True):
                 if manual_url.strip():
                     try:
-                        parsed = urllib.parse.urlparse(manual_url.strip())
-                        params = urllib.parse.parse_qs(parsed.query)
-                        code   = params.get("code", [""])[0]
-                    except:
-                        code = ""
+                        p = urllib.parse.parse_qs(urllib.parse.urlparse(manual_url.strip()).query)
+                        code = p.get("code",[""])[0]
+                    except: code = ""
                     if not code:
                         m = re.search(r'[?&]code=([^&\s]+)', manual_url)
                         code = m.group(1) if m else manual_url.strip()
@@ -733,37 +850,30 @@ font-size:0.72rem;color:#1e90ff;margin-top:8px;text-align:center;">
                             st.rerun()
                         else:
                             st.error(f"Failed: {str(resp)[:200]}")
-                    else:
-                        st.error("Could not extract code from URL.")
-                else:
-                    st.warning("Paste the redirect URL first.")
 
-            # Direct token paste
-            st.markdown('<div style="color:#555;font-size:0.68rem;margin-bottom:4px;margin-top:8px;">'
-                        'Or paste access token directly:</div>', unsafe_allow_html=True)
-            direct_tok = st.text_input("Access Token", key="direct_tok",
-                                       type="password", placeholder="eyJ0eXAiOiJKV1Q…")
-            if st.button("✔  Use Token", key="direct_tok_btn", use_container_width=True):
-                if direct_tok.strip():
-                    save_token(direct_tok.strip())
-                    st.session_state.ux_step = "idle"
-                    st.success("Token saved!")
-                    st.rerun()
-                else:
-                    st.warning("Paste your token first.")
+        # Direct token paste (always visible)
+        st.markdown('<div style="border-top:1px solid #1a1a1a;margin:10px 0 6px;"></div>', unsafe_allow_html=True)
+        st.markdown('<div style="color:#444;font-size:0.62rem;margin-bottom:4px;">Or paste token directly:</div>', unsafe_allow_html=True)
+        direct_tok = st.text_input("Access Token", key="direct_tok",
+                                   type="password", label_visibility="collapsed",
+                                   placeholder="eyJ0eXAiOiJKV1Q…")
+        if st.button("✔  Use Token", key="direct_tok_btn", use_container_width=True):
+            if direct_tok.strip():
+                save_token(direct_tok.strip())
+                st.session_state.ux_step = "idle"
+                st.rerun()
+            else:
+                st.warning("Paste your token first.")
 
-    st.markdown('<div style="border-top:1px solid #2a2a2a;margin:12px 0 8px;"></div>',
-                unsafe_allow_html=True)
-    st.markdown('<div style="color:#ff8c00;font-size:0.75rem;font-weight:700;'
-                'letter-spacing:.1em;margin-bottom:6px;">⚙ DASHBOARD</div>',
-                unsafe_allow_html=True)
+    # ── Dashboard controls ──
+    st.markdown('<div style="border-top:1px solid #2a2a2a;margin:12px 0 8px;"></div>', unsafe_allow_html=True)
+    st.markdown('<div style="color:#ff8c00;font-size:0.75rem;font-weight:700;letter-spacing:.1em;margin-bottom:6px;">⚙ DASHBOARD</div>', unsafe_allow_html=True)
     auto_refresh = st.checkbox("Auto-refresh (60s)", value=False, key="auto_refresh")
     if st.button("↺  Refresh Data", key="refresh_btn", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
 
-    st.markdown('<div style="border-top:1px solid #2a2a2a;margin:12px 0 8px;"></div>',
-                unsafe_allow_html=True)
+    st.markdown('<div style="border-top:1px solid #2a2a2a;margin:12px 0 8px;"></div>', unsafe_allow_html=True)
     st.markdown("""
 <div style="color:#888;font-size:0.70rem;line-height:2;">
 NAVIGATE<br/>
@@ -772,7 +882,6 @@ NAVIGATE<br/>
 <span style="color:#666;">→ Options Intel</span><br/>
 <span style="color:#666;">→ Fundamental Research</span>
 </div>""", unsafe_allow_html=True)
-
 
 # ============================================================
 # FETCH DATA
