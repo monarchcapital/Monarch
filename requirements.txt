@@ -1,11 +1,11 @@
-streamlit
-pandas
-numpy
+streamlit>=1.30
+pandas>=2.0
+numpy>=1.24
 requests
-plotly
-yfinance
+yfinance>=0.2.36
+plotly>=5.15
 feedparser
 matplotlib
 fpdf2
 ta
-sklearn
+scikit-learn
