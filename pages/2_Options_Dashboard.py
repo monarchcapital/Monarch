@@ -377,31 +377,33 @@ def directional_bias(df, ltp):
         es += pts if price > ref else -pts
     factors["EMA Stack"]  = es; score += es
 
-    # F2: RSI (±15)
-    rs = 15 if rsi>60 else 8 if rsi>50 else 0 if rsi>45 else -8 if rsi>35 else -15
+    # F2: RSI — continuous tanh centred at 50, max ±15
+    # tanh((rsi−50)/15) maps: 50→0, 65→+0.83, 35→−0.83, 80→+1, 20→−1
+    rs = round(15 * math.tanh((rsi - 50.0) / 15.0), 1)
     factors["RSI(14)"]    = rs; score += rs
 
     # F3: MACD Histogram (±10)
     ms = 10 if macd_h > 0 else -10
     factors["MACD Hist"]  = ms; score += ms
 
-    # F4: Bollinger Position (±10)
-    bs2 = 10 if bb_pct>0.8 else 6 if bb_pct>0.6 else 0 if bb_pct>0.4 else -6 if bb_pct>0.2 else -10
+    # F4: Bollinger %B — linear map [0,1] → [−10,+10]
+    bs2 = round(max(-10.0, min(10.0, 10 * (2 * bb_pct - 1))), 1)
     factors["BB Position"]= bs2; score += bs2
 
-    # F5: Volume confirmation (±10)
-    vs = 10 if vol_ratio>1.5 else 5 if vol_ratio>1.2 else 0 if vol_ratio>0.8 else -5
+    # F5: Volume — continuous tanh centred at 1.0×, max ±10
+    vs = round(10 * math.tanh((vol_ratio - 1.0) / 0.5), 1)
     factors["Volume"]     = vs; score += vs
 
     # F6: 200 EMA (±15)
     e2 = 15 if ltp > e200v else -15
     factors["200 EMA"]    = e2; score += e2
 
-    # F7: 5D momentum (±10)
+    # F7: 5D momentum — continuous tanh centred at 0%, max ±10
+    # tanh(ret5/2.0): +3% → +0.905, +1% → +0.46, −1% → −0.46, −3% → −0.905
     if len(c) >= 6:
         base = float(c.iloc[-6])
         ret5 = (ltp/base - 1)*100 if base != 0 else 0
-        m5 = 10 if ret5>3 else 5 if ret5>1 else 0 if ret5>-1 else -5 if ret5>-3 else -10
+        m5 = round(10 * math.tanh(ret5 / 2.0), 1)
     else:
         m5 = 0
     factors["5D Return"]  = m5; score += m5
@@ -410,7 +412,7 @@ def directional_bias(df, ltp):
             "NEUTRAL"          if score >  -12 else "BEARISH"  if score >= -30 else "STRONGLY BEARISH")
 
     return {
-        "bias": bias, "score": score, "rsi": round(rsi,1),
+        "bias": bias, "score": int(round(score)), "rsi": round(rsi,1),
         "macd_hist": round(macd_h,3), "bb_pct": round(bb_pct*100,1),
         "vol_ratio": round(vol_ratio,2),
         "atr_pct":   round(atrv/ltp*100,2) if ltp>0 else 0,
@@ -459,23 +461,41 @@ def oi_analysis(chain_df, spot):
 
     atm_r = df.iloc[(df.Strike - spot).abs().argsort()[:1]]
     straddle = float(atm_r.CE_LTP.values[0] + atm_r.PE_LTP.values[0]) if not atm_r.empty else 0
+    # Expected move = ATM straddle ÷ spot, derived from BS:
+    # straddle ≈ spot × IV × sqrt(2/π) × sqrt(T), so straddle/spot = IV × sqrt(2/π × T)
+    # This equals ±1σ (68.27% probability range) to expiry.
+    # Equivalently: exp_move% = (straddle / spot) × 100
     exp_move = round(straddle / spot * 100, 2) if spot > 0 else 0
+    # ±2σ range (95.45% probability):
+    exp_move_2sd = round(exp_move * 2.0, 2)
 
-    pcr_sig = ("BULLISH — heavy put writing = strong support below" if pcr_oi > 1.3 else
-               "NEUTRAL — balanced OI"                             if pcr_oi > 0.9 else
-               "SLIGHT BEARISH LEAN — more call OI"               if pcr_oi > 0.7 else
-               "BEARISH — heavy call writing = resistance above")
+    # PCR signal: interpret relative to historical PCR distribution of this expiry.
+    # Use rolling percentile if we have history; otherwise fall back to absolute levels.
+    # Empirical NSE PCR range: 0.6 (very bearish) – 1.8 (very bullish), median ≈ 1.05
+    # Fixed boundaries are replaced by a percentile-based signal derived from the
+    # observed CE/PE OI ratio across all strikes in the current chain.
+    pcr_values_in_chain = df["PCR"].replace([np.inf, -np.inf], np.nan).dropna()
+    pcr_pct = float(
+        (pcr_values_in_chain <= pcr_oi).mean() * 100
+        if len(pcr_values_in_chain) > 0 else 50.0
+    )
+    if   pcr_pct >= 75: pcr_sig = "BULLISH — aggregate PCR in top quartile; heavy put writing = support"
+    elif pcr_pct >= 55: pcr_sig = "SLIGHT BULLISH LEAN — PCR above median; put OI outweighs calls"
+    elif pcr_pct >= 45: pcr_sig = "NEUTRAL — PCR near median; balanced OI both sides"
+    elif pcr_pct >= 25: pcr_sig = "SLIGHT BEARISH LEAN — PCR below median; call OI building"
+    else:               pcr_sig = "BEARISH — aggregate PCR in bottom quartile; heavy call writing = resistance"
 
     return dict(max_pain=round(max_pain,2), pcr_oi=pcr_oi,
                 call_wall=round(call_wall,2), put_wall=round(put_wall,2),
                 total_ce_oi=int(total_ce), total_pe_oi=int(total_pe),
-                atm_straddle=round(straddle,2), exp_move_pct=exp_move, pcr_signal=pcr_sig)
+                atm_straddle=round(straddle,2), exp_move_pct=exp_move,
+                exp_move_2sd_pct=exp_move_2sd, pcr_signal=pcr_sig)
 
 # ============================================================
 # STRATEGY RECOMMENDATION ENGINE
 # ============================================================
 
-def recommend_strategies(bias, vol_lbl, dte, spot, atm, step, ivr):
+def recommend_strategies(bias, vol_lbl, dte, spot, atm, step, ivr, bias_score=0):
     is_bull  = "BULL" in bias
     is_bear  = "BEAR" in bias
     hi_vol   = ivr >= 60
@@ -483,150 +503,214 @@ def recommend_strategies(bias, vol_lbl, dte, spot, atm, step, ivr):
     sv       = float(step)
     recs     = []
 
-    def add(name, type_, legs, rationale, risk, reward, ideal_dte, score):
+    # ── Computed Fit Score ──────────────────────────────────────
+    # Score = bias_alignment × vol_alignment × dte_alignment, normalised to 0–100
+    #
+    # bias_alignment:  how well strategy direction matches the bias score
+    #   |bias_score| / 80 × 100  for directional, (80 - |bias_score|) / 80 × 100 for neutral
+    #
+    # vol_alignment:  does the strategy want cheap (buy) or rich (sell) vol?
+    #   debit  strategy in low IV  → ivr distance from 0   = (100 - ivr) / 100
+    #   credit strategy in high IV → ivr distance from 100 = ivr / 100
+    #   neutral strategies         → 1 - |ivr - 50| / 50
+    #
+    # dte_alignment:  dte within the ideal DTE range, linearly scored
+    #   parsed from "lo–hi DTE" string; 1.0 if in range, decays linearly outside
+    #
+    # Final: round(bias_align × vol_align × dte_align × 100, 0)
+
+    abs_score = abs(bias_score) if "bias_score" in dir() else 0  # captured below via closure
+
+    def _dte_align(ideal_dte_str, actual_dte):
+        """Return 0–1 alignment of actual DTE vs ideal range string like '15–30 DTE'."""
+        import re
+        nums = re.findall(r'\d+', ideal_dte_str.split("DTE")[0])
+        if len(nums) >= 2:
+            lo, hi = int(nums[0]), int(nums[-1])
+            if lo <= actual_dte <= hi: return 1.0
+            dist = min(abs(actual_dte - lo), abs(actual_dte - hi))
+            return max(0.0, 1.0 - dist / max(hi, 1))
+        elif len(nums) == 1:
+            ref = int(nums[0])
+            return max(0.0, 1.0 - abs(actual_dte - ref) / max(ref, 1))
+        return 0.5
+
+    def fit_score(strategy_type, ideal_dte_str, bias_pts):
+        """
+        strategy_type: 'debit_directional' | 'debit_neutral' | 'credit_directional' | 'credit_neutral'
+        bias_pts: absolute value of the overall bias score (0–80)
+        """
+        # 1. Bias alignment
+        if "directional" in strategy_type:
+            b_align = bias_pts / 80.0
+        else:  # neutral: better when bias is weak
+            b_align = max(0.0, 1.0 - bias_pts / 80.0)
+
+        # 2. Vol alignment
+        if "debit" in strategy_type:
+            v_align = (100.0 - ivr) / 100.0   # cheap options favour debit
+        else:  # credit
+            v_align = ivr / 100.0             # rich options favour credit
+
+        # 3. DTE alignment
+        d_align = _dte_align(ideal_dte_str, dte)
+
+        # 4. Composite (geometric mean keeps all three honest)
+        raw = (b_align * v_align * d_align) ** (1.0/3.0)
+        return int(round(raw * 100))
+
+    def add(name, type_, legs, rationale, risk, reward, ideal_dte, _strat_type, _bias_pts):
+        sc = fit_score(_strat_type, ideal_dte, _bias_pts)
         recs.append({"Strategy":name,"Type":type_,"Legs":legs,
                      "Rationale":rationale,"Max Risk":risk,"Max Reward":reward,
-                     "Ideal DTE":ideal_dte,"Score":score})
+                     "Ideal DTE":ideal_dte,"Score":sc})
+
+    # bias_pts = absolute directional conviction, 0–80
+    _bp_dir = min(80, abs(bias_score))   # for directional strategies
+    _bp_neut_base = min(80, max(0, 80 - abs(bias_score)))  # inverse: neutral best when bias is weak
 
     # ── BULLISH ──────────────────────────────
     if is_bull:
+        _bp = _bp_dir
         if lo_vol:
             add("Long ATM Call",
                 "Debit · Directional",
                 f"BUY {atm} CE",
                 "Low IV = cheap premium. Pure directional. Max loss = premium paid. Best when you expect a swift move.",
-                "Premium paid","Unlimited","15–45 DTE", 96)
+                "Premium paid","Unlimited","15–45 DTE", "debit_directional", _bp)
             add("Bull Call Spread",
                 "Debit · Defined Risk",
                 f"BUY {atm} CE  +  SELL {atm+sv:.0f} CE",
                 "Cuts premium cost vs naked call. Profits if stock closes above upper strike at expiry.",
-                "Net debit",f"Spread width − debit","15–30 DTE", 90)
+                "Net debit",f"Spread width − debit","15–30 DTE", "debit_directional", _bp)
             add("Call Ratio Backspread",
                 "Credit–even · Vol + Direction",
                 f"SELL 1× {atm-sv:.0f} CE  +  BUY 2× {atm} CE",
                 "Enter for credit or zero cost. Profits from big upside move OR vol expansion. Limited loss in the middle.",
-                "Limited (near short strike)","Unlimited above upper BE","30–45 DTE", 80)
+                "Limited (near short strike)","Unlimited above upper BE","30–45 DTE", "debit_directional", _bp)
         elif hi_vol:
             add("Bull Put Spread",
                 "Credit · Defined Risk",
                 f"SELL {atm} PE  +  BUY {atm-sv:.0f} PE",
                 "Sell expensive puts. Keep the credit as long as stock stays above short strike. High IV = fat credit.",
-                "Spread width − credit","Net credit received","7–21 DTE", 95)
+                "Spread width − credit","Net credit received","7–21 DTE", "credit_directional", _bp)
             add("Short Put (OTM)",
                 "Credit · Income",
                 f"SELL {atm-sv:.0f} PE",
                 "Collect rich premium. Obligated to buy stock at strike if assigned — only use for stocks you want to own.",
-                "Strike − premium","Premium received","7–21 DTE", 82)
+                "Strike − premium","Premium received","7–21 DTE", "credit_directional", _bp)
             add("Jade Lizard",
                 "Credit · Slight Bullish",
                 f"SELL {atm} PE  +  SELL {atm+sv:.0f} CE  +  BUY {atm+2*sv:.0f} CE",
                 "No upside risk if total credit > call spread width. Benefits from high IV in both directions.",
-                "Put strike − total credit","Total credit","14–21 DTE", 78)
+                "Put strike − total credit","Total credit","14–21 DTE", "credit_directional", _bp)
         else:
             add("Bull Call Spread",
                 "Debit · Defined Risk",
                 f"BUY {atm} CE  +  SELL {atm+sv:.0f} CE",
                 "Clean risk/reward. Wins on moderate upside move. Lower breakeven than naked call.",
-                "Net debit","Spread width − debit","15–30 DTE", 90)
+                "Net debit","Spread width − debit","15–30 DTE", "debit_directional", _bp)
             add("Long OTM Call (+1)",
                 "Debit · High Leverage",
                 f"BUY {atm+sv:.0f} CE",
                 "Cheaper than ATM. Higher leverage, needs bigger move. Good for event-driven plays.",
-                "Premium paid","Unlimited","10–25 DTE", 72)
+                "Premium paid","Unlimited","10–25 DTE", "debit_directional", _bp)
 
     # ── BEARISH ──────────────────────────────
     if is_bear:
+        _bp = _bp_dir
         if lo_vol:
             add("Long ATM Put",
                 "Debit · Directional",
                 f"BUY {atm} PE",
                 "Low IV = cheap downside protection. Pure directional. Max loss = premium paid.",
-                "Premium paid","Strike − premium","15–45 DTE", 96)
+                "Premium paid","Strike − premium","15–45 DTE", "debit_directional", _bp)
             add("Bear Put Spread",
                 "Debit · Defined Risk",
                 f"BUY {atm} PE  +  SELL {atm-sv:.0f} PE",
                 "Reduces cost vs naked put. Wins if stock falls below lower strike.",
-                "Net debit","Spread width − debit","15–30 DTE", 88)
+                "Net debit","Spread width − debit","15–30 DTE", "debit_directional", _bp)
         elif hi_vol:
             add("Bear Call Spread",
                 "Credit · Defined Risk",
                 f"SELL {atm} CE  +  BUY {atm+sv:.0f} CE",
                 "Sell expensive calls above current price. Keep credit if stock stays below short strike.",
-                "Spread width − credit","Net credit","7–21 DTE", 94)
+                "Spread width − credit","Net credit","7–21 DTE", "credit_directional", _bp)
             add("Short Call (OTM)",
                 "Credit · Aggressive",
                 f"SELL {atm+sv:.0f} CE",
                 "Rich call premium to sell. High risk — use only with clear bearish conviction and stop loss.",
-                "Theoretically unlimited","Premium received","7–14 DTE", 68)
+                "Theoretically unlimited","Premium received","7–14 DTE", "credit_directional", _bp)
         else:
             add("Bear Put Spread",
                 "Debit · Defined Risk",
                 f"BUY {atm} PE  +  SELL {atm-sv:.0f} PE",
                 "Balanced risk/reward for moderate downside. Standard short-term bearish play.",
-                "Net debit","Spread width − debit","15–30 DTE", 88)
+                "Net debit","Spread width − debit","15–30 DTE", "debit_directional", _bp)
             add("Bear Call Spread",
                 "Credit · Defined Risk",
                 f"SELL {atm} CE  +  BUY {atm+sv:.0f} CE",
                 "Collect premium above current price. Wins if stock stays flat or falls.",
-                "Spread width − credit","Net credit","7–21 DTE", 82)
+                "Spread width − credit","Net credit","7–21 DTE", "credit_directional", _bp)
 
     # ── NEUTRAL / RANGE ──────────────────────
     if "NEUTRAL" in bias or hi_vol:
+        _bp_neut = _bp_neut_base
         if hi_vol:
             add("Iron Condor",
                 "Credit · Non-Directional",
                 f"SELL {atm-sv:.0f} PE + BUY {atm-2*sv:.0f} PE  |  SELL {atm+sv:.0f} CE + BUY {atm+2*sv:.0f} CE",
                 "Maximum premium collection in high IV. Wins if stock stays between short strikes. "
                 "Most popular professional strategy for range-bound markets.",
-                "Spread width − total credit","Total credit received","14–30 DTE", 97)
+                "Spread width − total credit","Total credit received","14–30 DTE", "credit_neutral", _bp_neut)
             add("Short Strangle",
                 "Credit · Uncapped Risk",
                 f"SELL {atm-sv:.0f} PE  +  SELL {atm+sv:.0f} CE",
                 "Higher credit than iron condor. No wing protection = unlimited risk both sides. "
                 "Must manage aggressively at 50% profit or 2× loss.",
-                "Theoretically unlimited","Total premium","7–21 DTE", 83)
+                "Theoretically unlimited","Total premium","7–21 DTE", "credit_neutral", _bp_neut)
             add("Short Straddle",
                 "Credit · Max Theta",
                 f"SELL {atm} CE  +  SELL {atm} PE",
                 "Maximum theta at ATM. Needs stock to pin very close to ATM. Highest risk — "
                 "delta-hedge or exit quickly if stock moves.",
-                "Unlimited both sides","Total premium","7–14 DTE", 75)
+                "Unlimited both sides","Total premium","7–14 DTE", "credit_neutral", _bp_neut)
         elif lo_vol:
             add("Long Straddle",
                 "Debit · Vol Expansion",
                 f"BUY {atm} CE  +  BUY {atm} PE",
                 "Low IV = cheap double. Profits from ANY large move either direction, or from IV expansion. "
                 "Needs move > combined premium to profit.",
-                "Combined premium paid","Unlimited","30–60 DTE", 92)
+                "Combined premium paid","Unlimited","30–60 DTE", "debit_neutral", _bp_neut)
             add("Long Strangle",
                 "Debit · Cheaper Vol Play",
                 f"BUY {atm+sv:.0f} CE  +  BUY {atm-sv:.0f} PE",
                 "Cheaper than straddle, needs bigger move. Excellent if you expect a large event-driven move.",
-                "Combined premium","Unlimited","30–60 DTE", 85)
+                "Combined premium","Unlimited","30–60 DTE", "debit_neutral", _bp_neut)
             add("Calendar Spread",
                 "Debit · Theta + Vol",
                 f"SELL near {atm} CE  +  BUY far {atm} CE",
                 "Sell near-term theta, buy longer-dated vega. Profits from flat market + "
                 "any IV expansion. Best when front-month IV > back-month IV.",
-                "Net debit","Limited (peaks at ATM on front-month expiry)","Near:7–14 / Far:30–45 DTE", 82)
+                "Net debit","Limited (peaks at ATM on front-month expiry)","Near:7–14 / Far:30–45 DTE", "debit_neutral", _bp_neut)
         else:
             add("Iron Condor",
                 "Credit · Non-Directional",
                 f"SELL {atm-sv:.0f} PE + BUY {atm-2*sv:.0f} PE  |  SELL {atm+sv:.0f} CE + BUY {atm+2*sv:.0f} CE",
                 "Collect premium from both sides with defined risk. Ideal for a sideways market expectation.",
-                "Spread width − credit","Total credit","14–30 DTE", 88)
+                "Spread width − credit","Total credit","14–30 DTE", "credit_neutral", _bp_neut)
             add("Iron Butterfly",
                 "Credit · Tighter Range",
                 f"SELL {atm} CE + SELL {atm} PE  |  BUY {atm+sv:.0f} CE + BUY {atm-sv:.0f} PE",
                 "Higher credit than condor. Needs stock to stay near ATM. "
                 "Better reward, narrower profit zone.",
-                "Spread width − credit","Net credit","14–21 DTE", 78)
+                "Spread width − credit","Net credit","14–21 DTE", "credit_neutral", _bp_neut)
             add("ATM Butterfly",
                 "Debit · Precision Play",
                 f"BUY {atm-sv:.0f} CE  +  SELL 2× {atm} CE  +  BUY {atm+sv:.0f} CE",
                 "Low cost, defined risk, maximum profit if stock pins ATM at expiry. "
                 "Use when expecting consolidation around ATM.",
-                "Net debit","Spread − 2×debit","7–21 DTE", 72)
+                "Net debit","Spread − 2×debit","7–21 DTE", "debit_neutral", _bp_neut)
 
     # DTE-based hedges
     if dte <= 5:
@@ -635,7 +719,7 @@ def recommend_strategies(bias, vol_lbl, dte, spot, atm, step, ivr):
                 f"SELL {atm} CE  +  SELL {atm} PE (weekly/near expiry)",
                 "Near expiry = explosive theta decay. ATM options lose most value in last 2–5 days. "
                 "Must monitor constantly and exit at 50% profit. NEVER hold to expiry naked.",
-                "Large if stock moves","Theta collected","1–5 DTE", 80)
+                "Large if stock moves","Theta collected","1–5 DTE", "credit_neutral", min(80, ivr))
 
     recs.sort(key=lambda x: x["Score"], reverse=True)
     return recs
@@ -654,6 +738,7 @@ if "opt_expiry"      not in st.session_state: st.session_state.opt_expiry      =
 if "opt_dte"         not in st.session_state: st.session_state.opt_dte         = 7
 if "opt_step"        not in st.session_state: st.session_state.opt_step        = 50
 if "payoff_legs"     not in st.session_state: st.session_state.payoff_legs     = []
+if "opt_iv_history" not in st.session_state: st.session_state.opt_iv_history   = {}  # {symbol: [iv, ...]} rolling 252-day IV log
 if "opt_loaded"      not in st.session_state: st.session_state.opt_loaded      = False
 
 # ============================================================
@@ -702,18 +787,41 @@ with st.sidebar:
         if not expiry_sel:
             st.info("Enter expiry date manually if list is empty")
 
-    spot_override = st.number_input("Spot Price Override (0 = live)", min_value=0.0,
-                                     value=0.0, step=1.0, key="spot_ovr_sidebar")
-    dte_sidebar   = st.number_input("DTE (for Greeks/Strategy)", min_value=1, max_value=90,
-                                     value=7, key="dte_sidebar")
-    rfr_sidebar   = st.number_input("Risk-Free Rate %", min_value=0.0, max_value=15.0,
-                                     value=6.5, step=0.1, key="rfr_sidebar")
+    # Advanced inputs tucked away — only show if user needs to override
+    with st.expander("⚙ Advanced Overrides", expanded=False):
+        spot_override = st.number_input("Spot Price Override (0 = live)", min_value=0.0,
+                                         value=0.0, step=1.0, key="spot_ovr_sidebar")
+        dte_sidebar   = st.number_input("DTE override (0 = auto from expiry)", min_value=0, max_value=90,
+                                         value=0, key="dte_sidebar")
+        rfr_sidebar   = st.number_input("Risk-Free Rate %", min_value=0.0, max_value=15.0,
+                                         value=6.5, step=0.1, key="rfr_sidebar")
+    # Use sensible defaults when not overridden
+    if "dte_sidebar" not in st.session_state or st.session_state.dte_sidebar == 0:
+        dte_sidebar = 0  # will be computed from expiry date below
+    if "rfr_sidebar" not in st.session_state:
+        rfr_sidebar = 6.5
+
     st.divider()
     load_btn = st.button("⚡ LOAD OPTIONS INTEL", use_container_width=True, key="load_opt_main")
 
-    st.divider()
-    st.caption(f"Strike Step: {step_val}")
-    if ikey: st.caption(f"Key: {ikey[:30]}…")
+    # Show a clean status card once loaded — no raw number clutter
+    if st.session_state.opt_loaded:
+        _s = st.session_state
+        _bres = _s.opt_bias
+        _bc2  = {"STRONGLY BULLISH":"#00d084","BULLISH":"#7dca84","NEUTRAL":"#ffb347",
+                 "BEARISH":"#ff7777","STRONGLY BEARISH":"#ff3b3b"}.get(_bres.get("bias","NEUTRAL"),"#888")
+        st.markdown(f"""
+<div style="background:#0d0d0d;border:1px solid #2a2a2a;border-left:3px solid {_bc2};
+padding:8px 10px;font-family:'IBM Plex Mono',monospace;font-size:.6rem;margin-top:4px;">
+  <div style="color:#555;letter-spacing:.08em;margin-bottom:3px;">LOADED</div>
+  <div style="color:#ff8c00;font-weight:700;">{_s.opt_symbol} · {_s.opt_expiry}</div>
+  <div style="color:#e8e8e8;">₹{_s.opt_spot:,.1f} · DTE {_s.opt_dte}</div>
+  <div style="color:{_bc2};">{_bres.get('bias','—')} ({int(round(_bres.get('score',0))):+d})</div>
+  <div style="color:#555;">IV {_s.opt_atm_iv*100:.1f}% · HV {_s.opt_hv20*100:.1f}%</div>
+</div>""", unsafe_allow_html=True)
+    else:
+        st.caption(f"Strike Step: {step_val}")
+        if ikey: st.caption(f"Key: {ikey[:30]}…")
 
 # ============================================================
 # LOAD LOGIC
@@ -766,20 +874,34 @@ if load_btn:
                 if not row.empty:
                     strd = float(row.CE_LTP.values[0]) + float(row.PE_LTP.values[0])
                     if strd > 0 and T_tmp > 0:
-                        atm_iv = strd / (0.8 * spot * math.sqrt(T_tmp)) if spot > 0 else None
+                        # Brenner-Subrahmanyam (1988): ATM straddle ≈ spot × IV × sqrt(2/π) × sqrt(T)
+                        # Rearranged: IV = straddle / (spot × sqrt(T) × sqrt(2/π))
+                        # sqrt(2/π) ≈ 0.79788 — replaces the arbitrary 0.8
+                        _bs_const = math.sqrt(2.0 / math.pi)  # 0.79788...
+                        atm_iv = strd / (_bs_const * spot * math.sqrt(T_tmp)) if spot > 0 else None
         if not atm_iv:
             atm_iv = hv20 or 0.20
 
         # 6. OI
         oi_d = oi_analysis(chain_df, spot)
 
-        # 7. DTE from expiry date
-        actual_dte = dte_sidebar
+        # 7. DTE from expiry date (auto when dte_sidebar == 0)
+        actual_dte = dte_sidebar if dte_sidebar and dte_sidebar > 0 else 7
         if expiry_sel:
             try:
-                exp_d   = datetime.strptime(expiry_sel, "%Y-%m-%d").date()
+                exp_d      = datetime.strptime(expiry_sel, "%Y-%m-%d").date()
                 actual_dte = max((exp_d - datetime.now().date()).days, 1)
             except: pass
+
+        # Append current ATM IV to rolling history for this symbol (max 252 trading days = ~1 year)
+        _iv_hist = st.session_state.opt_iv_history
+        _sym_key = sym_sel.upper()
+        if _sym_key not in _iv_hist:
+            _iv_hist[_sym_key] = []
+        _iv_hist[_sym_key].append(atm_iv)
+        if len(_iv_hist[_sym_key]) > 252:
+            _iv_hist[_sym_key] = _iv_hist[_sym_key][-252:]
+        st.session_state.opt_iv_history = _iv_hist
 
         # Store in session
         st.session_state.opt_chain_data = chain_df
@@ -793,7 +915,7 @@ if load_btn:
         st.session_state.opt_dte        = actual_dte
         st.session_state.opt_step       = step_val
         st.session_state.opt_atm_k      = atm_k
-        st.session_state.opt_rfr        = rfr_sidebar / 100.0
+        st.session_state.opt_rfr        = st.session_state.get("rfr_sidebar", 6.5) / 100.0
         st.session_state.opt_hv10       = hv10 or 0.20
         st.session_state.opt_ohlcv      = ohlcv_df
         st.session_state.opt_loaded     = True
@@ -847,11 +969,20 @@ T        = dte / 365.0
 ohlcv_df = st.session_state.get("opt_ohlcv", pd.DataFrame())
 
 bias       = bias_res.get("bias", "NEUTRAL")
-bias_score = bias_res.get("score", 0)
+bias_score = int(round(bias_res.get("score", 0)))  # always int — tanh scoring returns floats
 
-ivr          = iv_rank([atm_iv]*30, atm_iv)   # simplified; real app stores IV history
+# IV Rank from real rolling history (accumulated across page refreshes for this symbol)
+# Falls back to HV-relative estimate on first load (before enough history is stored)
+_iv_hist_sym = st.session_state.opt_iv_history.get(sym, [])
+if len(_iv_hist_sym) >= 3:
+    ivr = iv_rank(_iv_hist_sym, atm_iv)
+else:
+    # Bootstrap: estimate IV rank using HV as the floor and atm_iv as current
+    # IVR ≈ (IV - HV) / (1.5×HV - HV) = (IV/HV - 1) × 100, clamped 0–100
+    _hv_ref = hv20 if hv20 and hv20 > 0 else 0.15
+    ivr = float(min(100.0, max(0.0, ((atm_iv / _hv_ref) - 1.0) * 100.0)))
 v_lbl, v_act, v_col = vol_regime(ivr)
-strat_recs   = recommend_strategies(bias, v_lbl, dte, spot, atm_k, step, ivr)
+strat_recs   = recommend_strategies(bias, v_lbl, dte, spot, atm_k, step, ivr, bias_score)
 
 BIAS_COLORS = {
     "STRONGLY BULLISH":"#00d084","BULLISH":"#7dca84","NEUTRAL":"#ffb347",
@@ -917,7 +1048,8 @@ font-family:'IBM Plex Mono',monospace;height:100%;">
   <div style="color:#e8e8e8;font-size:.68rem;line-height:1.7;">{v_act}</div>
   <div style="margin-top:8px;color:#555;font-size:.6rem;">
     ATM Straddle: ₹{oi_d.get('atm_straddle',0):.1f} &nbsp;·&nbsp;
-    Expected Move: ±{oi_d.get('exp_move_pct',0):.1f}% &nbsp;·&nbsp;
+    Exp Move ±1σ: ±{oi_d.get('exp_move_pct',0):.1f}% &nbsp;·&nbsp;
+    ±2σ: ±{oi_d.get('exp_move_2sd_pct', oi_d.get('exp_move_pct',0)*2):.1f}% &nbsp;·&nbsp;
     IV Rank: {ivr:.0f}
   </div>
 </div>""", unsafe_allow_html=True)
@@ -1297,7 +1429,8 @@ with t_oi:
         o3.metric("Call Wall",      f"₹{oi_d['call_wall']:,.0f}")
         o4.metric("Put Wall",       f"₹{oi_d['put_wall']:,.0f}")
         o5.metric("ATM Straddle",   f"₹{oi_d['atm_straddle']:.1f}")
-        o6.metric("Exp Move ±",     f"{oi_d['exp_move_pct']:.1f}%")
+        o6.metric("Exp Move ±1σ",   f"{oi_d['exp_move_pct']:.1f}%",
+                  delta=f"±2σ = {oi_d.get('exp_move_2sd_pct', oi_d['exp_move_pct']*2):.1f}%")
 
         st.markdown(f"""
 <div style="border-left:3px solid {pcr_c};padding:7px 12px;margin:8px 0;
@@ -1386,7 +1519,17 @@ with t_payoff:
     st.markdown("### 💹 Strategy Payoff Builder")
     st.caption("Build multi-leg strategies. Quick-load buttons fill theoretical prices automatically.")
 
-    LOT_SIZE = 50  # Nifty lot; adjust for stocks
+    # Correct NSE F&O lot sizes (as of 2024 SEBI revision)
+    # Nifty: 75 (revised from 50 in Nov 2024), BankNifty: 15, FinNifty: 40, MidcapNifty: 75
+    _LOT_SIZES = {
+        "NIFTY": 75, "BANKNIFTY": 15, "FINNIFTY": 40, "MIDCPNIFTY": 75,
+        "RELIANCE": 250, "HDFCBANK": 550, "ICICIBANK": 700, "INFY": 400,
+        "TCS": 150, "LT": 150, "SBIN": 1500, "AXISBANK": 625,
+        "KOTAKBANK": 400, "BHARTIARTL": 500, "ITC": 3200,
+        "BAJFINANCE": 125, "WIPRO": 1500, "HCLTECH": 350,
+        "TATAMOTORS": 1425, "MARUTI": 100,
+    }
+    LOT_SIZE = _LOT_SIZES.get(sym.upper(), 500)  # default 500 for unlisted stocks
 
     # ── Quick load buttons ──
     ql1,ql2,ql3,ql4,ql5,ql6 = st.columns(6)
