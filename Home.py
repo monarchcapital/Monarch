@@ -343,22 +343,25 @@ def _start_redirect_server():
     except Exception:
         pass
 
-def upstox_request_token_via_phone(client_id, notifier_url):
+def upstox_request_token_via_phone(client_id, client_secret):
     """
-    Calls Upstox Access Token Request API.
-    Upstox sends push notification + WhatsApp to the account holder.
-    On approval, token is POSTed to notifier_url.
+    Calls Upstox v3 Access Token Request API (semi-automated / indie user flow).
+    - client_id goes in the URL path
+    - client_secret goes in the JSON body ONLY
+    - notifier_url is configured in the Upstox app settings, NOT sent here
+    Upstox sends a push notification to the account holder's phone.
+    On approval, token is POSTed to the notifier URL set in the app settings.
     Returns (success, message)
     """
     try:
         url = UPSTOX_TOKEN_REQ_URL.format(client_id=client_id)
         r = requests.post(url,
-            json={"notifier_url": notifier_url},
+            json={"client_secret": client_secret},
             headers={"Content-Type": "application/json", "accept": "application/json"},
             timeout=15)
         if r.status_code == 200:
             return True, r.json()
-        return False, r.text
+        return False, r.json() if r.headers.get("content-type","").startswith("application/json") else r.text
     except Exception as e:
         return False, str(e)
 
@@ -745,46 +748,26 @@ padding:10px 12px;font-family:'IBM Plex Mono',monospace;margin-bottom:10px;">
 font-family:'IBM Plex Mono',monospace;">
   <div style="color:#1e90ff;font-size:0.72rem;font-weight:700;margin-bottom:5px;">HOW IT WORKS</div>
   <div style="color:#888;font-size:0.62rem;line-height:1.9;">
-    1. Click <b style="color:#ff8c00;">REQUEST TOKEN</b><br/>
-    2. Check Upstox app / WhatsApp<br/>
-    3. Tap <b style="color:#00d084;">Approve</b> on the notification<br/>
-    4. Dashboard auto-connects ✔
+    1. Click <b style="color:#ff8c00;">SEND PHONE NOTIFICATION</b><br/>
+    2. Open <b style="color:#fff;">Upstox app</b> on your phone<br/>
+    3. Tap <b style="color:#00d084;">Approve</b> the login request<br/>
+    4. Token auto-delivered to your app ✔
   </div>
   <div style="color:#555;font-size:0.58rem;margin-top:5px;border-top:1px solid #1a1a1a;padding-top:4px;">
-    ⚠ Requires <b style="color:#ffb347;">Notifier Webhook URL</b> set in your<br/>
-    Upstox API app settings (see below)
+    ⚠ One-time setup: set <b style="color:#ffb347;">Notifier Webhook URL</b> in<br/>
+    Upstox Developer App → your Streamlit app URL
   </div>
 </div>""", unsafe_allow_html=True)
 
             # The webhook URL — user needs to set their Streamlit app URL here
-            default_webhook = st.secrets.get("webhook_url", "") if True else ""
-            try: default_webhook = st.secrets.get("webhook_url","")
-            except: default_webhook = ""
-            
-            webhook_url = st.text_input("Your Webhook URL", key="webhook_url_inp",
-                value=default_webhook,
-                placeholder="https://your-app.streamlit.app/webhook")
-            st.markdown('<div style="color:#555;font-size:0.60rem;margin:-4px 0 8px;line-height:1.6;">' +
-                'Set this same URL as <b style="color:#ff8c00;">Notifier Webhook Endpoint</b> ' +
-                'in your Upstox Developer App settings.' +
-                '</div>', unsafe_allow_html=True)
-
-            if st.button("📱  REQUEST TOKEN — NOTIFY MY PHONE", key="phone_req_btn",
+            if st.button("📱  SEND PHONE NOTIFICATION", key="phone_req_btn",
                          use_container_width=True, type="primary"):
-                if not webhook_url.strip():
-                    st.error("Enter your webhook URL first.")
+                ok, resp = upstox_request_token_via_phone(UPSTOX_CLIENT_ID, UPSTOX_CLIENT_SECRET)
+                if ok:
+                    st.session_state.ux_step = "waiting_phone"
+                    st.rerun()
                 else:
-                    # Start local webhook listener
-                    if not st.session_state.ux_webhook_started:
-                        t = threading.Thread(target=_start_webhook_server, daemon=True)
-                        t.start()
-                        st.session_state.ux_webhook_started = True
-                    ok, resp = upstox_request_token_via_phone(UPSTOX_CLIENT_ID, webhook_url.strip())
-                    if ok:
-                        st.session_state.ux_step = "waiting_phone"
-                        st.rerun()
-                    else:
-                        st.error(f"Request failed: {str(resp)[:200]}")
+                    st.error(f"Request failed: {str(resp)[:300]}")
 
             if st.session_state.ux_step == "waiting_phone":
                 st.markdown("""
