@@ -1,11 +1,33 @@
-streamlit>=1.30
-pandas>=2.0
-numpy>=1.24
-requests
-yfinance>=0.2.36
-plotly>=5.15
-feedparser
-matplotlib
-fpdf2
-ta
-scikit-learn
+# ============================================================
+# MONARCH PRO — Requirements
+# Install with: pip install -r requirements.txt
+# ============================================================
+
+# ── Core framework ──────────────────────────────────────────
+streamlit>=1.35.0
+
+# ── Data & computation ──────────────────────────────────────
+pandas>=2.0.0
+numpy>=1.26.0
+
+# ── Market data ─────────────────────────────────────────────
+yfinance>=0.2.40
+
+# ── HTTP / API ──────────────────────────────────────────────
+requests>=2.31.0
+
+# ── Charting ────────────────────────────────────────────────
+plotly>=5.18.0
+
+# ── ML stack (4_ML_Predictor.py) ────────────────────────────
+scikit-learn>=1.4.0
+xgboost>=2.0.0
+lightgbm>=4.3.0
+
+# ── RSS feeds (1_Live_screener.py) ──────────────────────────
+feedparser>=6.0.10
+
+# ── Standard library (no install needed, listed for clarity) ─
+# json, time, math, os, re, urllib.parse, threading
+# webbrowser, socketserver, http.server, io, gzip
+# datetime, concurrent.futures, warnings
