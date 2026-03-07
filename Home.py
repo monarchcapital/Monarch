@@ -63,6 +63,7 @@ p, span, div, label, li, td, th, caption,
 [data-testid="stMarkdownContainer"] li {
     color: var(--bb-white) !important;
     font-family: var(--bb-mono) !important;
+    font-size: 0.92rem !important;
 }
 
 [data-testid="stSidebar"], [data-testid="stSidebar"] > div {
@@ -71,7 +72,7 @@ p, span, div, label, li, td, th, caption,
 }
 [data-testid="stSidebar"] p, [data-testid="stSidebar"] span,
 [data-testid="stSidebar"] label, [data-testid="stSidebar"] div {
-    color: var(--bb-white) !important; font-size: 0.84rem !important;
+    color: var(--bb-white) !important; font-size: 0.88rem !important;
 }
 
 h1 { color: var(--bb-amber) !important; font-size: 1.25rem !important;
@@ -96,16 +97,16 @@ h3 { color: var(--bb-white) !important; font-size: 0.90rem !important;
     color: var(--bb-muted) !important; font-size: 0.70rem !important;
     letter-spacing: 0.12em !important; text-transform: uppercase !important;
 }
-[data-testid="stMetricValue"] { color: var(--bb-amber) !important; font-size: 1.19rem !important; font-weight: 700 !important; }
-[data-testid="stMetricDelta"] { font-size: 0.75rem !important; }
+[data-testid="stMetricValue"] { color: var(--bb-amber) !important; font-size: 1.35rem !important; font-weight: 700 !important; }
+[data-testid="stMetricDelta"] { font-size: 0.82rem !important; }
 
 [data-testid="stDataFrame"] { border: 1px solid var(--bb-border) !important; border-radius: 0 !important; }
 .stDataFrame thead tr th { background: #1a1200 !important; color: var(--bb-amber) !important;
-    font-size: 0.72rem !important; font-weight: 700 !important; letter-spacing: 0.12em !important;
+    font-size: 0.80rem !important; font-weight: 700 !important; letter-spacing: 0.12em !important;
     text-transform: uppercase !important; border-bottom: 1px solid var(--bb-amber) !important;
     border-right: 1px solid #2a2a2a !important; padding: 5px 8px !important; white-space: nowrap !important; }
 .stDataFrame tbody tr td { background: #0d0d0d !important; color: var(--bb-white) !important;
-    font-size: 0.83rem !important; border-bottom: 1px solid #1a1a1a !important;
+    font-size: 0.90rem !important; border-bottom: 1px solid #1a1a1a !important;
     border-right: 1px solid #1a1a1a !important; padding: 4px 8px !important; white-space: nowrap !important; }
 .stDataFrame tbody tr:nth-child(odd) td { background: #111 !important; }
 .stDataFrame tbody tr:hover td { background: #1a1400 !important; }
@@ -126,13 +127,13 @@ input[type="text"], input[type="password"], input[type="number"] {
     border: 1px solid var(--bb-border) !important; font-family: var(--bb-mono) !important;
     font-size: 0.88rem !important; border-radius: 0 !important; }
 
-/* ── EXPANDER — nuclear arrow kill + label preserve ── */
+/* ── EXPANDER — complete fix for keyboard_arrow_right text overlap ── */
 .streamlit-expanderHeader,
 [data-testid="stExpander"] summary {
     background: var(--bb-surface) !important;
     color: var(--bb-amber) !important;
     font-family: var(--bb-mono) !important;
-    font-size: 0.80rem !important;
+    font-size: 0.92rem !important;
     font-weight: 600 !important;
     letter-spacing: 0.1em !important;
     text-transform: uppercase !important;
@@ -142,23 +143,32 @@ input[type="text"], input[type="password"], input[type="number"] {
     list-style: none !important;
     cursor: pointer !important;
 }
-/* Kill every possible form of the icon — SVG, Material Icons span,
-   toggle icon testid, first-child spans used by all Streamlit versions */
+/* Nuclear: hide EVERY form of the toggle icon including keyboard_arrow_right text */
 [data-testid="stExpander"] summary svg,
 [data-testid="stExpander"] summary .material-icons,
-[data-testid="stExpander"] summary span[data-testid="stExpanderToggleIcon"],
+[data-testid="stExpander"] summary [data-testid="stExpanderToggleIcon"],
+[data-testid="stExpander"] summary [data-testid="stExpanderToggleIcon"] *,
 [data-testid="stExpander"] summary > div > span:first-child,
-[data-testid="stExpander"] summary > span:first-child {
+[data-testid="stExpander"] summary > span:first-child,
+[data-testid="stExpander"] summary span[class*="icon"],
+[data-testid="stExpander"] summary span[data-testid] {
     display: none !important;
     visibility: hidden !important;
     width: 0 !important;
     height: 0 !important;
+    max-width: 0 !important;
+    max-height: 0 !important;
     overflow: hidden !important;
     font-size: 0 !important;
     color: transparent !important;
+    opacity: 0 !important;
+    position: absolute !important;
+    pointer-events: none !important;
 }
 [data-testid="stExpander"] summary::-webkit-details-marker,
-[data-testid="stExpander"] summary::marker { display: none !important; }
+[data-testid="stExpander"] summary::marker { display: none !important; content: "" !important; }
+[data-testid="stExpander"] summary::before,
+[data-testid="stExpander"] summary::after { display: none !important; content: "" !important; }
 [data-testid="stExpander"] {
     border: 1px solid var(--bb-border) !important;
     border-radius: 0 !important;
@@ -196,6 +206,12 @@ hr, [data-testid="stDivider"] hr { border-color: var(--bb-border) !important; }
 ::-webkit-scrollbar { width: 4px; height: 4px; }
 ::-webkit-scrollbar-thumb { background: var(--bb-border); }
 ::-webkit-scrollbar-thumb:hover { background: var(--bb-amber); }
+
+/* ── PRICE DELTA COLORS ── */
+[data-testid="stMetricDeltaIcon-Up"] { color: var(--bb-green) !important; }
+[data-testid="stMetricDeltaIcon-Down"] { color: var(--bb-red) !important; }
+[data-testid="stMetricDelta"]:has([data-testid="stMetricDeltaIcon-Up"]) { color: var(--bb-green) !important; }
+[data-testid="stMetricDelta"]:has([data-testid="stMetricDeltaIcon-Down"]) { color: var(--bb-red) !important; }
 
 /* ── Blinking animation ── */
 @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
