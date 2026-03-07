@@ -31,6 +31,24 @@ import os
 
 st.set_page_config(layout="wide", page_title="MONARCH — Options Intel")
 
+# ============================================================
+# CENTRALIZED CONFIGURATION — change once, applies everywhere
+# ============================================================
+CFG = {
+    "rfr_default":    6.5,    # Risk-free rate % (India repo rate)
+    "hv_window":      20,     # Historical volatility look-back days
+    "hv_window_fast": 10,     # Fast HV for comparison
+    "iv_hist_max":    252,    # Max IV history (1 trading year)
+    "chain_strikes":  8,      # Strikes shown each side in chain tab
+    "oi_strikes":     10,     # Strikes each side in OI tab
+    "pain_strikes":   15,     # Strikes each side for max pain calc
+    "iv_overpriced":  1.20,   # IV ratio above HV → sell signal
+    "iv_underpriced": 0.85,   # IV ratio below HV → buy signal
+    "chain_cache_ttl": 30,    # Seconds to cache live option chain
+    "expiry_cache_ttl": 300,  # Seconds to cache expiry list
+    "master_cache_ttl": 3600, # Seconds to cache instrument master
+}
+
 # ── Bloomberg Terminal Theme ──────────────────────────────────
 st.markdown("""
 <style>
@@ -38,43 +56,140 @@ st.markdown("""
 :root {
     --bb-bg: #0a0a0a; --bb-surface: #111111; --bb-border: #2a2a2a;
     --bb-amber: #ff8c00; --bb-amber2: #ffb347; --bb-green: #00d084;
-    --bb-red: #ff3b3b; --bb-blue: #1e90ff; --bb-white: #e8e8e8; --bb-muted: #666666;
+    --bb-red: #ff3b3b; --bb-blue: #1e90ff; --bb-white: #e8e8e8; --bb-muted: #888888;
 }
-html, body, [data-testid="stAppViewContainer"] {
+
+/* ── Base ── */
+html, body, [data-testid="stAppViewContainer"], [data-testid="stMain"],
+.main, .block-container, [data-testid="stVerticalBlock"] {
     background-color: var(--bb-bg) !important;
     color: var(--bb-white) !important;
     font-family: 'IBM Plex Mono', monospace !important;
 }
-[data-testid="stSidebar"] { background-color: #060606 !important; border-right: 1px solid var(--bb-border) !important; }
+
+/* ── Sidebar ── */
+[data-testid="stSidebar"], [data-testid="stSidebar"] > div {
+    background-color: #060606 !important;
+    border-right: 1px solid var(--bb-border) !important;
+}
+[data-testid="stSidebar"] * { color: var(--bb-white) !important; font-family: 'IBM Plex Mono', monospace !important; }
+[data-testid="stSidebar"] label { color: var(--bb-muted) !important; font-size: .65rem !important; }
+[data-testid="stSidebar"] .stDivider, [data-testid="stSidebar"] hr { border-color: var(--bb-border) !important; }
+
+/* ── Typography ── */
 h1 { font-family: 'IBM Plex Mono', monospace !important; color: var(--bb-amber) !important;
      font-size: 1.0rem !important; font-weight: 600 !important; letter-spacing: .15em !important;
      text-transform: uppercase !important; border-bottom: 1px solid var(--bb-amber) !important; padding-bottom: 4px !important; }
 h2 { color: var(--bb-amber2) !important; font-size: .85rem !important; letter-spacing: .1em !important; text-transform: uppercase !important; }
 h3 { color: var(--bb-white) !important; font-size: .78rem !important; letter-spacing: .08em !important; }
+p, li, span, div { font-family: 'IBM Plex Mono', monospace !important; }
+
+/* ── st.caption / small text ── */
+[data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] p,
+small, .stCaption, .caption { color: var(--bb-muted) !important; font-size: .62rem !important; }
+
+/* ── st.markdown prose text ── */
+[data-testid="stMarkdownContainer"], [data-testid="stMarkdownContainer"] p,
+[data-testid="stMarkdownContainer"] li, [data-testid="stMarkdownContainer"] td,
+[data-testid="stMarkdownContainer"] th {
+    color: var(--bb-white) !important;
+    font-family: 'IBM Plex Mono', monospace !important;
+    font-size: .72rem !important;
+}
+[data-testid="stMarkdownContainer"] strong { color: var(--bb-amber2) !important; }
+[data-testid="stMarkdownContainer"] code {
+    background: #1a1400 !important; color: var(--bb-amber) !important;
+    padding: 1px 4px !important; border-radius: 0 !important; font-size: .68rem !important;
+}
+[data-testid="stMarkdownContainer"] table { border-collapse: collapse !important; width: 100% !important; }
+[data-testid="stMarkdownContainer"] th { background: #1a1400 !important; color: var(--bb-amber) !important; border: 1px solid var(--bb-border) !important; padding: 4px 8px !important; font-size: .62rem !important; }
+[data-testid="stMarkdownContainer"] td { border: 1px solid var(--bb-border) !important; padding: 4px 8px !important; color: var(--bb-white) !important; font-size: .65rem !important; }
+
+/* ── Metrics ── */
 [data-testid="metric-container"] {
     background: var(--bb-surface) !important; border: 1px solid var(--bb-border) !important;
     border-left: 3px solid var(--bb-amber) !important; padding: 8px 12px !important; border-radius: 0 !important;
 }
-[data-testid="metric-container"] label { color: var(--bb-muted) !important; font-size: .58rem !important; letter-spacing: .1em !important; text-transform: uppercase !important; }
-[data-testid="metric-container"] [data-testid="stMetricValue"] { color: var(--bb-amber) !important; font-size: 1rem !important; font-weight: 600 !important; }
+[data-testid="metric-container"] label, [data-testid="stMetricLabel"],
+[data-testid="stMetricLabel"] p { color: var(--bb-muted) !important; font-size: .58rem !important; letter-spacing: .1em !important; text-transform: uppercase !important; }
+[data-testid="stMetricValue"], [data-testid="stMetricValue"] div { color: var(--bb-amber) !important; font-size: 1rem !important; font-weight: 600 !important; }
+[data-testid="stMetricDelta"] { font-size: .62rem !important; }
+[data-testid="stMetricDelta"] svg { display: none !important; }
+
+/* ── DataFrames ── */
 [data-testid="stDataFrame"] { border: 1px solid var(--bb-border) !important; }
+[data-testid="stDataFrame"] *, .stDataFrame * { background-color: transparent !important; }
+[data-testid="stDataFrame"] [data-testid="stDataFrameResizable"] { background: var(--bb-surface) !important; }
 .stDataFrame thead tr th { background: #1a1400 !important; color: var(--bb-amber) !important; font-size: .62rem !important; letter-spacing: .1em !important; text-transform: uppercase !important; border-bottom: 1px solid var(--bb-amber) !important; }
-.stDataFrame tbody tr td { font-size: .7rem !important; color: var(--bb-white) !important; border-bottom: 1px solid #1a1a1a !important; }
+.stDataFrame tbody tr td { font-size: .68rem !important; color: var(--bb-white) !important; border-bottom: 1px solid #1a1a1a !important; background: var(--bb-surface) !important; }
 .stDataFrame tbody tr:hover td { background: #1a1400 !important; }
+/* Streamlit 1.x iframe-based dataframe */
+.stDataFrame iframe { background: var(--bb-surface) !important; }
+
+/* ── Buttons ── */
 .stButton > button { background: #1a1400 !important; color: var(--bb-amber) !important; border: 1px solid var(--bb-amber) !important;
     border-radius: 0 !important; font-size: .7rem !important; letter-spacing: .1em !important; text-transform: uppercase !important; padding: 6px 14px !important; }
 .stButton > button:hover { background: var(--bb-amber) !important; color: #000 !important; }
-.stSelectbox > div > div, .stTextInput > div > div {
+.stButton > button:disabled { opacity: .4 !important; }
+
+/* ── Inputs: text, number, selectbox ── */
+.stSelectbox > div > div, .stTextInput > div > div, .stNumberInput > div > div {
     background: var(--bb-surface) !important; border: 1px solid var(--bb-border) !important;
     border-radius: 0 !important; color: var(--bb-white) !important; font-size: .72rem !important; }
+.stSelectbox label, .stTextInput label, .stNumberInput label {
+    color: var(--bb-muted) !important; font-size: .62rem !important; font-family: 'IBM Plex Mono', monospace !important; }
+.stSelectbox div[data-baseweb="select"] > div { background: var(--bb-surface) !important; color: var(--bb-white) !important; }
+/* Dropdown popup list */
+ul[data-baseweb="menu"], [data-baseweb="popover"], [data-baseweb="popover"] li {
+    background: #1a1a1a !important; color: var(--bb-white) !important; font-family: 'IBM Plex Mono', monospace !important; font-size: .7rem !important; border: 1px solid var(--bb-border) !important; }
+[data-baseweb="option"]:hover { background: #1a1400 !important; }
+/* Number input spinners */
+.stNumberInput button { background: var(--bb-surface) !important; color: var(--bb-muted) !important; border: 1px solid var(--bb-border) !important; }
+input[type="number"], input[type="text"], input[type="password"] {
+    background: var(--bb-surface) !important; color: var(--bb-white) !important;
+    border: 1px solid var(--bb-border) !important; font-family: 'IBM Plex Mono', monospace !important; font-size: .72rem !important; border-radius: 0 !important; }
+
+/* ── Tabs ── */
 .stTabs [data-baseweb="tab-list"] { background: var(--bb-surface) !important; border-bottom: 1px solid var(--bb-border) !important; gap: 0 !important; }
 .stTabs [data-baseweb="tab"] { background: transparent !important; color: var(--bb-muted) !important; font-size: .65rem !important; letter-spacing: .1em !important; text-transform: uppercase !important; border-radius: 0 !important; border-right: 1px solid var(--bb-border) !important; padding: 8px 14px !important; }
 .stTabs [aria-selected="true"] { background: #1a1400 !important; color: var(--bb-amber) !important; border-bottom: 2px solid var(--bb-amber) !important; }
-hr { border-color: var(--bb-border) !important; margin: 8px 0 !important; }
+[data-testid="stTabContent"] { background: var(--bb-bg) !important; }
+
+/* ── Expanders ── */
+[data-testid="stExpander"] { background: var(--bb-surface) !important; border: 1px solid var(--bb-border) !important; border-radius: 0 !important; }
+[data-testid="stExpander"] summary { color: var(--bb-amber2) !important; font-size: .66rem !important; letter-spacing: .08em !important; font-family: 'IBM Plex Mono', monospace !important; }
+[data-testid="stExpander"] summary:hover { color: var(--bb-amber) !important; background: #1a1400 !important; }
+[data-testid="stExpander"] svg { fill: var(--bb-amber2) !important; stroke: var(--bb-amber2) !important; }
+[data-testid="stExpanderDetails"] { background: var(--bb-bg) !important; border-top: 1px solid var(--bb-border) !important; }
+
+/* ── Divider ── */
+hr, [data-testid="stDivider"] { border-color: var(--bb-border) !important; margin: 8px 0 !important; }
+[data-testid="stDivider"] hr { border-top: 1px solid var(--bb-border) !important; }
+
+/* ── Spinner / info / warning ── */
+[data-testid="stAlert"] { background: var(--bb-surface) !important; border: 1px solid var(--bb-border) !important; color: var(--bb-white) !important; border-radius: 0 !important; font-size: .7rem !important; }
+[data-testid="stAlert"] p { color: var(--bb-white) !important; }
+.stInfo { border-left: 3px solid var(--bb-blue) !important; }
+.stWarning { border-left: 3px solid var(--bb-amber) !important; }
+.stError { border-left: 3px solid var(--bb-red) !important; }
+.stSuccess { border-left: 3px solid var(--bb-green) !important; }
+
+/* ── Spinner text ── */
+[data-testid="stSpinner"] p, .stSpinner p { color: var(--bb-amber) !important; }
+
+/* ── Scrollbars ── */
 ::-webkit-scrollbar { width: 4px; height: 4px; }
 ::-webkit-scrollbar-track { background: var(--bb-bg); }
 ::-webkit-scrollbar-thumb { background: var(--bb-border); }
 ::-webkit-scrollbar-thumb:hover { background: var(--bb-amber); }
+
+/* ── Hide Streamlit branding ── */
+#MainMenu, footer, [data-testid="stToolbar"], [data-testid="stDecoration"] { display: none !important; }
+
+/* ── Expander arrow overlap fix (from previous session) ── */
+[data-testid="stExpander"] summary svg,
+[data-testid="stExpander"] summary span[data-testid="StyledFullScreenButton"],
+[data-testid="stExpander"] summary > div > svg { display: none !important; visibility: hidden !important; width: 0 !important; font-size: 0 !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -169,6 +284,15 @@ def implied_vol(mkt_px, S, K, T, r, opt="call"):
         sig  = max(0.001, min(sig, 10.0))
     return round(sig, 6) if 0.001 < sig < 9.9 else None
 
+def bs_itm_prob(S, K, T, r, sigma, opt="call"):
+    """Probability option finishes ITM = N(d2) for call, N(-d2) for put.
+    This is the risk-neutral probability of exercise."""
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return 1.0 if (opt == "call" and S > K) else (1.0 if (opt == "put" and S < K) else 0.0)
+    d1 = (math.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    return round(_ncdf(d2) if opt == "call" else _ncdf(-d2), 4)
+
 def atm_strike(spot, step):
     return round(round(spot / step) * step, 2)
 
@@ -224,16 +348,21 @@ def fetch_expiries(_token, instrument_key):
     except: pass
     return []
 
-def fetch_option_chain(instrument_key, expiry):
-    """Fetch live option chain from Upstox."""
+@st.cache_data(ttl=CFG["chain_cache_ttl"], show_spinner=False)
+def fetch_option_chain(_token, instrument_key, expiry):
+    """Fetch live option chain from Upstox. Cached for 30s to avoid hammering API."""
     url = "https://api.upstox.com/v2/option/chain"
+    hdrs = {"Authorization": f"Bearer {_token}", "Accept": "application/json"}
     try:
-        r = requests.get(url, headers=HEADERS,
+        r = requests.get(url, headers=hdrs,
                          params={"instrument_key": instrument_key, "expiry_date": expiry},
                          timeout=15)
         if r.status_code == 200:
             return r.json().get("data", [])
-    except: pass
+        else:
+            st.warning(f"Chain API error {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        st.warning(f"Chain fetch failed: {e}")
     return []
 
 def fetch_spot_quote(instrument_key):
@@ -250,7 +379,7 @@ def fetch_spot_quote(instrument_key):
     except: pass
     return None
 
-def parse_chain(raw_data, spot):
+def parse_chain(raw_data, spot, step=50):
     """Parse Upstox option chain into a clean DataFrame."""
     rows = []
     if not raw_data: return pd.DataFrame()
@@ -289,7 +418,7 @@ def parse_chain(raw_data, spot):
         df["PCR"]       = df.apply(lambda r: round(r.PE_OI / (r.CE_OI + 1e-9), 3), axis=1)
         df["OI_Diff"]   = df["CE_OI"] - df["PE_OI"]
         df["Moneyness"] = df["Strike"].apply(
-            lambda k: "ATM" if abs(k - spot)/spot < 0.006
+            lambda k: "ATM" if abs(k - spot) <= 0.5 * step
                       else ("ITM-C" if k < spot else "OTM-C"))
     return df
 
@@ -371,19 +500,27 @@ def directional_bias(df, ltp):
 
     factors = {}; score = 0
 
-    # F1: EMA Stack (±20)
+    # Normaliser for MACD histogram: rolling std of histogram over last 60 bars
+    # Avoids hard ±10 flip — score is proportional to histogram magnitude
+    macd_hist_series = macd_l - macd_s
+    macd_std = float(macd_hist_series.tail(60).std()) or 1e-9
+
+    # F1: EMA Stack (±20) — 5 binary checks, ±4 each = ±20 total
+    # Uniform weights: each check equally important
     es = 0
-    for price, ref, pts in [(ltp,e9v,5),(ltp,e20v,5),(ltp,e50v,5),(e9v,e20v,3),(e20v,e50v,2)]:
-        es += pts if price > ref else -pts
+    for price, ref in [(ltp,e9v),(ltp,e20v),(ltp,e50v),(e9v,e20v),(e20v,e50v)]:
+        es += 4 if price > ref else -4
     factors["EMA Stack"]  = es; score += es
 
     # F2: RSI — continuous tanh centred at 50, max ±15
-    # tanh((rsi−50)/15) maps: 50→0, 65→+0.83, 35→−0.83, 80→+1, 20→−1
+    # tanh((rsi−50)/15): RSI 65→+0.83×15, RSI 35→−0.83×15
     rs = round(15 * math.tanh((rsi - 50.0) / 15.0), 1)
     factors["RSI(14)"]    = rs; score += rs
 
-    # F3: MACD Histogram (±10)
-    ms = 10 if macd_h > 0 else -10
+    # F3: MACD Histogram — continuous tanh, normalised by rolling std (max ±10)
+    # tanh(hist / std): at 1 std = ±0.76×10, at 2 std = ±0.96×10
+    # Avoids the binary ±10 flip that ignores magnitude
+    ms = round(10 * math.tanh(macd_h / macd_std), 1)
     factors["MACD Hist"]  = ms; score += ms
 
     # F4: Bollinger %B — linear map [0,1] → [−10,+10]
@@ -394,12 +531,15 @@ def directional_bias(df, ltp):
     vs = round(10 * math.tanh((vol_ratio - 1.0) / 0.5), 1)
     factors["Volume"]     = vs; score += vs
 
-    # F6: 200 EMA (±15)
-    e2 = 15 if ltp > e200v else -15
+    # F6: 200 EMA — continuous tanh normalised by ATR (max ±15)
+    # Distance from 200 EMA measured in ATR units: 0 ATR → 0, 1 ATR → tanh(1)×15 ≈ ±11.5
+    # This avoids binary ±15 flip and makes the score proportional to distance/volatility
+    atr_norm = atrv if atrv > 0 else (ltp * 0.01)
+    e2 = round(15 * math.tanh((ltp - e200v) / atr_norm), 1)
     factors["200 EMA"]    = e2; score += e2
 
     # F7: 5D momentum — continuous tanh centred at 0%, max ±10
-    # tanh(ret5/2.0): +3% → +0.905, +1% → +0.46, −1% → −0.46, −3% → −0.905
+    # tanh(ret5 / 2.0): +3%→+0.905×10, +1%→+0.46×10
     if len(c) >= 6:
         base = float(c.iloc[-6])
         ret5 = (ltp/base - 1)*100 if base != 0 else 0
@@ -431,19 +571,28 @@ def iv_rank(iv_series, current_iv):
     return round((current_iv - lo)/(hi - lo + 1e-9)*100, 1)
 
 def vol_regime(ivr):
-    if   ivr < 20: return "LOW VOL",      "BUY premium — debit spreads / long options / straddles", "#1e90ff"
-    elif ivr < 40: return "NORMAL-LOW",   "Slight buy lean — calendars / ratio spreads",            "#7ec8e3"
-    elif ivr < 60: return "NORMAL",       "Neutral — use balanced spreads both sides",               "#ffb347"
-    elif ivr < 75: return "ELEVATED",     "Lean SELL — credit spreads / iron condor",               "#ff8c00"
+    # IV Rank quartile boundaries — principled percentile cuts:
+    # < 25  = bottom quartile  → structurally cheap vol → BUY premium
+    # 25–50 = second quartile  → below-median vol → slight buy lean
+    # 50–75 = third quartile   → above-median vol → slight sell lean
+    # 75–90 = elevated         → lean SELL premium
+    # > 90  = top decile       → extreme premium → strong SELL signal
+    if   ivr < 25: return "LOW VOL",      "BUY premium — debit spreads / long options / straddles", "#1e90ff"
+    elif ivr < 50: return "NORMAL-LOW",   "Slight buy lean — calendars / ratio spreads",            "#7ec8e3"
+    elif ivr < 75: return "NORMAL-HIGH",  "Slight sell lean — balanced spreads, light credits",     "#ffb347"
+    elif ivr < 90: return "ELEVATED",     "Lean SELL — credit spreads / iron condor",               "#ff8c00"
     else:          return "HIGH VOL",     "SELL premium — iron condors / strangles / short straddle","#ff3b3b"
 
 # ============================================================
 # OI ANALYSIS
 # ============================================================
 
-def oi_analysis(chain_df, spot):
+def oi_analysis(chain_df, spot, step=50, T=0.02, r=0.065, atm_iv=0.20):
+    """OI analysis with GEX, gamma flip, OI cluster walls, and skew metrics."""
     if chain_df.empty: return {}
-    df = chain_df[(chain_df.Strike > spot*0.85) & (chain_df.Strike < spot*1.15)].copy()
+    atm_approx = round(round(spot / step) * step, 2)
+    df = chain_df[(chain_df.Strike >= atm_approx - CFG["pain_strikes"]*step) &
+                  (chain_df.Strike <= atm_approx + CFG["pain_strikes"]*step)].copy()
     if df.empty: return {}
 
     def pain(ep, d):
@@ -456,24 +605,27 @@ def oi_analysis(chain_df, spot):
     total_ce  = float(df.CE_OI.sum())
     total_pe  = float(df.PE_OI.sum())
     pcr_oi    = round(total_pe / (total_ce + 1e-9), 3)
-    call_wall = float(df.loc[df.CE_OI.idxmax(), "Strike"])
-    put_wall  = float(df.loc[df.PE_OI.idxmax(), "Strike"])
 
-    atm_r = df.iloc[(df.Strike - spot).abs().argsort()[:1]]
+    # ── OI cluster walls (3-strike sliding window — smoother than single-strike max) ──
+    def oi_cluster_peak(oi_col, strikes_list):
+        if len(strikes_list) < 3: return float(strikes_list[oi_col.argmax()])
+        best_k, best_sum = strikes_list[0], 0
+        for i in range(1, len(strikes_list) - 1):
+            s = oi_col.iloc[i-1] + oi_col.iloc[i] + oi_col.iloc[i+1]
+            if s > best_sum:
+                best_sum = s
+                best_k   = strikes_list[i]
+        return float(best_k)
+
+    call_wall = oi_cluster_peak(df.CE_OI.reset_index(drop=True), list(df.Strike))
+    put_wall  = oi_cluster_peak(df.PE_OI.reset_index(drop=True), list(df.Strike))
+
+    atm_r    = df.iloc[(df.Strike - spot).abs().argsort()[:1]]
     straddle = float(atm_r.CE_LTP.values[0] + atm_r.PE_LTP.values[0]) if not atm_r.empty else 0
-    # Expected move = ATM straddle ÷ spot, derived from BS:
-    # straddle ≈ spot × IV × sqrt(2/π) × sqrt(T), so straddle/spot = IV × sqrt(2/π × T)
-    # This equals ±1σ (68.27% probability range) to expiry.
-    # Equivalently: exp_move% = (straddle / spot) × 100
-    exp_move = round(straddle / spot * 100, 2) if spot > 0 else 0
-    # ±2σ range (95.45% probability):
+    exp_move     = round(straddle / spot * 100, 2) if spot > 0 else 0
     exp_move_2sd = round(exp_move * 2.0, 2)
 
-    # PCR signal: interpret relative to historical PCR distribution of this expiry.
-    # Use rolling percentile if we have history; otherwise fall back to absolute levels.
-    # Empirical NSE PCR range: 0.6 (very bearish) – 1.8 (very bullish), median ≈ 1.05
-    # Fixed boundaries are replaced by a percentile-based signal derived from the
-    # observed CE/PE OI ratio across all strikes in the current chain.
+    # ── PCR signal ──
     pcr_values_in_chain = df["PCR"].replace([np.inf, -np.inf], np.nan).dropna()
     pcr_pct = float(
         (pcr_values_in_chain <= pcr_oi).mean() * 100
@@ -485,11 +637,65 @@ def oi_analysis(chain_df, spot):
     elif pcr_pct >= 25: pcr_sig = "SLIGHT BEARISH LEAN — PCR below median; call OI building"
     else:               pcr_sig = "BEARISH — aggregate PCR in bottom quartile; heavy call writing = resistance"
 
-    return dict(max_pain=round(max_pain,2), pcr_oi=pcr_oi,
-                call_wall=round(call_wall,2), put_wall=round(put_wall,2),
-                total_ce_oi=int(total_ce), total_pe_oi=int(total_pe),
-                atm_straddle=round(straddle,2), exp_move_pct=exp_move,
-                exp_move_2sd_pct=exp_move_2sd, pcr_signal=pcr_sig)
+    # ── Gamma Exposure (GEX) ──
+    # GEX per strike = gamma × OI × spot (dollar-gamma, per-unit)
+    # Dealer convention: dealers are net SHORT options, so their GEX = -(buyer's GEX)
+    # Net GEX = calls positive, puts negative (from dealer perspective)
+    t_safe = max(T, 1.0/365.0)
+    gex_rows = []
+    for _, row in df.iterrows():
+        iv_c = float(row.CE_IV)
+        iv_p = float(row.PE_IV)
+        iv_c = max((iv_c/100 if iv_c > 2 else iv_c), 0.01) if iv_c else atm_iv
+        iv_p = max((iv_p/100 if iv_p > 2 else iv_p), 0.01) if iv_p else atm_iv
+        g_ce = bs_greeks(spot, float(row.Strike), t_safe, r, iv_c, "call")["gamma"]
+        g_pe = bs_greeks(spot, float(row.Strike), t_safe, r, iv_p, "put")["gamma"]
+        net  = (g_ce * float(row.CE_OI) - g_pe * float(row.PE_OI)) * spot
+        gex_rows.append({"Strike": float(row.Strike), "NET_GEX": net})
+
+    gex_df       = pd.DataFrame(gex_rows)
+    net_gex_total = float(gex_df["NET_GEX"].sum())
+    gex_regime   = ("POSITIVE GEX — range-bound / vol suppressed (dealers buy dips & sell rallies)"
+                    if net_gex_total >= 0 else
+                    "NEGATIVE GEX — trending / vol expansion likely (dealers chase price)")
+
+    # ── Gamma Flip Level (strike where cumulative GEX crosses zero) ──
+    gex_sorted = gex_df.copy()
+    gex_sorted["dist"] = (gex_sorted.Strike - spot).abs()
+    gex_sorted = gex_sorted.sort_values("dist").reset_index(drop=True)
+    cum_gex    = gex_sorted["NET_GEX"].cumsum()
+    gamma_flip = spot  # default
+    for i in range(1, len(cum_gex)):
+        if cum_gex.iloc[i-1] * cum_gex.iloc[i] <= 0:
+            gamma_flip = float(gex_sorted.Strike.iloc[i])
+            break
+
+    # ── IV Skew (downside put IV vs upside call IV at ±1 strike) ──
+    skew_val, skew_label = None, "—"
+    try:
+        dn1   = df.iloc[(df.Strike - (spot - step)).abs().argsort()[:1]]
+        up1   = df.iloc[(df.Strike - (spot + step)).abs().argsort()[:1]]
+        dn_iv = float(dn1.PE_IV.values[0])
+        up_iv = float(up1.CE_IV.values[0])
+        dn_iv = dn_iv/100 if dn_iv > 2 else dn_iv
+        up_iv = up_iv/100 if up_iv > 2 else up_iv
+        if dn_iv > 0 and up_iv > 0:
+            skew_val = round((dn_iv - up_iv) * 100, 2)
+            if   skew_val >  3: skew_label = f"BEARISH SKEW +{skew_val:.1f}pp — put protection demand elevated"
+            elif skew_val > -1: skew_label = f"NEUTRAL SKEW {skew_val:+.1f}pp — balanced demand"
+            else:               skew_label = f"CALL SKEW {skew_val:+.1f}pp — upside speculation elevated"
+    except: pass
+
+    return dict(
+        max_pain=round(max_pain,2), pcr_oi=pcr_oi,
+        call_wall=round(call_wall,2), put_wall=round(put_wall,2),
+        total_ce_oi=int(total_ce), total_pe_oi=int(total_pe),
+        atm_straddle=round(straddle,2), exp_move_pct=exp_move,
+        exp_move_2sd_pct=exp_move_2sd, pcr_signal=pcr_sig,
+        net_gex=round(net_gex_total, 2), gex_regime=gex_regime,
+        gamma_flip=round(gamma_flip, 2), gex_df=gex_df,
+        skew_pp=skew_val, skew_label=skew_label,
+    )
 
 # ============================================================
 # STRATEGY RECOMMENDATION ENGINE
@@ -498,8 +704,8 @@ def oi_analysis(chain_df, spot):
 def recommend_strategies(bias, vol_lbl, dte, spot, atm, step, ivr, bias_score=0):
     is_bull  = "BULL" in bias
     is_bear  = "BEAR" in bias
-    hi_vol   = ivr >= 60
-    lo_vol   = ivr < 35
+    hi_vol   = ivr >= 75   # top quartile = sell premium
+    lo_vol   = ivr < 25    # bottom quartile = buy premium
     sv       = float(step)
     recs     = []
 
@@ -519,20 +725,23 @@ def recommend_strategies(bias, vol_lbl, dte, spot, atm, step, ivr, bias_score=0)
     #
     # Final: round(bias_align × vol_align × dte_align × 100, 0)
 
-    abs_score = abs(bias_score) if "bias_score" in dir() else 0  # captured below via closure
+    abs_score = abs(bias_score)  # used by fit_score via closure
 
     def _dte_align(ideal_dte_str, actual_dte):
-        """Return 0–1 alignment of actual DTE vs ideal range string like '15–30 DTE'."""
+        """Return 0–1 DTE alignment. 1.0 if within range, exponential decay outside.
+        Decay constant κ = ln(2) / half_range → score halves every half_range days outside."""
         import re
         nums = re.findall(r'\d+', ideal_dte_str.split("DTE")[0])
         if len(nums) >= 2:
             lo, hi = int(nums[0]), int(nums[-1])
             if lo <= actual_dte <= hi: return 1.0
             dist = min(abs(actual_dte - lo), abs(actual_dte - hi))
-            return max(0.0, 1.0 - dist / max(hi, 1))
+            half_range = max((hi - lo) / 2.0, 1.0)
+            return math.exp(-math.log(2) * dist / half_range)
         elif len(nums) == 1:
             ref = int(nums[0])
-            return max(0.0, 1.0 - abs(actual_dte - ref) / max(ref, 1))
+            dist = abs(actual_dte - ref)
+            return math.exp(-math.log(2) * dist / max(ref / 2.0, 1.0))
         return 0.5
 
     def fit_score(strategy_type, ideal_dte_str, bias_pts):
@@ -830,6 +1039,14 @@ padding:8px 10px;font-family:'IBM Plex Mono',monospace;font-size:.6rem;margin-to
 if load_btn:
     with st.spinner(f"Loading {sym_sel} options intelligence…"):
 
+        # Validate expiry format before any API calls
+        if expiry_sel:
+            try:
+                datetime.strptime(expiry_sel, "%Y-%m-%d")
+            except ValueError:
+                st.error(f"Invalid expiry format '{expiry_sel}'. Expected YYYY-MM-DD.")
+                st.stop()
+
         # 1. Spot
         spot = spot_override if spot_override > 0 else (fetch_spot_quote(ikey) if ikey else None)
         if not spot:
@@ -853,8 +1070,8 @@ if load_btn:
         bias_res = directional_bias(ohlcv_df, spot)
 
         # 4. Option chain
-        chain_raw = fetch_option_chain(ikey, expiry_sel) if ikey and expiry_sel else []
-        chain_df  = parse_chain(chain_raw, spot)
+        chain_raw = fetch_option_chain(ACCESS_TOKEN, ikey, expiry_sel) if ikey and expiry_sel else []
+        chain_df  = parse_chain(chain_raw, spot, step_val)
 
         # 5. ATM IV
         atm_iv = None
@@ -868,7 +1085,16 @@ if load_btn:
                 pe_iv   = pe_iv_r/100 if pe_iv_r > 2 else pe_iv_r
                 if ce_iv + pe_iv > 0: atm_iv = (ce_iv + pe_iv) / 2
         if not atm_iv:
-            T_tmp = dte_sidebar / 365.0
+            # Compute T from expiry date first (dte_sidebar may be 0 = auto)
+            _dte_tmp = 7  # safe fallback
+            if expiry_sel:
+                try:
+                    _exp_d  = datetime.strptime(expiry_sel, "%Y-%m-%d").date()
+                    _dte_tmp = max(((_exp_d - datetime.now().date()).days), 1)
+                except: pass
+            elif dte_sidebar and dte_sidebar > 0:
+                _dte_tmp = dte_sidebar
+            T_tmp = _dte_tmp / 365.0
             if not chain_df.empty:
                 row = chain_df.iloc[(chain_df.Strike - spot).abs().argsort()[:1]]
                 if not row.empty:
@@ -883,7 +1109,9 @@ if load_btn:
             atm_iv = hv20 or 0.20
 
         # 6. OI
-        oi_d = oi_analysis(chain_df, spot)
+        _T_for_oi  = _dte_tmp / 365.0
+        _rfr_for_oi = st.session_state.get("rfr_sidebar", CFG["rfr_default"]) / 100.0
+        oi_d = oi_analysis(chain_df, spot, step_val, T=_T_for_oi, r=_rfr_for_oi, atm_iv=atm_iv or 0.20)
 
         # 7. DTE from expiry date (auto when dte_sidebar == 0)
         actual_dte = dte_sidebar if dte_sidebar and dte_sidebar > 0 else 7
@@ -977,10 +1205,11 @@ _iv_hist_sym = st.session_state.opt_iv_history.get(sym, [])
 if len(_iv_hist_sym) >= 3:
     ivr = iv_rank(_iv_hist_sym, atm_iv)
 else:
-    # Bootstrap: estimate IV rank using HV as the floor and atm_iv as current
-    # IVR ≈ (IV - HV) / (1.5×HV - HV) = (IV/HV - 1) × 100, clamped 0–100
+    # Bootstrap estimate: IV Rank ~50 when IV = HV (fair value), rises above 50 when IV > HV.
+    # Formula: IVR = 50 + 50 × tanh((IV - HV) / (0.5 × HV))
+    # At IV=HV: IVR=50. At IV=1.5×HV: IVR≈81. At IV=0.5×HV: IVR≈19.
     _hv_ref = hv20 if hv20 and hv20 > 0 else 0.15
-    ivr = float(min(100.0, max(0.0, ((atm_iv / _hv_ref) - 1.0) * 100.0)))
+    ivr = float(min(100.0, max(0.0, 50.0 + 50.0 * math.tanh((atm_iv - _hv_ref) / (0.5 * _hv_ref)))))
 v_lbl, v_act, v_col = vol_regime(ivr)
 strat_recs   = recommend_strategies(bias, v_lbl, dte, spot, atm_k, step, ivr, bias_score)
 
@@ -993,6 +1222,19 @@ bc = BIAS_COLORS.get(bias, "#888")
 # ── TOP HEADER BAR ──
 iv_vs_hv = (atm_iv - hv20)*100
 iv_sign  = "+" if iv_vs_hv >= 0 else ""
+
+# IV momentum: change vs rolling mean of session IV history
+_iv_hist_sym2 = st.session_state.opt_iv_history.get(sym, [])
+if len(_iv_hist_sym2) >= 5:
+    _iv_ma5 = float(np.mean(_iv_hist_sym2[-5:]))
+    iv_momentum = (atm_iv - _iv_ma5) * 100
+    iv_mom_sign = "+" if iv_momentum >= 0 else ""
+    iv_mom_str  = f"IV Δ(5): {iv_mom_sign}{iv_momentum:.1f}%"
+    iv_mom_c    = "#ff3b3b" if iv_momentum > 0.5 else ("#1e90ff" if iv_momentum < -0.5 else "#888")
+else:
+    iv_mom_str = "IV Δ: —"
+    iv_mom_c   = "#555"
+
 st.markdown(f"""
 <div style="background:#0d0d0d;border:1px solid #2a2a2a;border-left:4px solid {bc};
 padding:10px 16px;margin-bottom:6px;font-family:'IBM Plex Mono',monospace;">
@@ -1003,6 +1245,7 @@ padding:10px 16px;margin-bottom:6px;font-family:'IBM Plex Mono',monospace;">
     <span style="color:{bc};font-size:.82rem;font-weight:700;">{bias} ({bias_score:+d})</span>
     <span style="color:{v_col};font-size:.72rem;font-weight:600;">VOL: {v_lbl}</span>
     <span style="color:#888;font-size:.62rem;">ATM IV {atm_iv*100:.1f}% · HV20 {hv20*100:.1f}% · IV−HV {iv_sign}{iv_vs_hv:.1f}%</span>
+    <span style="color:{iv_mom_c};font-size:.6rem;">{iv_mom_str}</span>
     <span style="color:#555;font-size:.6rem;">DTE: {dte}</span>
   </div>
 </div>
@@ -1057,7 +1300,14 @@ font-family:'IBM Plex Mono',monospace;height:100%;">
     with ov2:
         # OI key metrics
         if oi_d:
-            pcr_c = "#00d084" if oi_d.get("pcr_oi",1) >= 1.0 else "#ff3b3b"
+            # PCR colour: green if aggregate put OI > call OI (bullish support), else red
+            pcr_c = "#00d084" if oi_d.get("total_pe_oi", 0) >= oi_d.get("total_ce_oi", 0) else "#ff3b3b"
+            _gex_net = oi_d.get("net_gex", 0) or 0
+            _gex_c   = "#00d084" if _gex_net >= 0 else "#ff3b3b"
+            _gex_lbl = "POS GEX" if _gex_net >= 0 else "NEG GEX"
+            _skew_pp = oi_d.get("skew_pp")
+            _skew_str = f"{_skew_pp:+.1f}pp" if _skew_pp is not None else "—"
+            _skew_c  = "#ff3b3b" if (_skew_pp or 0) > 2 else ("#1e90ff" if (_skew_pp or 0) < -1 else "#888")
             st.markdown(f"""
 <div style="background:#0d0d0d;border:1px solid #2a2a2a;padding:12px 16px;
 font-family:'IBM Plex Mono',monospace;">
@@ -1071,8 +1321,13 @@ font-family:'IBM Plex Mono',monospace;">
          <div style="color:#ff3b3b;font-size:.82rem;font-weight:600;">₹{oi_d.get('call_wall',0):,.0f}</div></div>
     <div><div style="color:#555;font-size:.58rem;">PUT WALL</div>
          <div style="color:#00d084;font-size:.82rem;font-weight:600;">₹{oi_d.get('put_wall',0):,.0f}</div></div>
+    <div><div style="color:#555;font-size:.58rem;">GEX REGIME</div>
+         <div style="color:{_gex_c};font-size:.78rem;font-weight:600;">{_gex_lbl} ({_gex_net:+,.0f})</div></div>
+    <div><div style="color:#555;font-size:.58rem;">IV SKEW (±1 strike)</div>
+         <div style="color:{_skew_c};font-size:.78rem;font-weight:600;">{_skew_str}</div></div>
   </div>
   <div style="margin-top:8px;color:{pcr_c};font-size:.62rem;">{oi_d.get('pcr_signal','—')}</div>
+  <div style="margin-top:4px;color:#555;font-size:.58rem;">Gamma Flip: ₹{oi_d.get('gamma_flip',spot):,.0f}</div>
 </div>""", unsafe_allow_html=True)
 
     # Best strategy card
@@ -1271,7 +1526,7 @@ with t_chain:
             pe_p = bs_price(spot, k, T, r, atm_iv, "put")
             cg   = bs_greeks(spot, k, T, r, atm_iv, "call")
             pg   = bs_greeks(spot, k, T, r, atm_iv, "put")
-            mm   = "ATM" if abs(k-spot)/spot<0.006 else ("ITM-C" if k<spot else "OTM-C")
+            mm   = "ATM" if abs(k-spot) <= 0.5*step else ("ITM-C" if k<spot else "OTM-C")
             syn_rows.append({
                 "Strike":k,"Moneyness":mm,
                 "CE Price":round(ce_p,2),"CE IV%":round(atm_iv*100,1),
@@ -1281,20 +1536,26 @@ with t_chain:
             })
         st.dataframe(pd.DataFrame(syn_rows), use_container_width=True, hide_index=True)
     else:
-        # Filter ±8 strikes
-        disp_c = chain_df[(chain_df.Strike >= spot*0.91) & (chain_df.Strike <= spot*1.09)].copy()
+        # Show ±8 strikes around ATM (not an arbitrary % band)
+        _chain_lo = atm_k - 8 * step
+        _chain_hi = atm_k + 8 * step
+        disp_c = chain_df[(chain_df.Strike >= _chain_lo) & (chain_df.Strike <= _chain_hi)].copy()
 
         # Add directional + IV edge signal per row
         def row_signal(row):
             ce_iv_r = float(row.CE_IV); pe_iv_r = float(row.PE_IV)
             ce_iv   = ce_iv_r/100 if ce_iv_r>2 else (ce_iv_r or atm_iv)
             pe_iv   = pe_iv_r/100 if pe_iv_r>2 else (pe_iv_r or atm_iv)
-            ce_edge = (ce_iv - hv20)*100
-            pe_edge = (pe_iv - hv20)*100
-            ce_dir  = "BUY" if bias_score>=12 else "SELL" if bias_score<=-12 else "—"
-            pe_dir  = "BUY" if bias_score<=-12 else "SELL" if bias_score>=12 else "—"
-            ce_vol  = "SELL (rich)" if ce_edge>15 else "BUY (cheap)" if ce_edge<-15 else "—"
-            pe_vol  = "SELL (rich)" if pe_edge>15 else "BUY (cheap)" if pe_edge<-15 else "—"
+            # IV edge: relative to HV — scale-invariant
+            # >1.20× HV = 20% overpriced → sell signal
+            # <0.85× HV = 15% underpriced → buy signal
+            hv_ref  = hv20 if hv20 and hv20 > 0 else atm_iv
+            ce_ratio = ce_iv / hv_ref if hv_ref > 0 else 1.0
+            pe_ratio = pe_iv / hv_ref if hv_ref > 0 else 1.0
+            ce_dir  = "BUY" if bias_score >= 12 else "SELL" if bias_score <= -12 else "—"
+            pe_dir  = "BUY" if bias_score <= -12 else "SELL" if bias_score >= 12 else "—"
+            ce_vol  = "SELL (rich)" if ce_ratio > 1.20 else "BUY (cheap)" if ce_ratio < 0.85 else "—"
+            pe_vol  = "SELL (rich)" if pe_ratio > 1.20 else "BUY (cheap)" if pe_ratio < 0.85 else "—"
             return pd.Series({"CE_Dir":ce_dir,"CE_Vol_Sig":ce_vol,"PE_Dir":pe_dir,"PE_Vol_Sig":pe_vol})
 
         sigs = disp_c.apply(row_signal, axis=1)
@@ -1352,15 +1613,19 @@ with t_greeks:
         pg  = bs_greeks(spot, k, T, r, pe_iv_use, "put")
         cp  = bs_price (spot, k, T, r, ce_iv_use, "call")
         pp  = bs_price (spot, k, T, r, pe_iv_use, "put")
-        mm  = "ATM" if abs(k-spot)/spot<0.006 else ("ITM" if k<spot else "OTM")
+        mm  = "ATM" if abs(k-spot) <= 0.5*step else ("ITM" if k<spot else "OTM")
+        ce_itm = bs_itm_prob(spot, k, T, r, ce_iv_use, "call")
+        pe_itm = bs_itm_prob(spot, k, T, r, pe_iv_use, "put")
         g_rows.append({
             "Strike":k, "Moneyness":mm,
             "CE Price":round(cp,2), "CE IV%":round(ce_iv_use*100,1),
             "CE Δ":cg["delta"], "CE Γ":cg["gamma"],
             "CE θ/d":round(cg["theta"],3), "CE ν/1%":round(cg["vega"],3),
+            "CE P(ITM)":f"{ce_itm*100:.0f}%",
             "PE Price":round(pp,2), "PE IV%":round(pe_iv_use*100,1),
             "PE Δ":pg["delta"], "PE Γ":pg["gamma"],
             "PE θ/d":round(pg["theta"],3), "PE ν/1%":round(pg["vega"],3),
+            "PE P(ITM)":f"{pe_itm*100:.0f}%",
         })
 
     g_df = pd.DataFrame(g_rows)
@@ -1419,7 +1684,7 @@ with t_oi:
     if not oi_d:
         st.info("No OI data available. Load chain first.")
     else:
-        pcr_c = "#00d084" if oi_d.get("pcr_oi",1) >= 1.0 else "#ff3b3b"
+        pcr_c = "#00d084" if oi_d.get("total_pe_oi", 0) >= oi_d.get("total_ce_oi", 0) else "#ff3b3b"
         pain_diff = spot - oi_d.get("max_pain", spot)
 
         o1,o2,o3,o4,o5,o6 = st.columns(6)
@@ -1439,7 +1704,7 @@ font-family:'IBM Plex Mono',monospace;font-size:.7rem;color:{pcr_c};">
 </div>""", unsafe_allow_html=True)
 
     if not chain_df.empty:
-        oi_disp = chain_df[(chain_df.Strike>=spot*0.90)&(chain_df.Strike<=spot*1.10)].copy()
+        oi_disp = chain_df[(chain_df.Strike >= atm_k - 10*step) & (chain_df.Strike <= atm_k + 10*step)].copy()
 
         # OI Bar Chart
         fig_oi = go.Figure()
@@ -1461,18 +1726,23 @@ font-family:'IBM Plex Mono',monospace;font-size:.7rem;color:{pcr_c};">
         )
         st.plotly_chart(fig_oi, use_container_width=True)
 
-        # PCR by Strike
+        # PCR bar colours derived from the chain's own PCR distribution (25th/75th pct)
+        _pcr_vals = oi_disp.PCR.replace([np.inf, -np.inf], np.nan).dropna()
+        _pcr_hi   = float(_pcr_vals.quantile(0.75)) if len(_pcr_vals) >= 4 else 1.2
+        _pcr_lo   = float(_pcr_vals.quantile(0.25)) if len(_pcr_vals) >= 4 else 0.8
         fig_pcr = go.Figure()
         fig_pcr.add_trace(go.Bar(
             x=oi_disp.Strike, y=oi_disp.PCR,
-            marker_color=["#00d084" if v>1.2 else "#ff3b3b" if v<0.8 else "#ffb347"
+            marker_color=["#00d084" if v > _pcr_hi else "#ff3b3b" if v < _pcr_lo else "#ffb347"
                           for v in oi_disp.PCR],
             name="PCR"
         ))
-        fig_pcr.add_hline(y=1.0, line=dict(color="#555",dash="dot"))
+        fig_pcr.add_hline(y=float(_pcr_vals.median()) if len(_pcr_vals) > 0 else 1.0,
+                          line=dict(color="#555",dash="dot"),
+                          annotation_text=f"Median {_pcr_vals.median():.2f}" if len(_pcr_vals) > 0 else "")
         fig_pcr.add_vline(x=spot, line=dict(color="#ffb347",dash="dot",width=1))
         fig_pcr.update_layout(
-            title="PCR by Strike (>1.2 bullish signal / <0.8 bearish signal)",
+            title=f"PCR by Strike  (green > {_pcr_hi:.2f} = 75th pct / red < {_pcr_lo:.2f} = 25th pct)",
             height=220, plot_bgcolor="#000", paper_bgcolor="#000",
             font=dict(color="#e8e8e8",family="IBM Plex Mono",size=9),
             margin=dict(t=40,b=10)
@@ -1495,6 +1765,113 @@ font-family:'IBM Plex Mono',monospace;font-size:.7rem;color:{pcr_c};">
             )
             st.plotly_chart(fig_oic, use_container_width=True)
 
+            # ΔOI interpretation table
+            with st.expander("◼ ΔOI POSITIONING GUIDE"):
+                st.markdown("""
+| Price | OI | Meaning | Implication |
+|-------|-----|---------|-------------|
+| ↑ | ↑ | Long build-up | Bullish — fresh longs entering |
+| ↓ | ↑ | Short build-up | Bearish — fresh shorts entering |
+| ↑ | ↓ | Short covering | Bullish — trapped shorts exiting |
+| ↓ | ↓ | Long liquidation | Bearish — longs exiting |
+
+**Read CE_ΔOI and PE_ΔOI independently at each strike.**
+- Big CE_ΔOI build at a strike above spot = call resistance being written
+- Big PE_ΔOI build at a strike below spot = put support being written
+""")
+
+        # ── Gamma Exposure (GEX) Chart ──
+        if oi_d and "gex_df" in oi_d and not oi_d["gex_df"].empty:
+            gex_plot = oi_d["gex_df"]
+            gex_plot = gex_plot[(gex_plot.Strike >= atm_k - CFG["oi_strikes"]*step) &
+                                (gex_plot.Strike <= atm_k + CFG["oi_strikes"]*step)]
+            gex_colors = ["#00d084" if v >= 0 else "#ff3b3b" for v in gex_plot.NET_GEX]
+            fig_gex = go.Figure()
+            fig_gex.add_trace(go.Bar(
+                x=gex_plot.Strike, y=gex_plot.NET_GEX,
+                marker_color=gex_colors, name="Net GEX", opacity=0.85
+            ))
+            fig_gex.add_vline(x=spot, line=dict(color="#ffb347",dash="dot",width=1.5),
+                              annotation_text=f"Spot {spot:.0f}")
+            if oi_d.get("gamma_flip"):
+                fig_gex.add_vline(x=oi_d["gamma_flip"],
+                                  line=dict(color="#ff8c00",dash="dash",width=1.5),
+                                  annotation_text=f"Gamma Flip {oi_d['gamma_flip']:.0f}",
+                                  annotation=dict(font=dict(color="#ff8c00",size=8)))
+            gex_net   = oi_d.get("net_gex", 0)
+            gex_regime_short = "POSITIVE" if gex_net >= 0 else "NEGATIVE"
+            gex_rc    = "#00d084" if gex_net >= 0 else "#ff3b3b"
+            fig_gex.update_layout(
+                title=f"Gamma Exposure (GEX) by Strike — Net: {gex_net:+.0f} [{gex_regime_short}]",
+                height=280, plot_bgcolor="#000", paper_bgcolor="#000",
+                font=dict(color="#e8e8e8",family="IBM Plex Mono",size=9),
+                margin=dict(t=40,b=10), yaxis=dict(gridcolor="#111")
+            )
+            st.plotly_chart(fig_gex, use_container_width=True)
+
+            # GEX regime card
+            gex_flip_rel = "ABOVE spot" if oi_d["gamma_flip"] > spot else "BELOW spot"
+            st.markdown(f"""
+<div style="background:#0d0d0d;border:1px solid #2a2a2a;border-left:3px solid {gex_rc};
+padding:9px 14px;font-family:'IBM Plex Mono',monospace;font-size:.65rem;">
+  <span style="color:{gex_rc};font-weight:700;">GEX: {oi_d.get('gex_regime','—')}</span><br/>
+  <span style="color:#888;">Gamma Flip: ₹{oi_d['gamma_flip']:,.0f} ({gex_flip_rel}) &nbsp;·&nbsp;
+  Net GEX: {gex_net:+,.0f}</span>
+</div>""", unsafe_allow_html=True)
+
+        # ── Volatility Smile ──
+        if not chain_df.empty:
+            smile_df = chain_df[(chain_df.Strike >= atm_k - CFG["oi_strikes"]*step) &
+                                (chain_df.Strike <= atm_k + CFG["oi_strikes"]*step)].copy()
+            smile_df["CE_IV_pct"] = smile_df.CE_IV.apply(lambda v: (v/100 if v>2 else v)*100 if v else None)
+            smile_df["PE_IV_pct"] = smile_df.PE_IV.apply(lambda v: (v/100 if v>2 else v)*100 if v else None)
+            valid_smile = smile_df[(smile_df.CE_IV_pct > 0) | (smile_df.PE_IV_pct > 0)]
+            if not valid_smile.empty:
+                fig_smile = go.Figure()
+                fig_smile.add_trace(go.Scatter(
+                    x=valid_smile.Strike, y=valid_smile.CE_IV_pct,
+                    mode="lines+markers", name="CE IV%",
+                    line=dict(color="#ff3b3b",width=2), marker=dict(size=5)
+                ))
+                fig_smile.add_trace(go.Scatter(
+                    x=valid_smile.Strike, y=valid_smile.PE_IV_pct,
+                    mode="lines+markers", name="PE IV%",
+                    line=dict(color="#00d084",width=2), marker=dict(size=5)
+                ))
+                fig_smile.add_hline(y=atm_iv*100, line=dict(color="#ffb347",dash="dot",width=1),
+                                    annotation_text=f"ATM IV {atm_iv*100:.1f}%")
+                if hv20:
+                    fig_smile.add_hline(y=hv20*100, line=dict(color="#555",dash="dot",width=1),
+                                        annotation_text=f"HV20 {hv20*100:.1f}%")
+                fig_smile.add_vline(x=spot, line=dict(color="#ffb347",dash="dot",width=1),
+                                    annotation_text=f"Spot {spot:.0f}")
+
+                # Skew annotation
+                skew_txt = ""
+                if oi_d and oi_d.get("skew_pp") is not None:
+                    skew_pp   = oi_d["skew_pp"]
+                    skew_col  = "#ff3b3b" if skew_pp > 2 else ("#1e90ff" if skew_pp < -1 else "#888")
+                    skew_txt  = f"Skew: {skew_pp:+.1f}pp"
+
+                fig_smile.update_layout(
+                    title=f"Volatility Smile — IV by Strike{'  ·  ' + skew_txt if skew_txt else ''}",
+                    height=280, plot_bgcolor="#000", paper_bgcolor="#000",
+                    font=dict(color="#e8e8e8",family="IBM Plex Mono",size=9),
+                    legend=dict(orientation="h",y=1.12), margin=dict(t=40,b=10),
+                    yaxis=dict(title="IV%",gridcolor="#111")
+                )
+                st.plotly_chart(fig_smile, use_container_width=True)
+
+                # Skew card
+                if oi_d and oi_d.get("skew_label") and oi_d["skew_label"] != "—":
+                    skew_pp   = oi_d.get("skew_pp", 0) or 0
+                    skew_c    = "#ff3b3b" if skew_pp > 2 else ("#1e90ff" if skew_pp < -1 else "#888")
+                    st.markdown(f"""
+<div style="border-left:3px solid {skew_c};padding:6px 12px;
+font-family:'IBM Plex Mono',monospace;font-size:.66rem;color:{skew_c};margin:4px 0;">
+  SKEW: {oi_d['skew_label']}
+</div>""", unsafe_allow_html=True)
+
     with st.expander("◼ HOW TO READ OI DATA"):
         st.markdown("""
 **Max Pain** — Strike where option writers lose the least. Price gravitates here near expiry.
@@ -1506,10 +1883,20 @@ font-family:'IBM Plex Mono',monospace;font-size:.7rem;color:{pcr_c};">
 - 0.9–1.2 → Balanced
 - < 0.7 → Heavy call buying → too much optimism → **contrarian BEARISH**
 
-**Call Wall** — Highest CE OI strike = hard resistance. Dealers short calls → sell futures above = supply.
-**Put Wall** — Highest PE OI strike = strong support. Dealers short puts → buy futures below = demand.
+**Call Wall** — Highest CE OI cluster = hard resistance. Dealers short calls → sell futures above = supply.
+**Put Wall** — Highest PE OI cluster = strong support. Dealers short puts → buy futures below = demand.
 
-**Expected Move** = ATM straddle price ÷ Spot. This is the market's priced 1 standard deviation move by expiry.
+**Expected Move** = ATM straddle ÷ Spot. Market's priced ±1σ move to expiry.
+
+**Gamma Exposure (GEX)**
+- Positive GEX: Dealers are net short gamma → buy dips, sell rallies → **range-bound / vol suppression**
+- Negative GEX: Dealers are net long gamma → chase price → **trending / vol expansion**
+- Gamma Flip: Price level where dealer hedging direction reverses. Crossing it can trigger vol expansion.
+
+**Volatility Skew**
+- Downside put IV > upside call IV (normal for indices): protection demand elevated
+- Skew narrowing: bearish hedging decreasing, market less worried about downside
+- Upside call IV > downside put IV (rare): upside breakout speculation
 """)
 
 # ══════════════════════════════════════════════════════════════
@@ -1601,8 +1988,14 @@ with t_payoff:
         with pc_lot:
             lot_inp = st.number_input("Lot Size", min_value=1, value=LOT_SIZE, key="lot_size_inp")
 
-        # ── Compute payoff ──
-        px_range     = np.linspace(spot * 0.82, spot * 1.18, 400)
+        # Chart range = ±3σ based on expected move from straddle
+        # exp_move_pct is ±1σ; ×3 gives the 99.7% probability range
+        _exp_move_frac = oi_d.get("exp_move_pct", 0) / 100.0 if oi_d else 0
+        if _exp_move_frac <= 0:
+            # Fallback: derive from IV and T (no OI data)
+            _exp_move_frac = atm_iv * math.sqrt(2.0 / math.pi) * math.sqrt(T) if T > 0 else 0.05
+        _range_frac  = max(3 * _exp_move_frac, 0.05)  # at least ±5% for very short DTE
+        px_range     = np.linspace(spot * (1 - _range_frac), spot * (1 + _range_frac), 400)
         payoff_total = np.zeros(len(px_range))
         total_cost   = 0.0
 
