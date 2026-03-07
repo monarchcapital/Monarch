@@ -337,51 +337,81 @@ display:flex;justify-content:space-between;margin-bottom:12px;">
 
 
 # ============================================================
-# TOKEN — PERSISTENT LOGIN
+# ============================================================
+# TOKEN — reads from Home.py session OR secrets OR manual paste
 # ============================================================
 TOKEN_FILE = ".upstox_token_scanner"
 
-st.sidebar.header("🔑 Upstox Connection")
-# FIX B-07: security note about token storage
-st.sidebar.caption("⚠️ Token saved locally in plaintext. Do NOT run on shared/public machines or commit this file to version control.")
-
-if "scanner_token_loaded" not in st.session_state:
+def _resolve_token():
+    """
+    Priority order for Streamlit Cloud compatibility:
+    1. st.session_state.upstox_token  — set by Home.py auto-login (same session)
+    2. st.secrets["upstox_token"]     — set once in Streamlit Cloud → Settings → Secrets
+    3. TOKEN_FILE on disk             — works locally, not on Cloud
+    4. Manual paste in sidebar        — always available as fallback
+    """
+    # 1. Shared session state from Home.py
+    if st.session_state.get("upstox_token",""):
+        return st.session_state["upstox_token"]
+    # 2. Streamlit secrets (Streamlit Cloud)
+    try:
+        tok = st.secrets.get("upstox_token","")
+        if tok: return tok
+    except: pass
+    # 3. Local file
     if os.path.exists(TOKEN_FILE):
         try:
-            with open(TOKEN_FILE, "r") as f:
-                st.session_state.scanner_token = f.read().strip()
-        except:
-            st.session_state.scanner_token = ""
-    else:
-        st.session_state.scanner_token = ""
+            t = open(TOKEN_FILE).read().strip()
+            if t: return t
+        except: pass
+    return ""
+
+if "scanner_token_loaded" not in st.session_state:
+    st.session_state.scanner_token = _resolve_token()
     st.session_state.scanner_token_loaded = True
 
-token_input = st.sidebar.text_input(
-    "Paste Access Token (once daily)",
-    type="password",
-    value=st.session_state.scanner_token
-)
+# Sidebar — show status or paste box
+st.sidebar.markdown("""
+<div style="color:#ff8c00;font-size:.85rem;font-weight:700;letter-spacing:.1em;
+padding:6px 0 4px;border-bottom:1px solid #2a2a2a;margin-bottom:8px;">
+🔑 UPSTOX CONNECTION
+</div>""", unsafe_allow_html=True)
 
-if token_input and token_input != st.session_state.scanner_token:
-    st.session_state.scanner_token = token_input
-    try:
-        with open(TOKEN_FILE, "w") as f:
-            f.write(token_input)
-        st.sidebar.success("Token saved locally ✔")
-    except:
-        st.sidebar.error("Could not save token")
+if st.session_state.scanner_token:
+    st.sidebar.markdown(f"""
+<div style="background:#001a0a;border:1px solid #00d084;border-left:3px solid #00d084;
+padding:7px 10px;font-family:'IBM Plex Mono',monospace;margin-bottom:8px;">
+  <div style="color:#00d084;font-size:.72rem;font-weight:700;">✔ CONNECTED</div>
+  <div style="color:#555;font-size:.62rem;">Token: {st.session_state.scanner_token[:16]}…</div>
+  <div style="color:#444;font-size:.58rem;">Login via Home page to refresh</div>
+</div>""", unsafe_allow_html=True)
+    if st.sidebar.button("↺ Change Token", key="screener_change_tok"):
+        st.session_state.scanner_token = ""
+        st.session_state.scanner_token_loaded = False
+        st.rerun()
+else:
+    st.sidebar.markdown('<div style="color:#ff3b3b;font-size:.68rem;margin-bottom:6px;">⚠ Not connected — login via Home page or paste token below</div>', unsafe_allow_html=True)
+    token_input = st.sidebar.text_input("PASTE ACCESS TOKEN (ONCE DAILY)",
+        type="password", key="screener_tok_inp",
+        placeholder="eyJ0eXAiOiJKV1Q…")
+    if token_input:
+        st.session_state.scanner_token = token_input
+        st.session_state.upstox_token  = token_input   # share back to session
+        try:
+            with open(TOKEN_FILE, "w") as f: f.write(token_input)
+        except: pass
+        st.rerun()
 
 ACCESS_TOKEN = st.session_state.scanner_token
 
 if not ACCESS_TOKEN:
-    st.warning("Paste Upstox access token once to start")
+    st.warning("⚠ Connect Upstox on the **Home** page, or paste your token in the sidebar.")
     st.stop()
 
 HEADERS = {
     "Authorization": f"Bearer {ACCESS_TOKEN}",
     "Accept": "application/json"
 }
-
 # ============================================================
 # SESSION STATE INIT
 # ============================================================
@@ -2178,6 +2208,59 @@ padding:10px 9px;font-family:'IBM Plex Mono',monospace;">
             ),
         )
         st.plotly_chart(fig_br, use_container_width=True)
+
+        # ── SEND TO ML PREDICTOR ──
+        st.divider()
+        st.markdown("""
+<div style="background:#0a1520;border-top:2px solid #1e90ff;border-bottom:1px solid #1a2a3a;
+     padding:8px 14px;font-family:'IBM Plex Mono',monospace;margin-bottom:10px;">
+  <span style="color:#1e90ff;font-size:.77rem;font-weight:700;letter-spacing:.12em;">
+    🧠 ML PRICE PREDICTOR
+  </span>
+  <span style="color:#555;font-size:.62rem;margin-left:16px;">
+    Select stocks from scan results → run ML to predict closing price
+  </span>
+</div>""", unsafe_allow_html=True)
+
+        ml_col1, ml_col2 = st.columns([3, 1])
+        with ml_col1:
+            all_tickers = df_out["Ticker"].tolist()
+            default_ml  = all_tickers[:min(5, len(all_tickers))]
+            ml_selected = st.multiselect(
+                "Select stocks for ML prediction",
+                options=all_tickers,
+                default=default_ml,
+                key="ml_ticker_select",
+                format_func=lambda t: f"{t}  (Score: {df_out.loc[df_out['Ticker']==t,'Score'].values[0]:.0f}  {df_out.loc[df_out['Ticker']==t,'Horizon'].values[0]})" if t in df_out['Ticker'].values else t
+            )
+        with ml_col2:
+            st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+            if st.button("🧠  OPEN ML PREDICTOR", key="goto_ml_btn",
+                         use_container_width=True, type="primary"):
+                if ml_selected:
+                    # Package everything the ML page needs
+                    st.session_state["ml_tickers"]       = ml_selected
+                    st.session_state["ml_scan_params"]   = {
+                        "interval":   "1d",
+                        "days":       365,
+                    }
+                    # Pass raw OHLCV data for selected tickers
+                    st.session_state["ml_raw_data"]      = {
+                        sym: st.session_state.raw_data_cache[sym].copy()
+                        for sym in ml_selected
+                        if sym in st.session_state.raw_data_cache
+                    }
+                    # Pass score context for display
+                    st.session_state["ml_score_context"] = df_out[
+                        df_out["Ticker"].isin(ml_selected)
+                    ][["Ticker","Score","SetupType","Horizon","Entry","Target","Stop","RR"]].to_dict("records")
+                    try:
+                        st.switch_page("pages/4_ML_Predictor.py")
+                    except Exception:
+                        st.info("Navigate to **ML Predictor** page in the sidebar.")
+                else:
+                    st.warning("Select at least one stock first.")
+
 
         # ── SECTOR HEATMAP ──
         if sector_returns:
