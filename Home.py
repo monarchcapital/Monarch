@@ -197,28 +197,6 @@ hr, [data-testid="stDivider"] hr { border-color: var(--bb-border) !important; }
 ::-webkit-scrollbar-thumb { background: var(--bb-border); }
 ::-webkit-scrollbar-thumb:hover { background: var(--bb-amber); }
 
-/* ── PRICE DELTA COLORS ── */
-[data-testid="stMetricDeltaIcon-Up"]  { color: #00d084 !important; }
-[data-testid="stMetricDeltaIcon-Down"] { color: #ff3b3b !important; }
-[data-testid="stMetricDelta"]:has([data-testid="stMetricDeltaIcon-Up"]) span  { color: #00d084 !important; }
-[data-testid="stMetricDelta"]:has([data-testid="stMetricDeltaIcon-Down"]) span { color: #ff3b3b !important; }
-/* ── FONT SIZE INCREASES ── */
-[data-testid="stMetricValue"]   { font-size: 1.35rem !important; font-weight: 700 !important; }
-[data-testid="stMetricLabel"] p { font-size: 0.78rem !important; }
-[data-testid="stMetricDelta"]   { font-size: 0.82rem !important; }
-.stDataFrame thead tr th        { font-size: 0.80rem !important; }
-.stDataFrame tbody tr td        { font-size: 0.90rem !important; }
-.stButton > button              { font-size: 0.90rem !important; }
-/* ── NAV ICON TEXT (keyboard_double_arrow) — scoped only to nav links ── */
-[data-testid="stSidebarNavLink"] [data-testid="stIconMaterial"] {
-    font-size: 0 !important;
-    line-height: 0 !important;
-    color: transparent !important;
-    overflow: hidden !important;
-    max-width: 20px !important;
-}
-
-
 /* ── Blinking animation ── */
 @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
 @keyframes pulse { 0%{box-shadow:0 0 0 0 rgba(255,140,0,.4)} 70%{box-shadow:0 0 0 6px rgba(255,140,0,0)} 100%{box-shadow:0 0 0 0 rgba(255,140,0,0)} }
@@ -263,6 +241,55 @@ hr, [data-testid="stDivider"] hr { border-color: var(--bb-border) !important; }
 .scanline-wrap { position:relative; overflow:hidden; }
 .scanline-wrap::after { content:''; position:absolute; left:0; right:0; height:2px;
     background:rgba(255,140,0,0.04); animation:scanline 4s linear infinite; pointer-events:none; }
+
+/* ══ FORCE SIDEBAR ALWAYS VISIBLE ══ */
+[data-testid="stSidebar"] {
+    display: block !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+    width: 21rem !important;
+    min-width: 200px !important;
+    transform: none !important;
+    position: relative !important;
+}
+[data-testid="stSidebar"] > div:first-child {
+    display: block !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+}
+/* Force the sidebar collapse/expand button visible */
+[data-testid="stSidebarCollapseButton"] {
+    display: flex !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+}
+button[kind="header"] {
+    display: flex !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+}
+
+/* ── PRICE DELTA COLORS ── */
+[data-testid="stMetricDeltaIcon-Up"]  { color: #00d084 !important; }
+[data-testid="stMetricDeltaIcon-Down"] { color: #ff3b3b !important; }
+[data-testid="stMetricDelta"]:has([data-testid="stMetricDeltaIcon-Up"]) span  { color: #00d084 !important; }
+[data-testid="stMetricDelta"]:has([data-testid="stMetricDeltaIcon-Down"]) span { color: #ff3b3b !important; }
+/* ── FONT SIZE INCREASES ── */
+[data-testid="stMetricValue"]   { font-size: 1.35rem !important; font-weight: 700 !important; }
+[data-testid="stMetricLabel"] p { font-size: 0.78rem !important; }
+[data-testid="stMetricDelta"]   { font-size: 0.82rem !important; }
+.stDataFrame thead tr th        { font-size: 0.80rem !important; }
+.stDataFrame tbody tr td        { font-size: 0.90rem !important; }
+.stButton > button              { font-size: 0.90rem !important; }
+/* ── NAV ICON TEXT fix ── */
+[data-testid="stSidebarNavLink"] [data-testid="stIconMaterial"] {
+    font-size: 0 !important;
+    line-height: 0 !important;
+    color: transparent !important;
+    overflow: hidden !important;
+    max-width: 20px !important;
+}
+
 </style>
 """, unsafe_allow_html=True)
 
