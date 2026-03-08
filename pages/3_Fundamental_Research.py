@@ -229,55 +229,6 @@ hr { border-color: #1e1e1e !important; margin: 10px 0 !important; }
 ::-webkit-scrollbar-track { background: var(--bb-bg); }
 ::-webkit-scrollbar-thumb { background: #333; border-radius: 0; }
 ::-webkit-scrollbar-thumb:hover { background: var(--bb-amber); }
-
-/* ── HIDE keyboard_double_arrow_right ICON TEXT ──────────────────
-   stIconMaterial spans render icon names as text via Material Icons font.
-   Setting font-size:0 makes the text invisible without hiding buttons/SVGs.
-   This covers the sidebar collapse button AND page nav links. ── */
-[data-testid="stIconMaterial"] {
-    font-size: 0 !important;
-    line-height: 0 !important;
-    color: transparent !important;
-    overflow: hidden !important;
-    display: inline-block !important;
-    width: 0 !important;
-}
-
-/* ── FORCE SIDEBAR ALWAYS VISIBLE ────────────────────────────── */
-[data-testid="stSidebar"] {
-    display: block !important;
-    visibility: visible !important;
-    opacity: 1 !important;
-    transform: none !important;
-    min-width: 200px !important;
-}
-[data-testid="stSidebarCollapseButton"] {
-    display: flex !important;
-    visibility: visible !important;
-    opacity: 1 !important;
-}
-[data-testid="stSidebarCollapseButton"] svg {
-    display: block !important;
-    visibility: visible !important;
-    opacity: 1 !important;
-    width: 1rem !important;
-    height: 1rem !important;
-}
-
-/* ── PRICE DELTA COLORS ── */
-[data-testid="stMetricDeltaIcon-Up"]  { color: #00d084 !important; }
-[data-testid="stMetricDeltaIcon-Down"] { color: #ff3b3b !important; }
-[data-testid="stMetricDelta"]:has([data-testid="stMetricDeltaIcon-Up"]) span  { color: #00d084 !important; }
-[data-testid="stMetricDelta"]:has([data-testid="stMetricDeltaIcon-Down"]) span { color: #ff3b3b !important; }
-
-/* ── FONT SIZE INCREASES ── */
-[data-testid="stMetricValue"]   { font-size: 1.35rem !important; font-weight: 700 !important; }
-[data-testid="stMetricLabel"] p { font-size: 0.78rem !important; }
-[data-testid="stMetricDelta"]   { font-size: 0.82rem !important; }
-.stDataFrame thead tr th        { font-size: 0.80rem !important; }
-.stDataFrame tbody tr td        { font-size: 0.90rem !important; }
-.stButton > button              { font-size: 0.90rem !important; }
-
 </style>""", unsafe_allow_html=True)
 
 # ── Terminal Header ──
@@ -480,19 +431,104 @@ def quarterly_series(df, *keys):
 
 
 # ============================================================
-# PEER SECTOR MAPS — NSE symbols by sector
+# PEER SECTOR MAPS — NSE symbols by sector (comprehensive: 350+ stocks)
 # ============================================================
 SECTOR_PEERS = {
-    "IT":       ["TCS","INFY","WIPRO","HCLTECH","TECHM","LTIM","MPHASIS","COFORGE","PERSISTENT"],
-    "Bank":     ["HDFCBANK","ICICIBANK","KOTAKBANK","AXISBANK","INDUSINDBK","FEDERALBNK","IDFCFIRSTB"],
-    "Pharma":   ["SUNPHARMA","DRREDDY","CIPLA","DIVISLAB","TORNTPHARM","AUROPHARMA","APOLLOHOSP"],
-    "Auto":     ["MARUTI","TATAMOTORS","M&M","BAJAJ-AUTO","HEROMOTOCO","EICHERMOT","TVSMOTORS"],
-    "FMCG":     ["HINDUNILVR","ITC","NESTLEIND","BRITANNIA","DABUR","MARICO","GODREJCP"],
-    "Metal":    ["TATASTEEL","JSWSTEEL","HINDALCO","SAIL","VEDL","COALINDIA","NMDC"],
-    "Energy":   ["RELIANCE","ONGC","NTPC","POWERGRID","BPCL","IOC","GAIL"],
-    "Infra":    ["LT","ADANIPORTS","ULTRACEMCO","SHREECEM","IRFC","RVNL"],
-    "Realty":   ["DLF","LODHA","OBEROIRLTY","PHOENIXLTD"],
-    "PSUBank":  ["SBIN","BANKBARODA","PNB","CANBK"],
+    "IT": [
+        "TCS","INFY","WIPRO","HCLTECH","TECHM","LTIM","MPHASIS","COFORGE","PERSISTENT",
+        "OFSS","LTTS","KPITTECH","MASTEK","TATAELXSI","NIIT","CYIENT","INTELLECT",
+        "SONATSOFTW","BSOFT","ZENSAR","ECLERX","RATEGAIN","FSL",
+    ],
+    "Bank": [
+        "HDFCBANK","ICICIBANK","KOTAKBANK","AXISBANK","INDUSINDBK","FEDERALBNK","IDFCFIRSTB",
+        "YESBANK","RBLBANK","BANDHANBNK","AUBANK","DCBBANK","KARURVYSYA","CSBBANK",
+        "UJJIVANSFB","EQUITASBNK","SURYODAY","SOUTHBANK",
+    ],
+    "PSU Bank": [
+        "SBIN","BANKBARODA","PNB","CANBK","UNIONBANK","INDIANB","IOB","UCOBANK",
+        "MAHABANK","CENTRALBK","J&KBANK",
+    ],
+    "NBFC / Finance": [
+        "BAJFINANCE","BAJAJFINSV","CHOLAFIN","MUTHOOTFIN","MANAPPURAM","M&MFIN",
+        "LICHSGFIN","POONAWALLA","CREDITACC","SHRIRAMFIN","SUNDARMFIN","ABCAPITAL",
+        "IIFL","IIFLWAM","UGROCAP","APTUS","HOMEFIRST","CANFINHOME","REPCO",
+    ],
+    "Pharma & Healthcare": [
+        "SUNPHARMA","DRREDDY","CIPLA","DIVISLAB","TORNTPHARM","AUROPHARMA","APOLLOHOSP",
+        "LUPIN","ALKEM","IPCA","BIOCON","GLENMARK","PFIZER","ABBOTINDIA","SANOFI",
+        "GLAXO","NATCOPHARM","GRANULES","LAURUSLABS","JUBLPHARMA","AJANTPHARM",
+        "ERIS","METROPOLIS","THYROCARE","KIMS","ASTER","FORTIS",
+    ],
+    "Auto & EV": [
+        "MARUTI","TATAMOTORS","M&M","BAJAJ-AUTO","HEROMOTOCO","EICHERMOT","TVSMOTORS",
+        "ASHOKLEY","MOTHERSON","BOSCHLTD","MINDA","BHARATFORG","ENDURANCE",
+        "SONACOMS","TIINDIA","CRAFTSMAN","SUPRAJIT","EXIDEIND","AMARAJABAT","OLECTRA",
+    ],
+    "FMCG": [
+        "HINDUNILVR","ITC","NESTLEIND","BRITANNIA","DABUR","MARICO","GODREJCP",
+        "EMAMILTD","COLPAL","JYOTHYLAB","TATACONSUM","VBL","RADICO","UNITDSPR",
+        "UBL","MCDOWELL-N","PGHH","GILLETTE","ZYDUSWELL","HATSUN",
+    ],
+    "Metal & Mining": [
+        "TATASTEEL","JSWSTEEL","HINDALCO","SAIL","VEDL","COALINDIA","NMDC",
+        "NATIONALUM","WELCORP","JINDALSAW","HINDCOPPER","MOIL","RATNAMANI",
+        "APARINDS","APLAPOLLO","SHYAMMETL",
+    ],
+    "Energy & Oil": [
+        "RELIANCE","ONGC","NTPC","POWERGRID","BPCL","IOC","GAIL","HPCL",
+        "PETRONET","OIL","MRPL","GSPL","GUJGASLTD","MGL","IGL",
+        "ADANIGREEN","ADANIPOWER","TATAPOWER","TORNTPOWER","CESC",
+    ],
+    "Infra & Construction": [
+        "LT","ADANIPORTS","ULTRACEMCO","SHREECEM","IRFC","RVNL","NCC","KEC",
+        "PNCINFRA","JKCEMENT","AMBUJACEMENT","ACC","DALMIACEME","RAMCOCEM",
+        "IRBINFRA","KNRCON","AHLUCONT","GPPL","CONCOR","RITES",
+    ],
+    "Realty": [
+        "DLF","LODHA","OBEROIRLTY","PHOENIXLTD","PRESTIGE","GODREJPROP","BRIGADE",
+        "SOBHA","KOLTEPATIL","MAHLIFE","SUNTECK","SIGNATURE",
+    ],
+    "Capital Goods": [
+        "SIEMENS","ABB","HAVELLS","VOLTAS","BLUESTARCO","POLYCAB","KEI","FINOLEX",
+        "THERMAX","CUMMINSIND","GRINDWELL","BHEL","BEL","HAL","BEML","MIDHANI",
+        "ELGIEQUIP","KIRLOSKAR","SKFINDIA","TIMKEN","SCHAEFFLER",
+    ],
+    "Consumer Durables": [
+        "TITAN","WHIRLPOOL","VGUARD","CROMPTON","ORIENTELEC","BAJAJCON","SYMPHONY",
+        "KAJARIACER","CERA","ASTRAL","PRINCEPIPE","HINDWARE",
+    ],
+    "Retail & E-commerce": [
+        "DMART","TRENT","ABFRL","BATA","RELAXO","METROBRANDS","SHOPERSTOP",
+        "VMART","NYKAA","CARTRADE","EASEMYTRIP",
+    ],
+    "Telecom & Media": [
+        "BHARTIARTL","VODAFONE","INDUSTOWER","TATACOMM","HFCL","STLTECH",
+        "ZEEL","SUNTV","PVRINOX","NAZARA",
+    ],
+    "Insurance": [
+        "SBILIFE","HDFCLIFE","ICICIPRULI","LICI","GICRE","NIACL","STARHEALTH",
+        "POLICYBZR",
+    ],
+    "Chemicals & Specialty": [
+        "PIDILITIND","ASIANPAINT","BERGERPAINTS","KANSAINER","NAVINFLUOR",
+        "DEEPAKNITR","ATUL","FINEORG","GALAXYSURF","AARTI","VINATIORG","GUJALKALI",
+        "TATACHEM","GHCL","AKZOINDIA","GNFC","PCBL","NOCIL",
+    ],
+    "Agri & Fertilizer": [
+        "UPL","PIIND","DHANUKA","RALLIS","BAYER","SUMICHEM","COROMANDEL",
+        "CHAMBLFERT","GNFC","NFL","GSFC","RCF",
+    ],
+    "Logistics & Transport": [
+        "DELHIVERY","BLUEDART","MAHINDLOG","VRL","GESHIP","SCI","ALLCARGO",
+        "AEGISLOG","SNOWMAN",
+    ],
+    "Hotel & Travel": [
+        "INDHOTEL","EIHOTEL","LEMONTRE","CHALET","MAHINDHOLIDAY",
+        "IRCTC","THOMASCOOK",
+    ],
+    "Defence": [
+        "HAL","BEL","BEML","MIDHANI","COCHINSHIP","GRSE","MAZAGON","BHEL",
+    ],
 }
 
 STOCK_SECTOR = {}
