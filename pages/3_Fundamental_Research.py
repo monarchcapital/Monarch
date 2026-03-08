@@ -239,7 +239,6 @@ hr { border-color: #1e1e1e !important; margin: 10px 0 !important; }
     display: inline-block !important;
     width: 0 !important;
 }
-/* ── FORCE SIDEBAR VISIBLE ── */
 [data-testid="stSidebar"] {
     display: block !important;
     visibility: visible !important;
@@ -247,24 +246,12 @@ hr { border-color: #1e1e1e !important; margin: 10px 0 !important; }
     transform: none !important;
     min-width: 200px !important;
 }
-[data-testid="stSidebarCollapseButton"] {
-    display: flex !important;
-    visibility: visible !important;
-    opacity: 1 !important;
-}
-[data-testid="stSidebarCollapseButton"] svg {
-    display: block !important;
-    visibility: visible !important;
-    opacity: 1 !important;
-    width: 1rem !important;
-    height: 1rem !important;
-}
-/* ── PRICE DELTA COLORS ── */
+[data-testid="stSidebarCollapseButton"] { display: flex !important; visibility: visible !important; opacity: 1 !important; }
+[data-testid="stSidebarCollapseButton"] svg { display: block !important; visibility: visible !important; opacity: 1 !important; width: 1rem !important; height: 1rem !important; }
 [data-testid="stMetricDeltaIcon-Up"]  { color: #00d084 !important; }
 [data-testid="stMetricDeltaIcon-Down"] { color: #ff3b3b !important; }
 [data-testid="stMetricDelta"]:has([data-testid="stMetricDeltaIcon-Up"]) span  { color: #00d084 !important; }
 [data-testid="stMetricDelta"]:has([data-testid="stMetricDeltaIcon-Down"]) span { color: #ff3b3b !important; }
-/* ── FONT SIZE INCREASES ── */
 [data-testid="stMetricValue"]   { font-size: 1.35rem !important; font-weight: 700 !important; }
 [data-testid="stMetricLabel"] p { font-size: 0.78rem !important; }
 [data-testid="stMetricDelta"]   { font-size: 0.82rem !important; }
@@ -474,7 +461,7 @@ def quarterly_series(df, *keys):
 
 
 # ============================================================
-# PEER SECTOR MAPS — NSE symbols by sector (comprehensive: 350+ stocks)
+# PEER SECTOR MAPS — NSE symbols by sector (comprehensive: 320+ stocks)
 # ============================================================
 SECTOR_PEERS = {
     "IT": [
@@ -489,7 +476,7 @@ SECTOR_PEERS = {
     ],
     "PSU Bank": [
         "SBIN","BANKBARODA","PNB","CANBK","UNIONBANK","INDIANB","IOB","UCOBANK",
-        "MAHABANK","CENTRALBK","J&KBANK",
+        "MAHABANK","CENTRALBK",
     ],
     "NBFC / Finance": [
         "BAJFINANCE","BAJAJFINSV","CHOLAFIN","MUTHOOTFIN","MANAPPURAM","M&MFIN",
@@ -549,8 +536,7 @@ SECTOR_PEERS = {
         "ZEEL","SUNTV","PVRINOX","NAZARA",
     ],
     "Insurance": [
-        "SBILIFE","HDFCLIFE","ICICIPRULI","LICI","GICRE","NIACL","STARHEALTH",
-        "POLICYBZR",
+        "SBILIFE","HDFCLIFE","ICICIPRULI","LICI","GICRE","NIACL","STARHEALTH","POLICYBZR",
     ],
     "Chemicals & Specialty": [
         "PIDILITIND","ASIANPAINT","BERGERPAINTS","KANSAINER","NAVINFLUOR",
@@ -562,12 +548,10 @@ SECTOR_PEERS = {
         "CHAMBLFERT","GNFC","NFL","GSFC","RCF",
     ],
     "Logistics & Transport": [
-        "DELHIVERY","BLUEDART","MAHINDLOG","VRL","GESHIP","SCI","ALLCARGO",
-        "AEGISLOG","SNOWMAN",
+        "DELHIVERY","BLUEDART","MAHINDLOG","VRL","GESHIP","SCI","ALLCARGO","AEGISLOG",
     ],
     "Hotel & Travel": [
-        "INDHOTEL","EIHOTEL","LEMONTRE","CHALET","MAHINDHOLIDAY",
-        "IRCTC","THOMASCOOK",
+        "INDHOTEL","EIHOTEL","LEMONTRE","CHALET","MAHINDHOLIDAY","IRCTC","THOMASCOOK",
     ],
     "Defence": [
         "HAL","BEL","BEML","MIDHANI","COCHINSHIP","GRSE","MAZAGON","BHEL",
@@ -706,7 +690,7 @@ st.markdown(f"""
     </div>
     <div style="display:flex;gap:24px;align-items:center;flex-wrap:wrap;">
       <span style="color:#e8e8e8;font-size:.8rem;font-weight:600;">
-        ₹{curr_price:.2f}</span>
+        {f"₹{curr_price:.2f}" if curr_price is not None else "N/A"}</span>
       <span style="color:#555;font-size:.65rem;">{sector_str}  ·  {industry}</span>
       <span style="color:#888;font-size:.65rem;">MCap: {fmt_cr(mktcap)}</span>
       <span style="color:{'#ff3b3b' if pct_from_hi and pct_from_hi < -20 else '#888'};font-size:.65rem;">
@@ -859,9 +843,9 @@ with tab_snap:
         st.markdown(f"""
 <div style="font-family:'IBM Plex Mono',monospace;margin:10px 0;">
   <div style="display:flex;justify-content:space-between;color:#555;font-size:.60rem;margin-bottom:3px;">
-    <span>52W LOW  ₹{_52w_lo:.2f}</span>
-    <span style="color:{bar_color};">CMP ₹{curr_price:.2f}  ({rng_pct*100:.0f}th pct)</span>
-    <span>52W HIGH  ₹{_52w_hi:.2f}</span>
+    <span>52W LOW  {f"₹{_52w_lo:.2f}" if _52w_lo is not None else "N/A"}</span>
+    <span style="color:{bar_color};">CMP {f"₹{curr_price:.2f}" if curr_price is not None else "N/A"}  ({rng_pct*100:.0f}th pct)</span>
+    <span>52W HIGH  {f"₹{_52w_hi:.2f}" if _52w_hi is not None else "N/A"}</span>
   </div>
   <div style="background:#1a1a1a;height:6px;border-radius:0;position:relative;">
     <div style="background:{bar_color};width:{rng_pct*100:.1f}%;height:100%;"></div>
