@@ -197,64 +197,46 @@ hr, [data-testid="stDivider"] hr { border-color: var(--bb-border) !important; }
 ::-webkit-scrollbar-thumb { background: var(--bb-border); }
 ::-webkit-scrollbar-thumb:hover { background: var(--bb-amber); }
 
-/* ══════════════════════════════════════════════════════════
-   ICON TEXT FIX — hide "keyboard_double_arrow_right" text
-   Only target the Material Icons text-rendering span.
-   DO NOT touch SVGs or sidebar collapse button.
-   ══════════════════════════════════════════════════════════ */
-
-/* Material Icons span that renders icon name as text */
-[data-testid="stIconMaterial"] {
-    font-size: 0 !important;
-    width: 0 !important;
-    height: 0 !important;
-    overflow: hidden !important;
-    display: inline-block !important;
-    color: transparent !important;
-}
-
-/* Expander toggle icon only — scoped tightly to summary */
-[data-testid="stExpander"] summary [data-testid="stExpanderToggleIcon"] {
-    font-size: 0 !important;
-    width: 0 !important;
-    height: 0 !important;
-    overflow: hidden !important;
-    color: transparent !important;
-    display: inline-block !important;
-}
-[data-testid="stExpander"] summary [data-testid="stExpanderToggleIcon"] * {
-    font-size: 0 !important;
-    color: transparent !important;
-}
-[data-testid="stExpander"] summary::-webkit-details-marker,
-[data-testid="stExpander"] summary::marker {
-    display: none !important;
-    content: "" !important;
-}
-
-/* ══════════════════════════════════════════════════════════
-   PRICE COLOR FIX — green/red for positive/negative changes
-   ══════════════════════════════════════════════════════════ */
-[data-testid="stMetricDeltaIcon-Up"] { color: #00d084 !important; }
+/* ── PRICE DELTA COLORS ── */
+[data-testid="stMetricDeltaIcon-Up"]  { color: #00d084 !important; }
 [data-testid="stMetricDeltaIcon-Down"] { color: #ff3b3b !important; }
-[data-testid="stMetricDelta"]:has([data-testid="stMetricDeltaIcon-Up"]),
-[data-testid="stMetricDelta"]:has([data-testid="stMetricDeltaIcon-Up"]) span {
-    color: #00d084 !important;
-}
-[data-testid="stMetricDelta"]:has([data-testid="stMetricDeltaIcon-Down"]),
-[data-testid="stMetricDelta"]:has([data-testid="stMetricDeltaIcon-Down"]) span {
-    color: #ff3b3b !important;
-}
+[data-testid="stMetricDelta"]:has([data-testid="stMetricDeltaIcon-Up"]) span  { color: #00d084 !important; }
+[data-testid="stMetricDelta"]:has([data-testid="stMetricDeltaIcon-Down"]) span { color: #ff3b3b !important; }
 
-/* ══════════════════════════════════════════════════════════
-   FONT SIZE INCREASES
-   ══════════════════════════════════════════════════════════ */
-[data-testid="stMetricValue"]  { font-size: 1.35rem !important; font-weight: 700 !important; }
+/* ── FONT SIZE INCREASES ── */
+[data-testid="stMetricValue"]   { font-size: 1.35rem !important; font-weight: 700 !important; }
 [data-testid="stMetricLabel"] p { font-size: 0.78rem !important; }
 [data-testid="stMetricDelta"]   { font-size: 0.82rem !important; }
 .stDataFrame thead tr th        { font-size: 0.80rem !important; }
 .stDataFrame tbody tr td        { font-size: 0.90rem !important; }
 .stButton > button              { font-size: 0.90rem !important; }
+
+/* ── SIDEBAR NAV ICON TEXT FIX ──
+   Only hides the text-render of the icon NAME inside page nav links.
+   Scoped to stSidebarNavLink to never touch the collapse toggle button. */
+[data-testid="stSidebarNavLink"] [data-testid="stIconMaterial"] {
+    font-size: 0 !important;
+    line-height: 0 !important;
+    color: transparent !important;
+    overflow: hidden !important;
+    max-width: 20px !important;
+}
+
+/* ── SIDEBAR COLLAPSE BUTTON — always visible ── */
+[data-testid="stSidebarCollapseButton"],
+[data-testid="stSidebarCollapseButton"] * {
+    opacity: 1 !important;
+    visibility: visible !important;
+    display: flex !important;
+    pointer-events: auto !important;
+}
+[data-testid="collapsedControl"],
+[data-testid="collapsedControl"] * {
+    opacity: 1 !important;
+    visibility: visible !important;
+    display: flex !important;
+    pointer-events: auto !important;
+}
 
 
 /* ── Blinking animation ── */
