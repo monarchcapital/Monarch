@@ -76,7 +76,7 @@ p, span, div, label, li, caption,
 [data-testid="stMarkdownContainer"] p,
 [data-testid="stMarkdownContainer"] span,
 [data-testid="stMarkdownContainer"] li {
-    color: var(--bb-white2) !important;
+    color: var(--bb-white2);
     font-family: var(--bb-mono) !important;
 }
 [data-testid="stSidebar"], [data-testid="stSidebar"] > div {
@@ -229,6 +229,49 @@ hr { border-color: #1e1e1e !important; margin: 10px 0 !important; }
 ::-webkit-scrollbar-track { background: var(--bb-bg); }
 ::-webkit-scrollbar-thumb { background: #333; border-radius: 0; }
 ::-webkit-scrollbar-thumb:hover { background: var(--bb-amber); }
+
+/* ── HIDE keyboard_double_arrow_right ICON TEXT ── */
+[data-testid="stIconMaterial"] {
+    font-size: 0 !important;
+    line-height: 0 !important;
+    color: transparent !important;
+    overflow: hidden !important;
+    display: inline-block !important;
+    width: 0 !important;
+}
+/* ── FORCE SIDEBAR VISIBLE ── */
+[data-testid="stSidebar"] {
+    display: block !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+    transform: none !important;
+    min-width: 200px !important;
+}
+[data-testid="stSidebarCollapseButton"] {
+    display: flex !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+}
+[data-testid="stSidebarCollapseButton"] svg {
+    display: block !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+    width: 1rem !important;
+    height: 1rem !important;
+}
+/* ── PRICE DELTA COLORS ── */
+[data-testid="stMetricDeltaIcon-Up"]  { color: #00d084 !important; }
+[data-testid="stMetricDeltaIcon-Down"] { color: #ff3b3b !important; }
+[data-testid="stMetricDelta"]:has([data-testid="stMetricDeltaIcon-Up"]) span  { color: #00d084 !important; }
+[data-testid="stMetricDelta"]:has([data-testid="stMetricDeltaIcon-Down"]) span { color: #ff3b3b !important; }
+/* ── FONT SIZE INCREASES ── */
+[data-testid="stMetricValue"]   { font-size: 1.35rem !important; font-weight: 700 !important; }
+[data-testid="stMetricLabel"] p { font-size: 0.78rem !important; }
+[data-testid="stMetricDelta"]   { font-size: 0.82rem !important; }
+.stDataFrame thead tr th        { font-size: 0.80rem !important; }
+.stDataFrame tbody tr td        { font-size: 0.90rem !important; }
+.stButton > button              { font-size: 0.90rem !important; }
+
 </style>""", unsafe_allow_html=True)
 
 # ── Terminal Header ──
