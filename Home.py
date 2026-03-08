@@ -21,7 +21,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 import yfinance as yf
 
-st.set_page_config(layout="wide", page_title="MONARCH — Global Risk Dashboard", page_icon="◼")
+st.set_page_config(layout="wide", page_title="MONARCH — Global Risk Dashboard", page_icon="◼", initial_sidebar_state="expanded")
 
 # ============================================================
 # SHARED CSS — Bloomberg dark terminal (matches screener/options)
@@ -202,7 +202,6 @@ hr, [data-testid="stDivider"] hr { border-color: var(--bb-border) !important; }
 [data-testid="stMetricDeltaIcon-Down"] { color: #ff3b3b !important; }
 [data-testid="stMetricDelta"]:has([data-testid="stMetricDeltaIcon-Up"]) span  { color: #00d084 !important; }
 [data-testid="stMetricDelta"]:has([data-testid="stMetricDeltaIcon-Down"]) span { color: #ff3b3b !important; }
-
 /* ── FONT SIZE INCREASES ── */
 [data-testid="stMetricValue"]   { font-size: 1.35rem !important; font-weight: 700 !important; }
 [data-testid="stMetricLabel"] p { font-size: 0.78rem !important; }
@@ -210,32 +209,13 @@ hr, [data-testid="stDivider"] hr { border-color: var(--bb-border) !important; }
 .stDataFrame thead tr th        { font-size: 0.80rem !important; }
 .stDataFrame tbody tr td        { font-size: 0.90rem !important; }
 .stButton > button              { font-size: 0.90rem !important; }
-
-/* ── SIDEBAR NAV ICON TEXT FIX ──
-   Only hides the text-render of the icon NAME inside page nav links.
-   Scoped to stSidebarNavLink to never touch the collapse toggle button. */
+/* ── NAV ICON TEXT (keyboard_double_arrow) — scoped only to nav links ── */
 [data-testid="stSidebarNavLink"] [data-testid="stIconMaterial"] {
     font-size: 0 !important;
     line-height: 0 !important;
     color: transparent !important;
     overflow: hidden !important;
     max-width: 20px !important;
-}
-
-/* ── SIDEBAR COLLAPSE BUTTON — always visible ── */
-[data-testid="stSidebarCollapseButton"],
-[data-testid="stSidebarCollapseButton"] * {
-    opacity: 1 !important;
-    visibility: visible !important;
-    display: flex !important;
-    pointer-events: auto !important;
-}
-[data-testid="collapsedControl"],
-[data-testid="collapsedControl"] * {
-    opacity: 1 !important;
-    visibility: visible !important;
-    display: flex !important;
-    pointer-events: auto !important;
 }
 
 
