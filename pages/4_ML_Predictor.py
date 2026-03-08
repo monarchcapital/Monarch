@@ -73,31 +73,38 @@ div[data-testid="metric-container"] div[data-testid="stMetricDelta"]{color:#00d0
 ::-webkit-scrollbar{width:6px;height:6px;}::-webkit-scrollbar-track{background:#0a0a0a;}
 ::-webkit-scrollbar-thumb{background:#333;border-radius:3px;}::-webkit-scrollbar-thumb:hover{background:#ff8c00;}
 
-/* ══ FORCE SIDEBAR ALWAYS VISIBLE ══ */
+/* ── HIDE keyboard_double_arrow_right ICON TEXT ──────────────────
+   stIconMaterial spans render icon names as text via Material Icons font.
+   Setting font-size:0 makes the text invisible without hiding buttons/SVGs.
+   This covers the sidebar collapse button AND page nav links. ── */
+[data-testid="stIconMaterial"] {
+    font-size: 0 !important;
+    line-height: 0 !important;
+    color: transparent !important;
+    overflow: hidden !important;
+    display: inline-block !important;
+    width: 0 !important;
+}
+
+/* ── FORCE SIDEBAR ALWAYS VISIBLE ────────────────────────────── */
 [data-testid="stSidebar"] {
     display: block !important;
     visibility: visible !important;
     opacity: 1 !important;
-    width: 21rem !important;
-    min-width: 200px !important;
     transform: none !important;
-    position: relative !important;
+    min-width: 200px !important;
 }
-[data-testid="stSidebar"] > div:first-child {
-    display: block !important;
-    visibility: visible !important;
-    opacity: 1 !important;
-}
-/* Force the sidebar collapse/expand button visible */
 [data-testid="stSidebarCollapseButton"] {
     display: flex !important;
     visibility: visible !important;
     opacity: 1 !important;
 }
-button[kind="header"] {
-    display: flex !important;
+[data-testid="stSidebarCollapseButton"] svg {
+    display: block !important;
     visibility: visible !important;
     opacity: 1 !important;
+    width: 1rem !important;
+    height: 1rem !important;
 }
 
 /* ── PRICE DELTA COLORS ── */
@@ -105,6 +112,7 @@ button[kind="header"] {
 [data-testid="stMetricDeltaIcon-Down"] { color: #ff3b3b !important; }
 [data-testid="stMetricDelta"]:has([data-testid="stMetricDeltaIcon-Up"]) span  { color: #00d084 !important; }
 [data-testid="stMetricDelta"]:has([data-testid="stMetricDeltaIcon-Down"]) span { color: #ff3b3b !important; }
+
 /* ── FONT SIZE INCREASES ── */
 [data-testid="stMetricValue"]   { font-size: 1.35rem !important; font-weight: 700 !important; }
 [data-testid="stMetricLabel"] p { font-size: 0.78rem !important; }
@@ -112,14 +120,6 @@ button[kind="header"] {
 .stDataFrame thead tr th        { font-size: 0.80rem !important; }
 .stDataFrame tbody tr td        { font-size: 0.90rem !important; }
 .stButton > button              { font-size: 0.90rem !important; }
-/* ── NAV ICON TEXT fix ── */
-[data-testid="stSidebarNavLink"] [data-testid="stIconMaterial"] {
-    font-size: 0 !important;
-    line-height: 0 !important;
-    color: transparent !important;
-    overflow: hidden !important;
-    max-width: 20px !important;
-}
 
 </style>
 """, unsafe_allow_html=True)
