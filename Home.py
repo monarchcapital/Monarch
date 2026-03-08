@@ -64,8 +64,6 @@ p, span, div, label, li, td, th, caption,
     color: var(--bb-white);
     font-family: var(--bb-mono) !important;
 }
-/* Re-assert white for Streamlit's own wrappers (no inline style conflict here) */
-[data-testid="stMarkdownContainer"] > div { color: var(--bb-white) !important; }
 
 [data-testid="stSidebar"], [data-testid="stSidebar"] > div {
     background-color: #060606 !important;
@@ -134,7 +132,7 @@ input[type="text"], input[type="password"], input[type="number"] {
     background: var(--bb-surface) !important;
     color: var(--bb-amber) !important;
     font-family: var(--bb-mono) !important;
-    font-size: 0.92rem !important;
+    font-size: 0.80rem !important;
     font-weight: 600 !important;
     letter-spacing: 0.1em !important;
     text-transform: uppercase !important;
@@ -199,90 +197,64 @@ hr, [data-testid="stDivider"] hr { border-color: var(--bb-border) !important; }
 ::-webkit-scrollbar-thumb { background: var(--bb-border); }
 ::-webkit-scrollbar-thumb:hover { background: var(--bb-amber); }
 
-/* ══════════════════════════════════════════════════════════════
-   FIX 1 — KILL keyboard_double_arrow / keyboard_arrow_right
-   These are Streamlit sidebar nav icons rendered by Material Icons font.
-   Target every possible selector across all Streamlit versions.
-   ══════════════════════════════════════════════════════════════ */
+/* ══════════════════════════════════════════════════════════
+   ICON TEXT FIX — hide "keyboard_double_arrow_right" text
+   Only target the Material Icons text-rendering span.
+   DO NOT touch SVGs or sidebar collapse button.
+   ══════════════════════════════════════════════════════════ */
 
-/* Sidebar page-nav icon spans (the ones showing "keyboard_double_a..." text) */
-[data-testid="stSidebarNavLink"] span[data-testid="stIconMaterial"],
-[data-testid="stSidebarNavLink"] span.material-icons,
-[data-testid="stSidebarNavLink"] span[class*="icon"],
-[data-testid="stSidebarNavLink"] svg,
-[data-testid="stNavLink"] span[data-testid="stIconMaterial"],
-[data-testid="stNavLink"] span.material-icons,
-[data-testid="stNavLink"] svg,
-/* Expander toggle icons */
-[data-testid="stExpander"] summary [data-testid="stExpanderToggleIcon"],
-[data-testid="stExpander"] summary [data-testid="stExpanderToggleIcon"] *,
-[data-testid="stExpander"] summary svg,
-[data-testid="stExpander"] summary .material-icons,
-[data-testid="stExpander"] summary > div > span:first-child,
-[data-testid="stExpander"] summary > span:first-child,
-[data-testid="stExpander"] summary span[data-testid],
-/* ANY span/element using Material Icons font anywhere in sidebar */
-[data-testid="stSidebar"] span[data-testid="stIconMaterial"],
-[data-testid="stSidebar"] .material-icons,
-.streamlit-expanderHeader span[class*="arrow"],
-.streamlit-expanderHeader svg {
-    display: none !important;
-    visibility: hidden !important;
+/* Material Icons span that renders icon name as text */
+[data-testid="stIconMaterial"] {
+    font-size: 0 !important;
     width: 0 !important;
     height: 0 !important;
-    max-width: 0 !important;
-    max-height: 0 !important;
     overflow: hidden !important;
+    display: inline-block !important;
+    color: transparent !important;
+}
+
+/* Expander toggle icon only — scoped tightly to summary */
+[data-testid="stExpander"] summary [data-testid="stExpanderToggleIcon"] {
+    font-size: 0 !important;
+    width: 0 !important;
+    height: 0 !important;
+    overflow: hidden !important;
+    color: transparent !important;
+    display: inline-block !important;
+}
+[data-testid="stExpander"] summary [data-testid="stExpanderToggleIcon"] * {
     font-size: 0 !important;
     color: transparent !important;
-    opacity: 0 !important;
-    position: absolute !important;
-    pointer-events: none !important;
 }
 [data-testid="stExpander"] summary::-webkit-details-marker,
-[data-testid="stExpander"] summary::marker { display: none !important; content: "" !important; }
-[data-testid="stExpander"] summary::before,
-[data-testid="stExpander"] summary::after  { display: none !important; content: "" !important; }
-
-/* Also hide the text label that appears before the icon in the nav */
-[data-testid="stSidebarNavLink"] [data-testid="stIconMaterial"]::before,
-[data-testid="stSidebarNavLink"] [data-testid="stIconMaterial"]::after,
-/* Kill material icon font rendering as text */
-@font-face rules won't help - target the element using the font */
-[data-testid="stSidebar"] [style*="material"] {
-    font-size: 0 !important;
-    color: transparent !important;
+[data-testid="stExpander"] summary::marker {
+    display: none !important;
+    content: "" !important;
 }
 
-/* ══════════════════════════════════════════════════════════════
-   FIX 2 — PRICE/CHANGE COLORS  (green positive · red negative)
-   The global "color: !important" catch-all was overriding inline
-   style="color:#00d084" attributes. Fixed by:
-   a) Removing !important from the catch-all color rule
-   b) Adding explicit high-specificity green/red rules
-   ══════════════════════════════════════════════════════════════ */
-
-/* Metric delta colors */
-[data-testid="stMetricDeltaIcon-Up"],
+/* ══════════════════════════════════════════════════════════
+   PRICE COLOR FIX — green/red for positive/negative changes
+   ══════════════════════════════════════════════════════════ */
+[data-testid="stMetricDeltaIcon-Up"] { color: #00d084 !important; }
+[data-testid="stMetricDeltaIcon-Down"] { color: #ff3b3b !important; }
 [data-testid="stMetricDelta"]:has([data-testid="stMetricDeltaIcon-Up"]),
-[data-testid="stMetricDelta"]:has([data-testid="stMetricDeltaIcon-Up"]) * {
+[data-testid="stMetricDelta"]:has([data-testid="stMetricDeltaIcon-Up"]) span {
     color: #00d084 !important;
 }
-[data-testid="stMetricDeltaIcon-Down"],
 [data-testid="stMetricDelta"]:has([data-testid="stMetricDeltaIcon-Down"]),
-[data-testid="stMetricDelta"]:has([data-testid="stMetricDeltaIcon-Down"]) * {
+[data-testid="stMetricDelta"]:has([data-testid="stMetricDeltaIcon-Down"]) span {
     color: #ff3b3b !important;
 }
 
-/* ══════════════════════════════════════════════════════════════
-   FIX 3 — FONT SIZE INCREASES across all pages
-   ══════════════════════════════════════════════════════════════ */
-[data-testid="stMetricValue"] { font-size: 0.92rem !important; font-weight: 700 !important; }
+/* ══════════════════════════════════════════════════════════
+   FONT SIZE INCREASES
+   ══════════════════════════════════════════════════════════ */
+[data-testid="stMetricValue"]  { font-size: 1.35rem !important; font-weight: 700 !important; }
 [data-testid="stMetricLabel"] p { font-size: 0.78rem !important; }
 [data-testid="stMetricDelta"]   { font-size: 0.82rem !important; }
-.stDataFrame thead tr th { font-size: 0.80rem !important; }
-.stDataFrame tbody tr td { font-size: 0.90rem !important; }
-.stButton > button      { font-size: 0.90rem !important; }
+.stDataFrame thead tr th        { font-size: 0.80rem !important; }
+.stDataFrame tbody tr td        { font-size: 0.90rem !important; }
+.stButton > button              { font-size: 0.90rem !important; }
 
 
 /* ── Blinking animation ── */
