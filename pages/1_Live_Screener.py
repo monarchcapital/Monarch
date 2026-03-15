@@ -6509,7 +6509,8 @@ def _build_score_explanation(sym: str, result: dict, df_raw: pd.DataFrame):
     score_col = ("#00ff88" if score >= 70 else
                  "#00d084" if score >= 55 else
                  "#ffb347" if score >= 40 else "#ff3b3b")
-    setup_col = "#1e90ff" if setup == "Breakout" else "#cc88ff"
+    setup_col = ("#ff8c00" if setup == "Reversal" else
+               "#1e90ff" if setup == "Breakout" else "#cc88ff")
 
     rows_html = []
 
@@ -6528,13 +6529,22 @@ def _build_score_explanation(sym: str, result: dict, df_raw: pd.DataFrame):
         vq_exp = (f"Yesterday's volume was <b>{vol_ratio:.2f}×</b> the 20-day average — "
                   f"slightly elevated. Normal trading activity, no strong signal either way.")
     else:
-        vq_icon = "🔊"; vq_col = "#ff6b6b"
-        vq_exp = (f"Yesterday's volume was <b>{vol_ratio:.2f}×</b> the 20-day average — "
-                  f"<b>high</b>. Price may already have moved. Enter only if price is still "
-                  f"below resistance. High vol on the scoring day is a caution flag.")
-    rows_html.append(_signal_row(vq_icon, "Volume Quiet (28% weight)",
+        if setup == "Reversal":
+            vq_icon = "🔊"; vq_col = "#00d084"
+            vq_exp = (f"Volume was <b>{vol_ratio:.2f}×</b> the 20-day average — "
+                      f"<b>capitulation surge</b>. Panic selling with heavy vol = sellers exhausted. "
+                      f"High vol on oversold stock = fuel for the bounce.")
+        else:
+            vq_icon = "🔊"; vq_col = "#ff6b6b"
+            vq_exp = (f"Yesterday's volume was <b>{vol_ratio:.2f}×</b> the 20-day average — "
+                      f"<b>high</b>. Price may already have moved. Enter only if price is still "
+                      f"below resistance. High vol on the scoring day is a caution flag.")
+    # For Reversal: bar shows how high vol is (higher = better). For others: inverse.
+    _vol_bar = (min(vol_ratio / 3.0, 1.0) if setup == "Reversal" else vol_quiet / 14.0)
+    rows_html.append(_signal_row(vq_icon,
+                                 ("Volume Surge (40% weight)" if setup == "Reversal" else "Volume Quiet (40% weight)"),
                                  f"{vol_ratio:.2f}× 20d avg",
-                                 vq_exp, vq_col, vol_quiet / 14.0))
+                                 vq_exp, vq_col, _vol_bar))
 
     # ── 2. SPREAD COMPRESSION (primary factor, weight 22%) ──────────────────
     if spread_raw >= 2.0:
@@ -6556,7 +6566,7 @@ def _build_score_explanation(sym: str, result: dict, df_raw: pd.DataFrame):
         sc_icon = "↕️"; sc_col = "#ff6b6b"
         sc_exp = (f"Range is wide and/or close is trending down (SpreadComp = {spread_raw:.1f}/3.0). "
                   f"No accumulation signature. Distribution possible.")
-    rows_html.append(_signal_row(sc_icon, "Spread Compression (22% weight)",
+    rows_html.append(_signal_row(sc_icon, "Spread Compression (40% weight)",
                                  f"{spread_raw:.1f} / 3.0",
                                  sc_exp, sc_col, min(spread_raw / 3.0, 1.0)))
 
@@ -6580,7 +6590,7 @@ def _build_score_explanation(sym: str, result: dict, df_raw: pd.DataFrame):
         vdu_exp = (f"5-day avg volume is <b>{_v5_str}</b> — elevated over the period. "
                    f"Could indicate accumulation, but also distribution. "
                    f"Confirm with price action (closes near highs = accumulation).")
-    rows_html.append(_signal_row(vdu_icon, "Volume Dry-Up (12% weight)",
+    rows_html.append(_signal_row(vdu_icon, "Volume Dry-Up (diagnostic)",
                                  _v5_str, vdu_exp, vdu_col, vdu_pts / 8.0))
 
     # ── 4. BB WIDTH SQUEEZE (10%) ────────────────────────────────────────────
@@ -6604,7 +6614,7 @@ def _build_score_explanation(sym: str, result: dict, df_raw: pd.DataFrame):
         bb_exp  = (f"BB width at the <b>{_bbw_pct}th percentile</b> of history — "
                    f"bands are wide. Volatility is elevated, not compressed. "
                    f"Wait for contraction before entry.")
-    rows_html.append(_signal_row(bb_icon, "Bollinger Squeeze (10% weight)",
+    rows_html.append(_signal_row(bb_icon, "Bollinger Squeeze (part of Coil 20%)",
                                  f"Bottom {_bbw_pct}% of history",
                                  bb_exp, bb_col, bb_pts / 8.0))
 
@@ -6628,7 +6638,7 @@ def _build_score_explanation(sym: str, result: dict, df_raw: pd.DataFrame):
         pr_icon = "⏳"; pr_col = "#888"
         pr_exp  = (f"Price is <b>{_dist_pct:.1f}% below resistance</b> at ₹{_base_hi:.2f}. "
                    f"Still forming the base. Not immediately actionable.")
-    rows_html.append(_signal_row(pr_icon, "Proximity to Trigger (10% weight)",
+    rows_html.append(_signal_row(pr_icon, "Proximity to Trigger (diagnostic)",
                                  f"{_dist_pct:.1f}% from ₹{_base_hi:.2f}",
                                  pr_exp, pr_col, prox_pts / 10.0))
 
@@ -6651,7 +6661,7 @@ def _build_score_explanation(sym: str, result: dict, df_raw: pd.DataFrame):
         at_exp  = (f"5-day ATR is <b>{abs(_atr_comp_pct):.0f}% ABOVE</b> the 60-day average. "
                    f"Volatility is expanding, not compressing. "
                    f"May indicate the move has already begun — check if price is still below resistance.")
-    rows_html.append(_signal_row(at_icon, "ATR Compression (8% weight)",
+    rows_html.append(_signal_row(at_icon, "ATR Compression (diagnostic)",
                                  f"5d ATR {_atr_comp_pct:+.0f}% vs 60d avg",
                                  at_exp, at_col, vc_pts / 10.0))
 
@@ -6675,7 +6685,7 @@ def _build_score_explanation(sym: str, result: dict, df_raw: pd.DataFrame):
         vp_icon = "➖"; vp_col = "#666"
         vp_exp  = ("Insufficient swing structure to confirm a VCP. "
                    "Could be early in base building, or stock is trending smoothly without pullbacks.")
-    rows_html.append(_signal_row(vp_icon, "VCP Pattern (4% weight)",
+    rows_html.append(_signal_row(vp_icon, "VCP Pattern (diagnostic)",
                                  f"{vcp_n} pullbacks",
                                  vp_exp, vp_col, vcp_pts / 10.0))
 
@@ -7219,7 +7229,86 @@ if st.session_state.raw_data_cache:
             styled_q = (q_df.style
                         .applymap(score_bg,  subset=["Score"])
                         .applymap(setup_bg,  subset=["Setup"]))
-            st.dataframe(styled_q, use_container_width=True, hide_index=True, height=480)
+            st.dataframe(styled_q, use_container_width=True, hide_index=True, height=320)
+
+            # ── FUNDAMENTALS PANEL for selected stock ────────────────────────
+            _sel = st.session_state.get("chart_sym", ticker_opts[0] if ticker_opts else None)
+            if _sel and _sel in st.session_state.raw_data_cache:
+                _fd = st.session_state.raw_data_cache[_sel]
+                _fl = get_live_bar(_sel)
+                _fr = get_cached_score(_sel, _fd, _fl, nifty_r5, nifty_r20)
+                if _fr:
+                    st.markdown(
+                        f'<div style="font-family:IBM Plex Mono;font-size:0.60rem;'
+                        f'color:#666;letter-spacing:0.12em;text-transform:uppercase;'
+                        f'margin:10px 0 4px;">◼ {_sel} — KEY METRICS</div>',
+                        unsafe_allow_html=True)
+
+                    # Build metrics as compact HTML rows
+                    _above_sma = "✅ Above" if _fr.get("AboveSMA200") else "❌ Below"
+                    _pos52 = _fr.get("Pos52W", 0)
+                    _pos52_pct = f"{_pos52*100:.0f}th %ile"
+
+                    # Price levels
+                    _ltp_f = float(_fl.get("ltp") or _fd["close"].iloc[-1])
+                    _e9  = _fr.get("EMA9",  0)
+                    _e20 = _fr.get("EMA20", 0)
+                    _e50 = _fr.get("EMA50", 0)
+
+                    # Returns: compute from raw data
+                    _fc = _fd["close"]
+                    _r1  = f"{(_fc.iloc[-1]/_fc.iloc[-2]-1)*100:+.1f}%" if len(_fc)>=2  else "—"
+                    _r5  = f"{(_fc.iloc[-1]/_fc.iloc[-6]-1)*100:+.1f}%" if len(_fc)>=6  else "—"
+                    _r20 = f"{(_fc.iloc[-1]/_fc.iloc[-21]-1)*100:+.1f}%" if len(_fc)>=21 else "—"
+
+                    # 52w high/low
+                    _hi52 = float(_fd["high"].tail(252).max()) if len(_fd) >= 50 else float(_fd["high"].max())
+                    _lo52 = float(_fd["low"].tail(252).min())  if len(_fd) >= 50 else float(_fd["low"].min())
+                    _from_hi = f"{(_ltp_f/_hi52-1)*100:.1f}%"
+                    _from_lo = f"{(_ltp_f/_lo52-1)*100:.1f}%"
+
+                    # ADV turnover
+                    _adv = _fr.get("ADVTurnover", 0)
+                    _adv_str = f"₹{_adv:.0f}Cr" if _adv >= 1 else f"₹{_adv*100:.0f}L"
+
+                    # Stability / Liquidity
+                    _stab = _fr.get("Stability", 0)
+                    _liq  = _fr.get("LiquidityScore", 0)
+                    _sect = _fr.get("Sector", "?")
+                    _atr  = _fr.get("ATR%", 0)
+                    _rs   = _fr.get("RS_vs_Nifty", 0)
+
+                    def _mrow(label, val, good=None):
+                        col = "#e8e8e8"
+                        if good is True:  col = "#00d084"
+                        if good is False: col = "#ff6b6b"
+                        return (f'<div style="display:flex;justify-content:space-between;'
+                                f'padding:3px 0;border-bottom:1px solid #111;">'
+                                f'<span style="color:#666;">{label}</span>'
+                                f'<span style="color:{col};font-weight:600;">{val}</span></div>')
+
+                    rows = [
+                        _mrow("Sector",      _sect),
+                        _mrow("SMA200",      _above_sma, good=_fr.get("AboveSMA200")),
+                        _mrow("52W Position",_pos52_pct, good=_pos52>0.6),
+                        _mrow("52W High",    f"₹{_hi52:,.0f}  ({_from_hi})"),
+                        _mrow("52W Low",     f"₹{_lo52:,.0f}  ({_from_lo})"),
+                        _mrow("EMA 9",       f"₹{_e9:,.1f}",  good=_ltp_f > _e9),
+                        _mrow("EMA 20",      f"₹{_e20:,.1f}", good=_ltp_f > _e20),
+                        _mrow("EMA 50",      f"₹{_e50:,.1f}", good=_ltp_f > _e50),
+                        _mrow("Return 1D",   _r1, good=_r1.startswith("+")),
+                        _mrow("Return 5D",   _r5, good=_r5.startswith("+")),
+                        _mrow("Return 20D",  _r20, good=_r20.startswith("+")),
+                        _mrow("ATR%",        f"{_atr:.1f}%"),
+                        _mrow("RS vs Nifty", f"{_rs:+.1f}%", good=_rs>0),
+                        _mrow("ADV Turnover",_adv_str, good=_adv>50),
+                        _mrow("Stability",   f"{_stab:.2f}",  good=_stab>0.55),
+                        _mrow("Liquidity",   f"{_liq:.2f}",   good=_liq>0.6),
+                    ]
+                    st.markdown(
+                        f'<div style="font-family:IBM Plex Mono;font-size:0.67rem;">'
+                        + "".join(rows) + "</div>",
+                        unsafe_allow_html=True)
 
         with col_chart:
             sym = chosen   # use value from this run, not stale session_state
