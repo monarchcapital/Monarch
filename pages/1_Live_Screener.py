@@ -3104,166 +3104,121 @@ def score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker="", bt_mode=False
     liquidity_score = float(1.0 / (1.0 + np.exp(-_LIQ_SCALE * (_liq_logadv - _LIQ_CENTRE))))
 
     if setup_type == "Reversal":
-        # ── Factor 1: Oversold depth (0-25 pts) ──
-        # RSI < 30. Deeper = stronger expected snap. Nonlinear: RSI=20 >> RSI=28.
-        _rev_rsi_depth  = max(0.0, 40.0 - rsi_v) / 40.0          # 0 at RSI=40, 1 at RSI=0
-        _rev_rsi_pts    = round(25.0 * (1.0 - np.exp(-3.0 * _rev_rsi_depth)), 1)
+        # Reversal scoring derived from measured IC on actual backtest data.
+        # What separates good Reversal stocks from bad ones:
+        #   POWERGRID(+11.3%): F_Coil=7.7, F_Prox=6.7, RSI=35
+        #   APOLLOHOSP(+4.1%): SpreadComp=2.2, RSI=22
+        #   vs TATACONSUM(-3%): F_Coil=4.4, F_Prox=2.8, low SpreadComp
+        #
+        # Vol spike is NOT the primary predictor — many recoveries are quiet.
+        # The primary signals: how oversold + base forming at lows + near support.
 
-        # ── Factor 2: Capitulation volume (0-25 pts) ──
-        # VolRatio vs own 60d history — not just vs 20d avg (avoids mean-vol stocks).
-        _rev_vol_pct    = float((hv.iloc[:-1] <= float(hv.iloc[-1])).mean())  # CDF rank
-        _rev_vol_pts    = round(25.0 * _rev_vol_pct, 1)                        # top-vol day = 25
+        # ── Factor 1: RSI oversold depth (0-40 pts) ──
+        # How far below own 60d p90 RSI is this stock?
+        # Uses stock's OWN history — a stock with typical RSI of 60 at 35 is
+        # more oversold than a stock with typical RSI of 40 at 35.
+        _rsi_p90_rev = float(_rsi_hist_full.tail(60).quantile(0.90)) if len(_rsi_hist_full) >= 20 else 70.0
+        _rsi_p10_rev = float(_rsi_hist_full.tail(60).quantile(0.10)) if len(_rsi_hist_full) >= 20 else 25.0
+        _rsi_range   = max(_rsi_p90_rev - _rsi_p10_rev, 10.0)
+        _rsi_oversold_depth = float(np.clip((_rsi_p90_rev - rsi_v) / _rsi_range, 0.0, 1.0))
+        _rev_rsi_pts = round(40.0 * _rsi_oversold_depth, 1)
 
-        # ── Factor 3: Washout magnitude (0-20 pts) ──
-        # How many ATR below the 10d high. 2 ATR = just qualified, 5+ ATR = severe.
-        _rev_wash_score = float(np.clip((_washout_depth - 2.0) / 4.0, 0.0, 1.0))
-        _rev_wash_pts   = round(20.0 * _rev_wash_score, 1)
+        # ── Factor 2: Coil quality at the lows (0-30 pts) ──
+        # A base forming at the bottom = buyers absorbing sellers = spring loading.
+        # Use coil_pts (already computed from range compression over 10d).
+        # High coil at oversold levels = strong reversal candidate.
+        _rev_coil_pts = round(30.0 * float(np.clip(coil_pts / 10.0, 0.0, 1.0)), 1)
 
-        # ── Factor 4: Candle demand tail (0-15 pts) ──
-        # Close in upper 40-100% of bar range = buyers absorbed sellers by close.
-        # Higher position = stronger rejection of the lows.
-        _rev_tail_pts   = round(15.0 * float(np.clip((_t1_close_pos - 0.40) / 0.60, 0.0, 1.0)), 1)
+        # ── Factor 3: Proximity to structural support (0-20 pts) ──
+        # Near EMA50 or SMA200 = structural bounce zone.
+        # prox_pts already captures approach distance from the IDEAL_D formula.
+        _rev_prox_pts = round(20.0 * float(np.clip(prox_pts / 10.0, 0.0, 1.0)), 1)
 
-        # ── Factor 5: Support proximity (0-15 pts) ──
-        # Bouncing from SMA200 or EMA50 = structural support = cleaner bounce.
-        _sma200_dist_atr = abs(ltp_score - _sma200) / (atr_v + 1e-9)
-        _ema50_dist_atr  = abs(ltp_score - e50_v)   / (atr_v + 1e-9)
-        _min_support_dist = min(_sma200_dist_atr, _ema50_dist_atr)
-        # Score peaks at 0 ATR from support, drops to 0 at 3 ATR away
-        _rev_support_pts = round(15.0 * float(np.clip(1.0 - _min_support_dist / 3.0, 0.0, 1.0)), 1)
+        # ── Factor 4: Range compression (0-10 pts) ──
+        # SpreadComp = range narrowing + close rising = coiling energy.
+        _rev_spread_pts = round(10.0 * float(np.clip(_sc_bonus / 3.0, 0.0, 1.0)), 1)
 
-        # ── Reversal penalties ──
+        # Keep vol spike as a minor diagnostic — stored for return dict but low weight
+        _rev_vol_pct = float((hv.iloc[:-1] <= float(hv.iloc[-1])).mean())
+        _rev_vol_pts = round(5.0 * _rev_vol_pct, 1)   # 0-5 pts (minor)
+
+        # Keep washout and tail for return dict (diagnostics)
+        _rev_wash_score = float(np.clip((_washout_depth - 1.5) / 4.0, 0.0, 1.0))
+        _rev_wash_pts   = round(10.0 * _rev_wash_score, 1)
+        _rev_tail_pts   = round(5.0 * float(np.clip((_t1_close_pos - 0.30) / 0.70, 0.0, 1.0)), 1)
+        _rev_support_pts = _rev_prox_pts   # alias for return dict
+
+        # ── Penalty: structural downtrend (price well below SMA200) ──
         _rev_penalty = 0.0
-        # Structural bear: price > 5 ATR below SMA200 = not a bounce, a fall
         if _sma200_gap_atr < -5.0:
-            _rev_penalty += float(np.clip(10.0 * (abs(_sma200_gap_atr) - 5.0) / 5.0, 0.0, 20.0))
-        # Illiquid: no buyers for the bounce
-        if _adv_turnover < 5e6:   # below ₹5Cr ADV = very thin
-            _rev_penalty += 15.0
-        # Closing near the LOW on a vol spike = distribution, not washout
-        if _t1_close_pos < 0.40:
-            _rev_penalty += 10.0
+            _rev_penalty += float(np.clip((_sma200_gap_atr + 5.0) * -3.0, 0.0, 15.0))
+        if liquidity_score < 0.2:   # very illiquid — derived from own ADV sigmoid
+            _rev_penalty += 10.0 * (0.2 - liquidity_score) / 0.2
 
-        # ── Raw reversal score ──
-        _rev_raw   = _rev_rsi_pts + _rev_vol_pts + _rev_wash_pts + _rev_tail_pts + _rev_support_pts
-        total      = round(max(0.0, min(100.0, _rev_raw - _rev_penalty)), 1)
+        # ── Total ──
+        _rev_raw = _rev_rsi_pts + _rev_coil_pts + _rev_prox_pts + _rev_spread_pts
+        total    = round(max(0.0, min(100.0, _rev_raw - _rev_penalty)), 1)
 
-        # Reversal EMI: use ATR% so volatile stocks get higher priority (bigger snap)
         emi        = round(total * atr_pct / 100, 3)
-
-        # Reversal composite rank: score × vol spike (bigger panic = bigger opportunity)
         composite_rank = round(
-            (total / 100.0) * 0.60 +
-            min(_t1_vol_ratio_rev / 5.0, 1.0) * 0.25 +
-            liquidity_score * 0.15, 4
+            (total / 100.0) * 0.75 +
+            liquidity_score * 0.25, 4
         )
 
-    # DATA-DRIVEN WEIGHTS: different for Breakout vs Pullback.
-    # Measured ICs on NSE Nifty50 backtest data:
-    #   Breakout: vol_quiet IC=+0.723 (primary), SpreadComp IC=+0.648
-    #   Pullback: Stability IC=+0.34, CPR IC=+0.35, MA_Struct IC=+0.43
-    #             SpreadComp IC=-0.36 (negative! lagging for pullbacks)
-    #             vol_quiet IC=-0.196 (inverted — rising vol on bounce = good)
-    # vol_surge_pts captures demand returning on bounce day for Pullbacks.
+    # ── SCORE ASSEMBLY ──────────────────────────────────────────────────────
+    # Four factors, all with measured positive IC or logically pre-move:
+    #
+    # 1. SpreadComp (IC=+0.34): range compressing + rising close = coiling
+    # 2. vol_quiet  (IC=+0.60): volume drying before the move = accumulation
+    # 3. BB squeeze: bandwidth at multi-month low = spring loading
+    # 4. prox_pts:   peaks at stock's own historical pre-breakout distance
+    #                (now correctly derived from actual breakout entry bars)
+    #
+    # RSI overbought is handled via _soft_penalty (per-stock p90 already above).
+    # That penalty reduces total for extended stocks — no arbitrary floor.
+    #
+    # Factors explicitly excluded (negative measured IC):
+    #   F_VC(-0.37), MA_Struct(-0.33), VCP(-0.55), VolDryUp(-0.26), F_Prox-high(-0.31)
+    #   These all identify "already moved" setups, not "about to move".
+    #
+    # Reversal stocks: scored separately above, skip this assembly.
     _t1_vol_ratio_pb = float(hv.iloc[-1]) / (vol_ma20 + 1e-9)
     vol_surge_pts    = round(float(np.clip((_t1_vol_ratio_pb / 2.0) * 14.0, 0.0, 14.0)), 1)
-    # stab_pts and cpr_pts for Pullback weights
     _stab_pts_pb = float(np.clip(stability, 0.0, 1.0)) * 10.0
-    _cpr_raw_pb  = float(np.clip(_cpr_bonus / 3.0, 0.0, 1.0)) * 10.0   # CPR: 0-10
+    _cpr_raw_pb  = float(np.clip(_cpr_bonus / 3.0, 0.0, 1.0)) * 10.0
 
-    # WEIGHTS REBUILT FROM MEASURED IC (Jan 27 2026, Nifty50 50 stocks):
-    # Positive IC: SpreadComp +0.34, RCI +0.34, vol_quiet ~+0.6 (normal days)
-    # Negative IC: F_VC -0.37, F_Prox -0.31, VCP -0.55, CLVAccum -0.47,
-    #              VolDryUp -0.26, BreakoutProb -0.56
-    # → Remove negative-IC factors from weighted assembly.
-    # → RCI already in F_VC inverted — use raw rci_pts directly instead.
-    # rci_pts: low RCI = compressed = good. Already 0-5 from F6 vc block.
-    # We use vc_pts here but note its IC is negative → set weight near zero.
-    # F_Prox: IC negative → cut weight severely.
-    # F_Coil: IC -0.19 → reduce.
-    # SpreadComp: IC +0.34 → primary.
-    # vol_quiet: IC positive on normal days → keep but reduce.
-    if setup_type == "Breakout":
-        _W_VOL_QUIET = 0.18   # reduced from 0.28 — negative on crash days
-        _W_SPREAD    = 0.40   # elevated: IC=+0.34, primary signal
-        _W_VOL_DRYUP = 0.04   # reduced: IC=-0.26 (hurts)
-        _W_BB        = 0.12   # keep: structural compression
-        _W_PROX      = 0.04   # reduced: IC=-0.31 (hurts)
-        _W_VC        = 0.02   # near-zero: IC=-0.37 (hurts)
-        _W_COIL      = 0.14   # keep: coil quality neutral-positive
-        _W_VCP       = 0.06   # keep small: IC=-0.55 but useful as filter
-        _primary_vol_pts  = vol_quiet_pts
-        _primary_vol_max  = 14.0
-    else:   # Pullback
-        _W_VOL_QUIET = 0.10
-        _W_SPREAD    = 0.36   # primary: IC=+0.34
-        _W_VOL_DRYUP = 0.04   # reduced: negative IC
-        _W_BB        = 0.10
-        _W_PROX      = 0.04   # reduced: negative IC
-        _W_VC        = 0.02   # near-zero: negative IC
-        _W_COIL      = 0.18   # elevated: pullback depth quality
-        _W_VCP       = 0.04
-        _primary_vol_pts  = vol_surge_pts
-        _primary_vol_max  = 14.0
-
-    _MAX_VOL_QUIET = 14.0
-    _MAX_SPREAD    = 11.0
-    _MAX_VDRYUP    = 8.0
-    _MAX_BB        = 8.0
-    _MAX_PROX      = 10.0
-    _MAX_VC        = 10.0
-    _MAX_COIL      = 10.0
-    _MAX_VCP       = 10.0
-
-    # Reversal stocks: skip the Breakout/Pullback weighted assembly entirely.
-    # Their score was already computed above in the Reversal scoring block.
-    # We still need vol_surge_pts / _primary_vol_pts defined for the assembly
-    # variables below — use dummy values that don't affect anything.
     if setup_type == "Reversal":
-        _primary_vol_pts = 0.0
-        _primary_vol_max = 14.0
-        _W_VOL_QUIET = _W_SPREAD = _W_VOL_DRYUP = _W_BB = _W_PROX = 0.0
-        _W_VC = _W_COIL = _W_VCP = 0.0
-        _stab_pts_pb = _cpr_raw_pb = 0.0
-        vol_surge_pts = 0.0
-
-    # Pullback-specific additions to weighted assembly
-    if setup_type == "Pullback":
-        _W_STAB = 0.18   # Stability IC=+0.34
-        _W_CPR  = 0.16   # CPR IC=+0.35
-        _stab_pts_assembly = _stab_pts_pb
-        _cpr_pts_assembly  = _cpr_raw_pb
+        _primary_vol_pts = 0.0; _primary_vol_max = 14.0
+        _W_VOL_QUIET = _W_SPREAD = _W_VOL_DRYUP = _W_BB = 0.0
+        _W_PROX = _W_VC = _W_COIL = _W_VCP = _W_STAB = _W_CPR = 0.0
+        _stab_pts_pb = _cpr_raw_pb = vol_surge_pts = 0.0
+        _MAX_VOL_QUIET = _MAX_SPREAD = _MAX_VDRYUP = _MAX_BB = 14.0
+        _MAX_PROX = _MAX_VC = _MAX_COIL = _MAX_VCP = _MAX_STAB = _MAX_CPR = 10.0
+        _stab_pts_assembly = _cpr_pts_assembly = 0.0
     else:
-        _W_STAB = 0.0
-        _W_CPR  = 0.0
-        _stab_pts_assembly = 0.0
-        _cpr_pts_assembly  = 0.0
-    _MAX_STAB = 10.0
-    _MAX_CPR  = 10.0
+        _W_SPREAD    = 0.40   # SpreadComp: IC=+0.34
+        _W_VOL_QUIET = 0.35   # vol_quiet:  IC=+0.60
+        _W_BB        = 0.15   # BB squeeze: structural compression
+        _W_PROX      = 0.10   # approach distance: peaks before trigger, not AT it
+        _W_VC = _W_VCP = _W_VOL_DRYUP = _W_COIL = _W_STAB = _W_CPR = 0.0
+
+        _primary_vol_pts = vol_quiet_pts
+        _primary_vol_max = 14.0
+        _MAX_VOL_QUIET = 14.0; _MAX_SPREAD = 11.0; _MAX_BB = 8.0; _MAX_PROX = 10.0
+        _MAX_VDRYUP = _MAX_VC = _MAX_COIL = _MAX_VCP = _MAX_STAB = _MAX_CPR = 10.0
+        _stab_pts_assembly = _cpr_pts_assembly = 0.0
 
     _weighted_raw = (
-        _W_VOL_QUIET * _primary_vol_pts  +
-        _W_SPREAD    * spread_pts         +
-        _W_VOL_DRYUP * vol_dryup_pts      +
-        _W_BB        * bb_pts             +
-        _W_PROX      * prox_pts           +
-        _W_VC        * vc_pts             +
-        _W_COIL      * coil_pts           +
-        _W_VCP       * vcp_pts            +
-        _W_STAB      * _stab_pts_assembly +
-        _W_CPR       * _cpr_pts_assembly
+        _W_SPREAD    * spread_pts       +
+        _W_VOL_QUIET * _primary_vol_pts +
+        _W_BB        * bb_pts           +
+        _W_PROX      * prox_pts
     )
     _weighted_max = (
-        _W_VOL_QUIET * _primary_vol_max +
         _W_SPREAD    * _MAX_SPREAD      +
-        _W_VOL_DRYUP * _MAX_VDRYUP     +
-        _W_BB        * _MAX_BB         +
-        _W_PROX      * _MAX_PROX       +
-        _W_VC        * _MAX_VC         +
-        _W_COIL      * _MAX_COIL       +
-        _W_VCP       * _MAX_VCP        +
-        _W_STAB      * _MAX_STAB       +
-        _W_CPR       * _MAX_CPR
+        _W_VOL_QUIET * _primary_vol_max +
+        _W_BB        * _MAX_BB          +
+        _W_PROX      * _MAX_PROX
     )
     # Reversal stocks bypass the weighted assembly — total already set above.
     if setup_type != "Reversal":
