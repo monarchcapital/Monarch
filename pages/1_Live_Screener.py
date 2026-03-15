@@ -3165,69 +3165,48 @@ def score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker="", bt_mode=False
             liquidity_score * 0.25, 4
         )
 
-    # ── SCORE ASSEMBLY ──────────────────────────────────────────────────────
-    # Four factors, all with measured positive IC or logically pre-move:
+    # ── UNIFIED SCORE ASSEMBLY — identical formula for ALL setup types ──────
+    # Derived from grid-search on actual Jan 2026 Nifty50 backtest data.
+    # Best 5d return spread (+2.4%): SpreadComp(40%) + vol_direction(40%) + Coil(20%)
     #
-    # 1. SpreadComp (IC=+0.34): range compressing + rising close = coiling
-    # 2. vol_quiet  (IC=+0.60): volume drying before the move = accumulation
-    # 3. BB squeeze: bandwidth at multi-month low = spring loading
-    # 4. prox_pts:   peaks at stock's own historical pre-breakout distance
-    #                (now correctly derived from actual breakout entry bars)
+    # SpreadComp: range compressing + rising close = spring loading
+    # vol_direction: setup-aware
+    #   Reversal → vol_surge (high panic vol = capitulation = bounce fuel)
+    #   Breakout/Pullback → vol_quiet (low vol = accumulation before move)
+    # Coil: base quality at approach level — same signal for all setups
     #
-    # RSI overbought is handled via _soft_penalty (per-stock p90 already above).
-    # That penalty reduces total for extended stocks — no arbitrary floor.
-    #
-    # Factors explicitly excluded (negative measured IC):
-    #   F_VC(-0.37), MA_Struct(-0.33), VCP(-0.55), VolDryUp(-0.26), F_Prox-high(-0.31)
-    #   These all identify "already moved" setups, not "about to move".
-    #
-    # Reversal stocks: scored separately above, skip this assembly.
+    # Using a single formula means Reversal scores compete directly with
+    # Breakout/Pullback scores on the same 0-100 scale.
     _t1_vol_ratio_pb = float(hv.iloc[-1]) / (vol_ma20 + 1e-9)
-    vol_surge_pts    = round(float(np.clip((_t1_vol_ratio_pb / 2.0) * 14.0, 0.0, 14.0)), 1)
-    _stab_pts_pb = float(np.clip(stability, 0.0, 1.0)) * 10.0
-    _cpr_raw_pb  = float(np.clip(_cpr_bonus / 3.0, 0.0, 1.0)) * 10.0
+    vol_surge_pts    = round(float(np.clip((_t1_vol_ratio_pb / 3.0) * 14.0, 0.0, 14.0)), 1)
+    _stab_pts_pb = _cpr_raw_pb = _stab_pts_assembly = _cpr_pts_assembly = 0.0
+    _W_BB = _W_PROX = _W_VC = _W_VCP = _W_VOL_DRYUP = _W_STAB = _W_CPR = 0.0
 
     if setup_type == "Reversal":
-        _primary_vol_pts = 0.0; _primary_vol_max = 14.0
-        _W_VOL_QUIET = _W_SPREAD = _W_VOL_DRYUP = _W_BB = 0.0
-        _W_PROX = _W_VC = _W_COIL = _W_VCP = _W_STAB = _W_CPR = 0.0
-        _stab_pts_pb = _cpr_raw_pb = vol_surge_pts = 0.0
-        _MAX_VOL_QUIET = _MAX_SPREAD = _MAX_VDRYUP = _MAX_BB = 14.0
-        _MAX_PROX = _MAX_VC = _MAX_COIL = _MAX_VCP = _MAX_STAB = _MAX_CPR = 10.0
-        _stab_pts_assembly = _cpr_pts_assembly = 0.0
+        _primary_vol_pts = vol_surge_pts   # panic vol = bounce fuel
     else:
-        _W_SPREAD    = 0.40   # SpreadComp: IC=+0.34
-        _W_VOL_QUIET = 0.35   # vol_quiet:  IC=+0.60
-        _W_BB        = 0.15   # BB squeeze: structural compression
-        _W_PROX      = 0.10   # approach distance: peaks before trigger, not AT it
-        _W_VC = _W_VCP = _W_VOL_DRYUP = _W_COIL = _W_STAB = _W_CPR = 0.0
+        _primary_vol_pts = vol_quiet_pts   # quiet vol = accumulation
+    _primary_vol_max = 14.0
 
-        _primary_vol_pts = vol_quiet_pts
-        _primary_vol_max = 14.0
-        _MAX_VOL_QUIET = 14.0; _MAX_SPREAD = 11.0; _MAX_BB = 8.0; _MAX_PROX = 10.0
-        _MAX_VDRYUP = _MAX_VC = _MAX_COIL = _MAX_VCP = _MAX_STAB = _MAX_CPR = 10.0
-        _stab_pts_assembly = _cpr_pts_assembly = 0.0
+    _W_SPREAD    = 0.40
+    _W_VOL_QUIET = 0.40   # vol_direction (see above)
+    _W_COIL      = 0.20
+    _MAX_SPREAD = 11.0; _MAX_VOL_QUIET = 14.0; _MAX_COIL = 10.0
+    _MAX_BB = _MAX_PROX = _MAX_VC = _MAX_VCP = _MAX_VDRYUP = _MAX_STAB = _MAX_CPR = 10.0
 
     _weighted_raw = (
         _W_SPREAD    * spread_pts       +
         _W_VOL_QUIET * _primary_vol_pts +
-        _W_BB        * bb_pts           +
-        _W_PROX      * prox_pts
+        _W_COIL      * coil_pts
     )
     _weighted_max = (
         _W_SPREAD    * _MAX_SPREAD      +
         _W_VOL_QUIET * _primary_vol_max +
-        _W_BB        * _MAX_BB          +
-        _W_PROX      * _MAX_PROX
+        _W_COIL      * _MAX_COIL
     )
-    # Reversal stocks bypass the weighted assembly — total already set above.
-    if setup_type != "Reversal":
-        _scale_to_100 = 100.0 / max(_weighted_max, 1e-9)
-        total_base    = round(_weighted_raw * _scale_to_100, 1)
-        # Minor additive: candle pattern and Darvas only
-        total_base += cdl_pts * 0.3 + darvas_pts * 0.2
-        total = round(total_base, 1)
-    # else: total was already set in the Reversal scoring block above
+    _scale_to_100 = 100.0 / max(_weighted_max, 1e-9)
+    total_base    = round(_weighted_raw * _scale_to_100, 1)
+    total = round(total_base, 1)
 
     # Preserve raw values for display/debug
     rs_pts_raw,  vol_pts_raw,  rs_sect_pts_raw = rs_pts,  vol_pts,  rs_sect_pts
@@ -3875,7 +3854,12 @@ if st.button("🚀 Start Bulk Extraction", use_container_width=True):
                f"{len(live_quotes)} live quotes patched")
 
     if results:
-        result_df = pd.DataFrame(results).sort_values("CompositeRank", ascending=False).reset_index(drop=True)
+        result_df = pd.DataFrame(results)
+        # Cross-sectional percentile rank — normalise Score across universe
+        if not result_df.empty and "Score" in result_df.columns:
+            _ls = result_df["Score"].values.astype(float)
+            result_df["Score"] = [round(float((_ls <= s).sum() / len(_ls)) * 100, 1) for s in _ls]
+        result_df = result_df.sort_values("CompositeRank", ascending=False).reset_index(drop=True)
         result_df.insert(0, "#", result_df.index + 1)
 
         # ── Bloomberg-style extraction results table ──
@@ -5310,7 +5294,21 @@ else:
 
                 # Store full unfiltered signal set for quintile analysis
                 _SCORING_VERSION = "v7_ic_derived_weights"
-                st.session_state.bt_signals_full = pd.DataFrame(bt_signals_full) if bt_signals_full else pd.DataFrame()
+                _bt_full_df = pd.DataFrame(bt_signals_full) if bt_signals_full else pd.DataFrame()
+
+                # Cross-sectional percentile rank: replace raw Score with within-universe rank.
+                # This makes Reversal scores (typically 10-50) compete fairly with
+                # Breakout/Pullback scores (typically 45-75) on the same 0-100 scale.
+                # A perfect Reversal setup gets the same percentile as a perfect Breakout.
+                if not _bt_full_df.empty and "Score" in _bt_full_df.columns:
+                    _raw_scores = _bt_full_df["Score"].values.astype(float)
+                    _cs_pct = np.array([
+                        float((_raw_scores <= s).sum() / len(_raw_scores)) * 100
+                        for s in _raw_scores
+                    ])
+                    _bt_full_df["Score"] = np.round(_cs_pct, 1)
+
+                st.session_state.bt_signals_full = _bt_full_df
                 st.session_state.bt_signals_version = _SCORING_VERSION
 
                 if not bt_signals:
