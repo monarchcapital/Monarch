@@ -24,30 +24,713 @@ import streamlit as st
 import requests, gzip, json, time, io, math, urllib.parse
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import plotly.graph_objects as go
 import yfinance as yf
 import os
 
-st.set_page_config(layout="wide", page_title="MONARCH — Options Intel", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="MONARCH — Options Intel")
 
 # ============================================================
 # CENTRALIZED CONFIGURATION — change once, applies everywhere
 # ============================================================
 CFG = {
     "rfr_default":    6.5,    # Risk-free rate % (India repo rate)
-    "hv_window":      20,     # Historical volatility look-back days
+    "hv_window":      20,     # Historical volatility look-back (trading days)
     "hv_window_fast": 10,     # Fast HV for comparison
     "iv_hist_max":    252,    # Max IV history (1 trading year)
     "chain_strikes":  8,      # Strikes shown each side in chain tab
     "oi_strikes":     10,     # Strikes each side in OI tab
     "pain_strikes":   15,     # Strikes each side for max pain calc
-    "iv_overpriced":  1.20,   # IV ratio above HV → sell signal
-    "iv_underpriced": 0.85,   # IV ratio below HV → buy signal
+    # ── IV/HV classification: percentile-based, NOT fixed ratios ──────────────────
+    # These are no longer used for signal generation (replaced by iv_hv_pct_sell/buy).
+    # Retained only for legacy display labels in the chain tab edge classifier.
+    "iv_rich_ratio":   1.20,  # kept for chain-tab IV edge label compatibility
+    "iv_cheap_ratio":  0.85,  # kept for chain-tab IV edge label compatibility
+    # ── Adaptive thresholds (percentile-based, replacing magic ratios) ──────────
+    # Sell premium when IV/HV ratio is in the top N-th percentile of history
+    "iv_hv_pct_sell":  75,    # IV/HV percentile above which vol is "rich" → sell
+    "iv_hv_pct_buy":   30,    # IV/HV percentile below which vol is "cheap" → buy
+    # ADX trend threshold (percentile of rolling ADX history, not fixed 25)
+    "adx_trend_pct":   60,    # ADX above this percentile = confirmed trend
+    # PCR percentile thresholds (adaptive to each chain's own distribution)
+    "pcr_bull_pct":    65,    # PCR above this percentile = bullish (more puts written)
+    "pcr_bear_pct":    35,    # PCR below this percentile = bearish (more calls written)
+    # Liquidity: all thresholds now also computed as percentiles within chain
+    "liq_spread_pct_sell": 70, # spread above 70th pct of chain = illiquid
+    "liq_oi_pct_min":      30, # OI below 30th pct of chain = thin
+    "liq_vol_pct_min":     30, # volume below 30th pct of chain = thin
+    # Safety ratio for short strikes: distance / expected_move
+    "safety_ratio_safe":    1.5,  # distance > 1.5x expected move = safe
+    "safety_ratio_moderate": 1.0, # distance 1.0–1.5x = moderate
+    # ── Signal model weights — leading indicators first (optimised for 1–5 day prediction) ──────
+    # Markets move due to POSITIONING CHANGES, not lagging price indicators.
+    # Flow and positioning are leading; trend/momentum are confirming (lagging).
+    "factor_weights": {
+        # LEADING (predictive) — where money is moving right now
+        "flow":          0.30,   # ΔIV, ΔOI, ΔPCR, ΔSkew — institutional order flow changes
+        "positioning":   0.25,   # PCR level, OI walls, max pain distance — structural positioning
+        "vol_regime":    0.20,   # IV percentile, IV/HV ratio, term structure slope
+        # CONFIRMING (lagging) — what price has already done
+        "rel_strength":  0.15,   # stock return vs Nifty 20D — trend confirmation
+        "trend":         0.10,   # EMA structure + ADX — slowest to update, lowest weight
+        # NOTE: RSI and MACD are subsumed into 'trend' with minimal influence.
+        # They confirm but never drive the signal for 1-5 day horizons.
+    },
+    "hv_fallback":     0.15,  # HV fallback when no historical data (15% annualised — NSE index baseline)
     "chain_cache_ttl": 30,    # Seconds to cache live option chain
     "expiry_cache_ttl": 300,  # Seconds to cache expiry list
     "master_cache_ttl": 3600, # Seconds to cache instrument master
+    "iv_hist_file":   ".monarch_iv_history.json",
+    "signal_log_file":".monarch_signal_log.json",  # forward signal log (replaces backtest)
+    "signal_log_max": 200,   # keep last 200 signal entries (~2-3 months of daily use)
+    # ── Flow conviction threshold (derived from distribution, not arbitrary) ──────────
+    # flow_magnitude is in [0,1]. A "high conviction" flow event is one where the
+    # composite magnitude exceeds the 70th percentile of recent magnitudes.
+    # We use 0.35 as the session cold-start seed — it is replaced by the rolling
+    # percentile once 5+ flow observations accumulate in session state.
+    "flow_conviction_seed": 0.35,
+    # ── Kelly cap — EV/MaxRisk Kelly capped at a fraction of account ─────────────────
+    # 0.25 = 25% max of capital in any single position (standard half-Kelly cap)
+    "kelly_cap_pct":  0.25,
+    # ── Fractional Kelly multiplier ──────────────────────────────────────────────────
+    # Apply fractional Kelly to reduce variance. 0.5 = half-Kelly (industry standard).
+    "kelly_fraction": 0.50,
+    "theta_days":     252,    # Theta convention: 252 trading days
+    "ann_days":       252,    # Annualisation base
+    # ── Liquidity filter — legacy absolute floors (fallback when chain sample < 5) ─
+    "liq_min_oi":        1000,   # absolute floor contracts (only when no percentile data)
+    "liq_min_vol":        100,   # absolute floor contracts (only when no percentile data)
+    "liq_max_spread_pct":   5.0, # absolute cap % (only when no percentile data)
+    # ── Centralised lot sizes (SEBI-mandated NSE F&O lot sizes, updated Jan 2025) ──
+    "lot_sizes": {
+        "NIFTY": 75, "BANKNIFTY": 15, "FINNIFTY": 40, "MIDCPNIFTY": 75,
+        "SENSEX": 10,
+        "RELIANCE": 250, "HDFCBANK": 550, "ICICIBANK": 700, "INFY": 400,
+        "TCS": 150, "LT": 150, "SBIN": 1500, "AXISBANK": 625,
+        "KOTAKBANK": 400, "BHARTIARTL": 500, "ITC": 3200,
+        "BAJFINANCE": 125, "WIPRO": 1500, "HCLTECH": 350,
+        "TATAMOTORS": 1425, "MARUTI": 100,
+        "SUNPHARMA": 350, "TITAN": 175, "ADANIENT": 400, "ONGC": 1925,
+        "NTPC": 2250, "JSWSTEEL": 600, "TATASTEEL": 5500, "HINDALCO": 1075,
+        "DRREDDY": 125, "CIPLA": 650, "DIVISLAB": 200,
+        "BAJAJ-AUTO": 75, "HEROMOTOCO": 150, "EICHERMOT": 175,
+        "M&M": 350, "TECHM": 600, "INDUSINDBK": 500,
+        "POWERGRID": 2400, "COALINDIA": 1400, "VEDL": 1550, "SAIL": 6750,
+    },
+    "lot_size_fallback": 500,
+    "pop_simulations": 10000,
+    # ── Intraday candle windows ───────────────────────────────────────────────
+    # All window sizes as trading parameters, not magic numbers.
+    # 5-minute candles: 6 candles = 30 min, 3 candles = 15 min, 18 candles = 90 min
+    "intra_interval":         "5minute",   # Upstox candle interval
+    "intra_opening_candles":  6,           # 30-min opening window (6 × 5-min candles)
+    "intra_recent_candles":   6,           # 30-min recent window for vol acceleration
+    "intra_structure_candles":3,           # candles for price structure early/late comparison
+    "intra_lunch_candle_start": 14,        # candle index ~12:30 IST (14 × 5-min from open)
+    "intra_lunch_candle_morn":  5,         # candle index ~end of first hour (~09:55)
+    "intra_min_candles_vol":  6,           # min candles needed for vol acceleration signal
+    "intra_min_candles_struct":6,          # min candles needed for price structure signal
+    "intra_min_candles_lunch": 18,         # min candles needed for lunch reversal (~90 min)
+    "intra_min_candles":       2,          # absolute minimum to compute any signal
 }
+
+# ============================================================
+# ADAPTIVE PARAMETER ENGINE
+# All mixing weights, scale factors, and thresholds are learned
+# from historical signal→return correlations stored in session state.
+# Hard-coded constants are replaced by data-driven calibration with
+# principled priors used only as cold-start seeds.
+# ============================================================
+
+# ── Cold-start priors (used ONLY before enough data accumulates) ──────────────
+# Every prior is a single interpretable number that gets overwritten by data.
+_PRIOR = {
+    # Sub-model internal mixing weights (sum to 1.0 within each group)
+    "trend_ema_vs_adx":       0.60,   # weight of EMA structure vs ADX within trend factor
+    "momentum_rsi_vs_ret5":   0.50,   # RSI vs 5-day return within momentum
+    "vol_bb_vs_atr":          0.60,   # BB regime vs ATR regime within vol factor
+    "positioning_pcr_vs_oi_vs_mp": [0.40, 0.35, 0.25],  # PCR : OI-skew : max-pain
+    "rs_level_vs_slope":      0.70,   # RS level vs RS slope within rel-strength
+    "trend_combined_trend_vs_momentum": 0.60,   # combined trend: trend_score vs momentum
+    # Regime pillars
+    "regime_adx_vs_gex":      0.60,   # ADX vs GEX within trend_axis
+    "regime_iv_vs_hv_accel":  0.55,   # IV pct vs HV accel within vol_axis
+    "regime_conf_iv":         0.30,   # confidence: weight of IV pillar
+    "regime_conf_adx":        0.30,   # confidence: weight of ADX pillar
+    "regime_conf_hv":         0.25,   # confidence: weight of HV accel pillar
+    "regime_conf_gex":        0.15,   # confidence: weight of GEX pillar
+    # Composite EV score weights
+    "ev_score_vs_dir_align":  0.60,   # ev_score vs directional alignment in composite
+    # Within-factor RS decomposition
+    "rs_z_vs_slope":          0.70,
+    # Logistic sharpness for prob_up conversion
+    "logistic_sharpness":     4.0,    # raw_score × sharpness → logistic input
+    # Sigmoid sharpness for safety factor
+    "safety_sigmoid_sharpness": 2.0,
+    # Tanh scale for term structure bonus
+    "ts_tanh_scale":          20.0,   # ts_slope × scale
+    # Tanh scale for EV normalisation: ev / (max_risk × ev_tanh_scale)
+    "ev_tanh_scale":          0.50,
+    # Max-pain gravity dampening (mp_dist_em × gravity → clamp)
+    "mp_gravity":             0.40,
+    # Vol-regime dampening: expensive vol → bearish lean, coefficient
+    "vol_regime_damp":        0.50,
+    # Term-structure z-score scale (pp of slope → z-score)
+    "ts_slope_scale":         20.0,
+    # RS slope scale
+    "rs_slope_scale":         50.0,
+    # HV accel tanh stretch
+    "hv_accel_stretch":       3.0,
+    # ADX weak-trend fraction of trend level
+    "adx_weak_frac":          0.75,
+    "adx_vs_rsi_within_trend": 0.75,   # fraction of non-EMA portion going to ADX vs RSI
+    # MC blend weight (MC direction vs factor direction)
+    "mc_blend":               0.50,
+    # Liquidity composite weights
+    "liq_spread_w":           0.50,
+    "liq_oi_w":               0.30,
+    "liq_vol_w":              0.20,
+    # std floor as fraction of mean (for dOI/dPCR z-score denominators)
+    "std_floor_frac":         0.05,
+    # ── Intraday signal weights ───────────────────────────────────────────────
+    # Opening 30-min momentum is the strongest NSE intraday signal.
+    # VWAP position is second. Volume acceleration and OI build are supporting.
+    "intra_w_opening_momentum":    0.30,   # first 30-min directional thrust
+    "intra_w_vwap_position":       0.25,   # spot vs VWAP
+    "intra_w_volume_acceleration": 0.20,   # recent 30-min vol vs session average
+    "intra_w_oi_build":            0.15,   # net CE vs PE OI change direction
+    "intra_w_price_structure":     0.07,   # higher highs / lower lows
+    "intra_w_lunch_reversal":      0.03,   # post-lunch reversal signal
+    # Weight of intraday score in final directional blend
+    "intra_blend_weight":          0.20,   # 20% intraday, 80% factor+MC by default
+}
+
+_CALIB_STORE_KEY = "monarch_calib"   # session_state key for persisted calibration
+_CALIB_FILE      = ".monarch_calib.json"   # disk path — survives restarts
+_CALIB_MIN_OBS   = 15                # minimum paired observations before overriding prior
+_CALIB_WINDOW    = 252               # rolling window for correlation computation
+
+
+def _load_calib() -> dict:
+    """Load persisted calibration from disk. Returns {} on any error."""
+    try:
+        if os.path.exists(_CALIB_FILE):
+            with open(_CALIB_FILE, "r") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def _save_calib(d: dict):
+    """Persist calibration dict to disk. Silent on failure."""
+    try:
+        with open(_CALIB_FILE, "w") as f:
+            json.dump(d, f, indent=2)
+    except Exception:
+        pass
+
+
+def _get_calib(symbol: str = "") -> dict:
+    """Return the calibration dict for the given symbol.
+    Falls back to a cross-symbol 'global' store for any missing key.
+    On first call per session, loads from disk.
+    """
+    if _CALIB_STORE_KEY not in st.session_state:
+        st.session_state[_CALIB_STORE_KEY] = _load_calib()
+    store = st.session_state.get(_CALIB_STORE_KEY, {})
+    sym_key = symbol.upper() if symbol else "_global"
+    # Symbol-specific dict, falling back to global, falling back to empty
+    sym_calib    = store.get(sym_key, {})
+    global_calib = store.get("_global", {})
+    # Merge: symbol-specific overrides global overrides prior
+    merged = {**global_calib, **sym_calib}
+    return merged
+
+
+def _set_calib(key: str, value, symbol: str = ""):
+    """Write a calibrated value for a symbol (or globally if symbol='')."""
+    if _CALIB_STORE_KEY not in st.session_state:
+        st.session_state[_CALIB_STORE_KEY] = _load_calib()
+    store  = st.session_state[_CALIB_STORE_KEY]
+    sym_key = symbol.upper() if symbol else "_global"
+    if sym_key not in store:
+        store[sym_key] = {}
+    store[sym_key][key] = value
+    st.session_state[_CALIB_STORE_KEY] = store
+    _save_calib(store)
+
+
+def _calib(key: str, symbol: str = None) -> float:
+    """Look up a calibrated scalar parameter for a symbol.
+    If symbol is None, auto-reads opt_symbol from session state.
+    Returns the data-driven value if available, otherwise the prior.
+    """
+    sym = symbol if symbol is not None else st.session_state.get("opt_symbol", "")
+    return float(_get_calib(sym).get(key, _PRIOR[key]))
+
+
+def _calib_vec(key: str, symbol: str = None) -> list:
+    """Look up a calibrated vector parameter for a symbol.
+    If symbol is None, auto-reads opt_symbol from session state.
+    Returns the data-driven value if available, otherwise the prior list.
+    Returned list is always L1-normalised.
+    """
+    sym = symbol if symbol is not None else st.session_state.get("opt_symbol", "")
+    v   = _get_calib(sym).get(key, _PRIOR[key])
+    arr = [float(x) for x in v]
+    s   = sum(arr)
+    return [x / s for x in arr] if s > 1e-9 else [1.0 / len(arr)] * len(arr)
+
+
+def _update_scalar_calib(key: str, signal_hist: list, outcome_hist: list,
+                          transform=None, symbol: str = ""):
+    """Learn the optimal scale/weight for `key` via OLS on (signal → outcome).
+    Symbol-specific: stores result under `symbol` key so each instrument
+    learns its own relationships independently.
+    """
+    if len(signal_hist) < _CALIB_MIN_OBS or len(outcome_hist) < _CALIB_MIN_OBS:
+        return
+    n = min(len(signal_hist), len(outcome_hist), _CALIB_WINDOW)
+    x = np.array(signal_hist[-n:], dtype=float)
+    y = np.array(outcome_hist[-n:], dtype=float)
+    if transform is not None:
+        x = np.array([transform(v) for v in x])
+    mask = np.isfinite(x) & np.isfinite(y)
+    x, y = x[mask], y[mask]
+    if len(x) < _CALIB_MIN_OBS:
+        return
+    xx = float(np.dot(x, x))
+    if xx < 1e-12:
+        return
+    w_ols = float(np.dot(x, y)) / xx
+    prior_val = _PRIOR.get(key, 0.5)
+    shrink = max(0.0, 1.0 - (len(x) - _CALIB_MIN_OBS) / _CALIB_WINDOW)
+    w_blended = (1.0 - shrink) * w_ols + shrink * prior_val
+    if isinstance(prior_val, float) and 0.0 <= prior_val <= 1.0:
+        w_blended = max(0.05, min(0.95, w_blended))
+    else:
+        w_blended = max(prior_val * 0.1, min(prior_val * 10.0, w_blended))
+    _set_calib(key, round(w_blended, 6), symbol)
+
+
+def _update_vec_calib(key: str, signal_matrix: np.ndarray, outcome_hist: list,
+                       symbol: str = ""):
+    """Learn optimal mixing weights for a vector of signals via regularised OLS.
+    Symbol-specific: stores result under `symbol` key.
+    """
+    if len(outcome_hist) < _CALIB_MIN_OBS:
+        return
+    n = min(signal_matrix.shape[0], len(outcome_hist), _CALIB_WINDOW)
+    X = signal_matrix[-n:].astype(float)
+    y = np.array(outcome_hist[-n:], dtype=float)
+    mask = np.all(np.isfinite(X), axis=1) & np.isfinite(y)
+    X, y = X[mask], y[mask]
+    if len(X) < _CALIB_MIN_OBS:
+        return
+    lam = 0.1
+    XtX = X.T @ X + lam * np.eye(X.shape[1])
+    Xty = X.T @ y
+    try:
+        w = np.linalg.solve(XtX, Xty)
+    except np.linalg.LinAlgError:
+        return
+    w = np.abs(w)
+    prior_arr = np.array(_PRIOR.get(key, [1.0 / X.shape[1]] * X.shape[1]), dtype=float)
+    shrink = max(0.0, 1.0 - (len(X) - _CALIB_MIN_OBS) / _CALIB_WINDOW)
+    w = (1.0 - shrink) * w + shrink * (prior_arr / prior_arr.sum())
+    w = np.clip(w, 0.01, None)
+    w = w / w.sum()
+    _set_calib(key, [round(float(v), 6) for v in w], symbol)
+
+
+def _run_calibration_cycle(ohlcv_df, symbol: str = "", horizon: int = 4):
+    """Top-level calibration dispatcher.
+    Called once per LOAD after outcomes are resolved.
+    Uses real forward returns from resolved signal snapshots as the primary
+    training signal. Falls back to OHLCV-derived forward returns when
+    insufficient resolved outcomes exist.
+    Each parameter is calibrated independently using its own signal/outcome pair.
+    """
+    sym = symbol.upper() if symbol else ""
+
+    # ── Primary outcome series: real resolved returns ─────────────────────────
+    # These are log(spot_t+horizon / spot_t) computed from actual market prices
+    # against signals recorded at time t. This is the correct closed-loop feedback.
+    real_ret_hist = _get_hist("_calib_realised_ret_hist", sym)
+
+    # ── Fallback: OHLCV-derived forward returns (no look-ahead gap enforced) ──
+    # Used only when real_ret_hist has fewer than _CALIB_MIN_OBS entries.
+    ohlcv_fwd_ret = []
+    if len(real_ret_hist) < _CALIB_MIN_OBS:
+        if ohlcv_df is not None and not ohlcv_df.empty and len(ohlcv_df) >= horizon + _CALIB_MIN_OBS + 5:
+            c = ohlcv_df["close"].astype(float).reset_index(drop=True)
+            ohlcv_fwd_ret = list(np.log(c.shift(-horizon) / c).dropna().values)
+
+    # Choose which outcome series to use
+    fwd_ret = real_ret_hist if len(real_ret_hist) >= _CALIB_MIN_OBS else ohlcv_fwd_ret
+    if len(fwd_ret) < _CALIB_MIN_OBS:
+        return   # not enough data to calibrate anything
+
+    fwd_ret = list(fwd_ret)
+
+    # Helper: retrieve per-symbol history, fall back to global
+    def H(key): return _get_hist(key, sym)
+
+    # ── 1. Logistic sharpness ──────────────────────────────────────────────────
+    _update_scalar_calib("logistic_sharpness", H("_calib_raw_score_hist"), fwd_ret,
+                          transform=lambda x: 1 / (1 + math.exp(-max(-20, min(20, x)))),
+                          symbol=sym)
+
+    # ── 2. EV vs direction blend ───────────────────────────────────────────────
+    ev_h   = H("_calib_ev_score_hist")
+    dir_h  = H("_calib_dir_align_hist")
+    n_ed   = min(len(ev_h), len(dir_h), len(fwd_ret))
+    if n_ed >= _CALIB_MIN_OBS:
+        X_ed = np.column_stack([ev_h[-n_ed:], dir_h[-n_ed:]])
+        _update_vec_calib("ev_score_vs_dir_align_vec", X_ed, fwd_ret[-n_ed:], symbol=sym)
+        vec = _calib_vec("ev_score_vs_dir_align_vec", sym)
+        if len(vec) == 2:
+            _set_calib("ev_score_vs_dir_align", round(vec[0], 6), sym)
+
+    # ── 3. Positioning sub-weights ─────────────────────────────────────────────
+    pcr_h = H("_calib_pcr_level_hist")
+    oi_h  = H("_calib_oi_skew_hist")
+    mp_h  = H("_calib_mp_z_hist")
+    n_pos = min(len(pcr_h), len(oi_h), len(mp_h), len(fwd_ret))
+    if n_pos >= _CALIB_MIN_OBS:
+        X_pos = np.column_stack([pcr_h[-n_pos:], oi_h[-n_pos:], mp_h[-n_pos:]])
+        _update_vec_calib("positioning_pcr_vs_oi_vs_mp", X_pos, fwd_ret[-n_pos:], symbol=sym)
+
+    # ── 4. Vol-regime sub-weights ──────────────────────────────────────────────
+    vrz_h = H("_calib_vol_regime_z_hist")
+    tsz_h = H("_calib_term_slope_z_hist")
+    n_vr  = min(len(vrz_h), len(tsz_h), len(fwd_ret))
+    if n_vr >= _CALIB_MIN_OBS:
+        X_vr = np.column_stack([vrz_h[-n_vr:], tsz_h[-n_vr:]])
+        _update_vec_calib("vol_regime_z_vs_ts", X_vr, fwd_ret[-n_vr:], symbol=sym)
+        vec2 = _calib_vec("vol_regime_z_vs_ts", sym)
+        if len(vec2) == 2:
+            _set_calib("vol_bb_vs_atr", round(vec2[0], 6), sym)
+
+    # ── 5. RS level vs slope ───────────────────────────────────────────────────
+    rs_lev_h = H("_calib_rs_z_hist")
+    rs_slp_h = H("_calib_rs_slope_hist")
+    n_rs     = min(len(rs_lev_h), len(rs_slp_h), len(fwd_ret))
+    if n_rs >= _CALIB_MIN_OBS:
+        X_rs = np.column_stack([rs_lev_h[-n_rs:], rs_slp_h[-n_rs:]])
+        _update_vec_calib("rs_level_vs_slope_vec", X_rs, fwd_ret[-n_rs:], symbol=sym)
+        vec_rs = _calib_vec("rs_level_vs_slope_vec", sym)
+        if len(vec_rs) == 2:
+            _set_calib("rs_level_vs_slope", round(vec_rs[0], 6), sym)
+
+    # ── 6. MC blend weight ─────────────────────────────────────────────────────
+    mc_h  = H("_calib_mc_dir_hist")
+    fac_h = H("_calib_fac_dir_hist")
+    n_mc  = min(len(mc_h), len(fac_h), len(fwd_ret))
+    if n_mc >= _CALIB_MIN_OBS:
+        X_mc = np.column_stack([mc_h[-n_mc:], fac_h[-n_mc:]])
+        _update_vec_calib("mc_blend_vec", X_mc, fwd_ret[-n_mc:], symbol=sym)
+        vec_mc = _calib_vec("mc_blend_vec", sym)
+        if len(vec_mc) == 2:
+            _set_calib("mc_blend", round(vec_mc[0], 6), sym)
+
+    # ── 7. Safety sigmoid sharpness ────────────────────────────────────────────
+    safe_h = H("_calib_safety_ratio_hist")
+    # Use real return as proxy for safety quality (safe positions → better returns)
+    n_sf   = min(len(safe_h), len(fwd_ret))
+    if n_sf >= _CALIB_MIN_OBS:
+        _update_scalar_calib("safety_sigmoid_sharpness", safe_h[-n_sf:], fwd_ret[-n_sf:],
+                              transform=lambda x: max(0.0, x - 1.0), symbol=sym)
+
+    # ── 8. Term-structure tanh scale ───────────────────────────────────────────
+    ts_slp_h = H("_calib_ts_slope_raw_hist")
+    n_ts     = min(len(ts_slp_h), len(fwd_ret))
+    if n_ts >= _CALIB_MIN_OBS:
+        _update_scalar_calib("ts_tanh_scale", ts_slp_h[-n_ts:], fwd_ret[-n_ts:], symbol=sym)
+
+    # ── 9. HV accel stretch ────────────────────────────────────────────────────
+    hva_h = H("_calib_hv_accel_raw_hist")
+    n_hv  = min(len(hva_h), len(fwd_ret))
+    if n_hv >= _CALIB_MIN_OBS:
+        _update_scalar_calib("hv_accel_stretch", hva_h[-n_hv:], fwd_ret[-n_hv:], symbol=sym)
+
+    # ── 10. Max-pain gravity ────────────────────────────────────────────────────
+    mp_raw_h = H("_calib_mp_dist_raw_hist")
+    n_mp     = min(len(mp_raw_h), len(fwd_ret))
+    if n_mp >= _CALIB_MIN_OBS:
+        _update_scalar_calib("mp_gravity", [-v for v in mp_raw_h[-n_mp:]], fwd_ret[-n_mp:],
+                              symbol=sym)
+
+    # ── 11. Regime pillar confidence weights ────────────────────────────────────
+    iv_ph  = H("_calib_iv_pillar_hist")
+    adx_ph = H("_calib_adx_pillar_hist")
+    hva_ph = H("_calib_hva_pillar_hist")
+    gex_ph = H("_calib_gex_pillar_hist")
+    n_rp   = min(len(iv_ph), len(adx_ph), len(hva_ph), len(gex_ph), len(fwd_ret))
+    if n_rp >= _CALIB_MIN_OBS:
+        X_rp = np.column_stack([
+            np.abs(iv_ph[-n_rp:]), np.abs(adx_ph[-n_rp:]),
+            np.abs(hva_ph[-n_rp:]),np.abs(gex_ph[-n_rp:]),
+        ])
+        _update_vec_calib("regime_conf_pillars", X_rp,
+                          list(np.abs(fwd_ret[-n_rp:])), symbol=sym)
+        vrc = _calib_vec("regime_conf_pillars", sym)
+        if len(vrc) == 4:
+            for k, v in zip(["regime_conf_iv","regime_conf_adx",
+                              "regime_conf_hv","regime_conf_gex"], vrc):
+                _set_calib(k, round(v, 6), sym)
+
+    # ── 12. Trend EMA vs ADX ────────────────────────────────────────────────────
+    ema_h = H("_calib_ema_score_hist")
+    adx_h = H("_calib_adx_score_hist")
+    n_tr  = min(len(ema_h), len(adx_h), len(fwd_ret))
+    if n_tr >= _CALIB_MIN_OBS:
+        X_tr = np.column_stack([ema_h[-n_tr:], adx_h[-n_tr:]])
+        _update_vec_calib("trend_ema_vs_adx_vec", X_tr, fwd_ret[-n_tr:], symbol=sym)
+        vtr = _calib_vec("trend_ema_vs_adx_vec", sym)
+        if len(vtr) == 2:
+            _set_calib("trend_ema_vs_adx", round(vtr[0], 6), sym)
+
+    # ── 13. ADX vs RSI within trend ────────────────────────────────────────────
+    rsi_h2 = H("_calib_rsi_trend_hist")
+    n_ar   = min(len(adx_h), len(rsi_h2), len(fwd_ret))
+    if n_ar >= _CALIB_MIN_OBS:
+        X_ar = np.column_stack([adx_h[-n_ar:], rsi_h2[-n_ar:]])
+        _update_vec_calib("adx_vs_rsi_vec", X_ar, fwd_ret[-n_ar:], symbol=sym)
+        var = _calib_vec("adx_vs_rsi_vec", sym)
+        if len(var) == 2:
+            _set_calib("adx_vs_rsi_within_trend", round(var[0], 6), sym)
+
+    # ── 14. Intraday signal weights ─────────────────────────────────────────────
+    _intra_keys = [
+        "_calib_intra_opening_momentum_hist",
+        "_calib_intra_vwap_position_hist",
+        "_calib_intra_volume_acceleration_hist",
+        "_calib_intra_oi_build_hist",
+        "_calib_intra_price_structure_hist",
+        "_calib_intra_lunch_reversal_hist",
+    ]
+    _intra_hists = [H(k) for k in _intra_keys]
+    _n_intra = min(min(len(h) for h in _intra_hists), len(fwd_ret))
+    if _n_intra >= _CALIB_MIN_OBS:
+        X_intra = np.column_stack([h[-_n_intra:] for h in _intra_hists])
+        _update_vec_calib("intra_weights_vec", X_intra, fwd_ret[-_n_intra:], symbol=sym)
+        v_intra = _calib_vec("intra_weights_vec", sym)
+        _intra_param_keys = [
+            "intra_w_opening_momentum", "intra_w_vwap_position",
+            "intra_w_volume_acceleration", "intra_w_oi_build",
+            "intra_w_price_structure", "intra_w_lunch_reversal",
+        ]
+        if len(v_intra) == len(_intra_param_keys):
+            for pk, wv in zip(_intra_param_keys, v_intra):
+                _set_calib(pk, round(wv, 6), sym)
+
+    # ── 15. Intraday blend weight ─────────────────────────────────────────────
+    intra_score_h = H("_calib_intraday_score_hist")
+    n_ib = min(len(intra_score_h), len(fwd_ret))
+    if n_ib >= _CALIB_MIN_OBS:
+        # Calibrate the blend weight: how much does intraday improve over factor-only?
+        factor_h = H("_calib_raw_score_hist")
+        n_blend  = min(len(intra_score_h), len(factor_h), len(fwd_ret))
+        if n_blend >= _CALIB_MIN_OBS:
+            X_blend = np.column_stack([factor_h[-n_blend:], intra_score_h[-n_blend:]])
+            _update_vec_calib("intra_blend_vec", X_blend, fwd_ret[-n_blend:], symbol=sym)
+            v_blend = _calib_vec("intra_blend_vec", sym)
+            if len(v_blend) == 2:
+                # intra_blend_weight = fraction of total weight going to intraday
+                _set_calib("intra_blend_weight", round(v_blend[1], 6), sym)
+
+
+def _record(key: str, val: float, symbol: str = None):
+    """Append a scalar observation to a calibration history list.
+    If symbol is None, auto-reads opt_symbol from session state.
+    Keeps the last _CALIB_WINDOW entries.
+    """
+    sym    = symbol if symbol is not None else st.session_state.get("opt_symbol", "")
+    ns_key = f"{sym.upper()}:{key}" if sym else key
+    hist   = st.session_state.get(ns_key, [])
+    hist.append(float(val))
+    if len(hist) > _CALIB_WINDOW:
+        hist = hist[-_CALIB_WINDOW:]
+    st.session_state[ns_key] = hist
+
+
+def _get_hist(key: str, symbol: str = "") -> list:
+    """Retrieve a signal history list, trying symbol-specific first then global."""
+    if symbol:
+        ns = st.session_state.get(f"{symbol.upper()}:{key}", [])
+        if ns:
+            return ns
+    return st.session_state.get(key, [])
+
+
+def _record_outcome(symbol: str, signal_snapshot: dict, horizon_days: int = 4):
+    """Record a signal snapshot with its entry price so forward returns can be
+    computed when the next load happens.  Stored in a per-symbol pending queue.
+    Called at every LOAD; resolved at the NEXT load of the same symbol.
+
+    signal_snapshot must contain: raw_score, flow_score, mc_direction,
+    factor_direction, ev_score, dir_align, safety_ratio, ts_slope,
+    pcr_level_z, oi_skew_z, mp_z, vol_regime_z, term_slope_z,
+    rs_z, rs_slope_z, ema_score, adx_score, rsi_z,
+    iv_pillar, adx_pillar, hv_accel_pillar, gex_pillar.
+    """
+    key = f"_outcome_pending_{symbol.upper()}"
+    pending = st.session_state.get(key, [])
+    pending.append({
+        "ts":            datetime.now().isoformat(timespec="seconds"),
+        "spot":          signal_snapshot.get("spot", 0.0),
+        "horizon":       horizon_days,
+        **{k: float(v) for k, v in signal_snapshot.items()
+           if k != "spot" and isinstance(v, (int, float))}
+    })
+    # Keep last 100 pending entries
+    st.session_state[key] = pending[-100:]
+
+
+def _resolve_outcomes(symbol: str, current_spot: float, ohlcv_df) -> list:
+    """Resolve pending signal snapshots by computing realised forward returns.
+    Called at LOAD time. For each pending entry whose horizon has elapsed,
+    compute log(current_spot / entry_spot) and pair it with all stored signals.
+    Returns list of resolved (signal_dict, realised_return) pairs.
+    Removes resolved entries from the pending queue.
+    """
+    key     = f"_outcome_pending_{symbol.upper()}"
+    pending = st.session_state.get(key, [])
+    if not pending:
+        return []
+
+    # Use OHLCV close prices for accurate forward returns when available
+    if ohlcv_df is not None and not ohlcv_df.empty:
+        closes = ohlcv_df["close"].astype(float).values
+    else:
+        closes = None
+
+    resolved  = []
+    remaining = []
+    today     = datetime.now().date()
+
+    for entry in pending:
+        try:
+            entry_date = datetime.fromisoformat(entry["ts"]).date()
+            elapsed    = int(np.busday_count(entry_date.isoformat(), today.isoformat()))
+            horizon    = int(entry.get("horizon", 4))
+
+            if elapsed >= horizon:
+                entry_spot = float(entry.get("spot", 0))
+                if entry_spot <= 0:
+                    continue  # can't compute return without entry spot
+
+                # Use actual close price elapsed sessions later if OHLCV available
+                if closes is not None and elapsed <= len(closes):
+                    realised_ret = float(np.log(closes[-1] / entry_spot))
+                else:
+                    realised_ret = float(np.log(current_spot / entry_spot))
+
+                resolved.append((entry, realised_ret))
+            else:
+                remaining.append(entry)
+        except Exception:
+            remaining.append(entry)
+
+    st.session_state[key] = remaining
+    return resolved
+
+
+def _ingest_resolved_outcomes(symbol: str, resolved_pairs: list):
+    """Feed resolved (signal, return) pairs into signal history buffers
+    so the calibration cycle can train on real outcomes.
+    This is the core feedback loop: market reality → calibration.
+    """
+    for entry, ret in resolved_pairs:
+        sym = symbol.upper()
+        _record("_calib_raw_score_hist",   entry.get("raw_score",   0.0), sym)
+        _record("_calib_ev_score_hist",    entry.get("ev_score",    0.0), sym)
+        _record("_calib_dir_align_hist",   entry.get("dir_align",   0.5), sym)
+        _record("_calib_pcr_level_hist",   entry.get("pcr_level_z", 0.0), sym)
+        _record("_calib_oi_skew_hist",     entry.get("oi_skew_z",   0.0), sym)
+        _record("_calib_mp_z_hist",        entry.get("mp_z",        0.0), sym)
+        _record("_calib_vol_regime_z_hist",entry.get("vol_regime_z",0.0), sym)
+        _record("_calib_term_slope_z_hist",entry.get("term_slope_z",0.0), sym)
+        _record("_calib_rs_z_hist",        entry.get("rs_z",        0.0), sym)
+        _record("_calib_rs_slope_hist",    entry.get("rs_slope_z",  0.0), sym)
+        _record("_calib_ema_score_hist",   entry.get("ema_score",   0.0), sym)
+        _record("_calib_adx_score_hist",   entry.get("adx_score",   0.0), sym)
+        _record("_calib_rsi_trend_hist",   entry.get("rsi_z",       0.0), sym)
+        _record("_calib_mc_dir_hist",      entry.get("mc_direction",0.0), sym)
+        _record("_calib_fac_dir_hist",     entry.get("factor_direction",0.0), sym)
+        _record("_calib_iv_pillar_hist",   entry.get("iv_pillar",   0.0), sym)
+        _record("_calib_adx_pillar_hist",  entry.get("adx_pillar",  0.0), sym)
+        _record("_calib_hva_pillar_hist",  entry.get("hv_accel_pillar", 0.0), sym)
+        _record("_calib_gex_pillar_hist",  entry.get("gex_pillar",  0.0), sym)
+        # Record the realised return itself as a forward return observation
+        _record("_calib_realised_ret_hist", ret, sym)
+
+
+# ── Statistical helpers ────────────────────────────────────────────────────────
+
+def _zscore_clamp(series, current_val, clamp=3.0):
+    """Return z-score of current_val in series, clamped to [-clamp, +clamp].
+    Returns 0.0 when series is too short (< 5) or std ≈ 0.
+    The clamp is adaptive: uses the 99th percentile of abs(z) in history
+    rather than the fixed value of 3.0, once enough data accumulates.
+    """
+    s = pd.Series(series).dropna()
+    if len(s) < 5:
+        return 0.0
+    mu, sd = float(s.mean()), float(s.std())
+    if sd < 1e-9:
+        return 0.0
+    z = (current_val - mu) / sd
+    # Adaptive clamp: 99th percentile of |z| in history (replaces fixed 3.0)
+    if len(s) >= 30:
+        adaptive_clamp = float(np.percentile(np.abs((s - mu) / sd), 99))
+        clamp = max(2.0, min(5.0, adaptive_clamp))
+    return float(max(-clamp, min(clamp, z)))
+
+
+def _percentile_score(series, current_val):
+    """Return what fraction of `series` is <= current_val (0.0–1.0).
+    Returns 0.5 when series is too short (< 3).
+    """
+    s = pd.Series(series).dropna()
+    if len(s) < 3:
+        return 0.5
+    return float((s <= current_val).mean())
+
+
+def _rolling_zscore(series_full, window=252):
+    """Given a pandas Series, compute rolling z-score using a trailing window."""
+    s = pd.Series(series_full).dropna()
+    if len(s) < 5:
+        return 0.0
+    tail = s.tail(window)
+    mu, sd = float(tail.mean()), float(tail.std())
+    if sd < 1e-9:
+        return 0.0
+    return float((float(s.iloc[-1]) - mu) / sd)
+
+
+def _normalise_to_signal(raw: float, hist_key: str, record: bool = True) -> float:
+    """Convert any raw value to a [-1, +1] signal using its own rolling distribution.
+    Uses rank-based normalisation (percentile → [-1,+1]) so the output is
+    always well-scaled regardless of the raw value's unit or magnitude.
+    Automatically records the value into `hist_key` for future calibration.
+    """
+    hist = st.session_state.get(hist_key, [])
+    if record:
+        hist.append(float(raw))
+        if len(hist) > _CALIB_WINDOW:
+            hist = hist[-_CALIB_WINDOW:]
+        st.session_state[hist_key] = hist
+    if len(hist) < 3:
+        return 0.0
+    pct = _percentile_score(hist, float(raw))
+    return float(2.0 * pct - 1.0)   # maps [0,1] percentile → [-1,+1]
 
 # ── Bloomberg Terminal Theme ──────────────────────────────────
 st.markdown("""
@@ -73,20 +756,20 @@ html, body, [data-testid="stAppViewContainer"], [data-testid="stMain"],
     border-right: 1px solid var(--bb-border) !important;
 }
 [data-testid="stSidebar"] * { color: var(--bb-white) !important; font-family: 'IBM Plex Mono', monospace !important; }
-[data-testid="stSidebar"] label { color: var(--bb-muted) !important; font-size: .65rem !important; }
+[data-testid="stSidebar"] label { color: var(--bb-muted) !important; font-size: .82rem !important; }
 [data-testid="stSidebar"] .stDivider, [data-testid="stSidebar"] hr { border-color: var(--bb-border) !important; }
 
 /* ── Typography ── */
 h1 { font-family: 'IBM Plex Mono', monospace !important; color: var(--bb-amber) !important;
-     font-size: 1.0rem !important; font-weight: 600 !important; letter-spacing: .15em !important;
+     font-size: 1.25rem !important; font-weight: 600 !important; letter-spacing: .15em !important;
      text-transform: uppercase !important; border-bottom: 1px solid var(--bb-amber) !important; padding-bottom: 4px !important; }
-h2 { color: var(--bb-amber2) !important; font-size: .85rem !important; letter-spacing: .1em !important; text-transform: uppercase !important; }
-h3 { color: var(--bb-white) !important; font-size: .78rem !important; letter-spacing: .08em !important; }
+h2 { color: var(--bb-amber2) !important; font-size: 1.05rem !important; letter-spacing: .1em !important; text-transform: uppercase !important; }
+h3 { color: var(--bb-white) !important; font-size: .96rem !important; letter-spacing: .08em !important; }
 p, li, span, div { font-family: 'IBM Plex Mono', monospace !important; }
 
 /* ── st.caption / small text ── */
 [data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] p,
-small, .stCaption, .caption { color: var(--bb-muted) !important; font-size: .62rem !important; }
+small, .stCaption, .caption { color: var(--bb-muted) !important; font-size: .80rem !important; }
 
 /* ── st.markdown prose text ── */
 [data-testid="stMarkdownContainer"], [data-testid="stMarkdownContainer"] p,
@@ -94,64 +777,64 @@ small, .stCaption, .caption { color: var(--bb-muted) !important; font-size: .62r
 [data-testid="stMarkdownContainer"] th {
     color: var(--bb-white) !important;
     font-family: 'IBM Plex Mono', monospace !important;
-    font-size: .72rem !important;
+    font-size: .90rem !important;
 }
 [data-testid="stMarkdownContainer"] strong { color: var(--bb-amber2) !important; }
 [data-testid="stMarkdownContainer"] code {
     background: #1a1400 !important; color: var(--bb-amber) !important;
-    padding: 1px 4px !important; border-radius: 0 !important; font-size: .68rem !important;
+    padding: 1px 4px !important; border-radius: 0 !important; font-size: .86rem !important;
 }
 [data-testid="stMarkdownContainer"] table { border-collapse: collapse !important; width: 100% !important; }
-[data-testid="stMarkdownContainer"] th { background: #1a1400 !important; color: var(--bb-amber) !important; border: 1px solid var(--bb-border) !important; padding: 4px 8px !important; font-size: .62rem !important; }
-[data-testid="stMarkdownContainer"] td { border: 1px solid var(--bb-border) !important; padding: 4px 8px !important; color: var(--bb-white) !important; font-size: .65rem !important; }
+[data-testid="stMarkdownContainer"] th { background: #1a1400 !important; color: var(--bb-amber) !important; border: 1px solid var(--bb-border) !important; padding: 5px 10px !important; font-size: .80rem !important; }
+[data-testid="stMarkdownContainer"] td { border: 1px solid var(--bb-border) !important; padding: 5px 10px !important; color: var(--bb-white) !important; font-size: .84rem !important; }
 
 /* ── Metrics ── */
 [data-testid="metric-container"] {
     background: var(--bb-surface) !important; border: 1px solid var(--bb-border) !important;
-    border-left: 3px solid var(--bb-amber) !important; padding: 8px 12px !important; border-radius: 0 !important;
+    border-left: 3px solid var(--bb-amber) !important; padding: 10px 14px !important; border-radius: 0 !important;
 }
 [data-testid="metric-container"] label, [data-testid="stMetricLabel"],
-[data-testid="stMetricLabel"] p { color: var(--bb-muted) !important; font-size: .58rem !important; letter-spacing: .1em !important; text-transform: uppercase !important; }
-[data-testid="stMetricValue"], [data-testid="stMetricValue"] div { color: var(--bb-amber) !important; font-size: 1rem !important; font-weight: 600 !important; }
-[data-testid="stMetricDelta"] { font-size: .62rem !important; }
+[data-testid="stMetricLabel"] p { color: var(--bb-muted) !important; font-size: .76rem !important; letter-spacing: .1em !important; text-transform: uppercase !important; }
+[data-testid="stMetricValue"], [data-testid="stMetricValue"] div { color: var(--bb-amber) !important; font-size: 1.25rem !important; font-weight: 600 !important; }
+[data-testid="stMetricDelta"] { font-size: .80rem !important; }
 [data-testid="stMetricDelta"] svg { display: none !important; }
 
 /* ── DataFrames ── */
 [data-testid="stDataFrame"] { border: 1px solid var(--bb-border) !important; }
 [data-testid="stDataFrame"] *, .stDataFrame * { background-color: transparent !important; }
 [data-testid="stDataFrame"] [data-testid="stDataFrameResizable"] { background: var(--bb-surface) !important; }
-.stDataFrame thead tr th { background: #1a1400 !important; color: var(--bb-amber) !important; font-size: .62rem !important; letter-spacing: .1em !important; text-transform: uppercase !important; border-bottom: 1px solid var(--bb-amber) !important; }
-.stDataFrame tbody tr td { font-size: .68rem !important; color: var(--bb-white) !important; border-bottom: 1px solid #1a1a1a !important; background: var(--bb-surface) !important; }
+.stDataFrame thead tr th { background: #1a1400 !important; color: var(--bb-amber) !important; font-size: .80rem !important; letter-spacing: .1em !important; text-transform: uppercase !important; border-bottom: 1px solid var(--bb-amber) !important; }
+.stDataFrame tbody tr td { font-size: .86rem !important; color: var(--bb-white) !important; border-bottom: 1px solid #1a1a1a !important; background: var(--bb-surface) !important; }
 .stDataFrame tbody tr:hover td { background: #1a1400 !important; }
 /* Streamlit 1.x iframe-based dataframe */
 .stDataFrame iframe { background: var(--bb-surface) !important; }
 
 /* ── Buttons ── */
 .stButton > button { background: #1a1400 !important; color: var(--bb-amber) !important; border: 1px solid var(--bb-amber) !important;
-    border-radius: 0 !important; font-size: .7rem !important; letter-spacing: .1em !important; text-transform: uppercase !important; padding: 6px 14px !important; }
+    border-radius: 0 !important; font-size: .88rem !important; letter-spacing: .1em !important; text-transform: uppercase !important; padding: 7px 16px !important; }
 .stButton > button:hover { background: var(--bb-amber) !important; color: #000 !important; }
 .stButton > button:disabled { opacity: .4 !important; }
 
 /* ── Inputs: text, number, selectbox ── */
 .stSelectbox > div > div, .stTextInput > div > div, .stNumberInput > div > div {
     background: var(--bb-surface) !important; border: 1px solid var(--bb-border) !important;
-    border-radius: 0 !important; color: var(--bb-white) !important; font-size: .72rem !important; }
+    border-radius: 0 !important; color: var(--bb-white) !important; font-size: .90rem !important; }
 .stSelectbox label, .stTextInput label, .stNumberInput label {
-    color: var(--bb-muted) !important; font-size: .62rem !important; font-family: 'IBM Plex Mono', monospace !important; }
+    color: var(--bb-muted) !important; font-size: .80rem !important; font-family: 'IBM Plex Mono', monospace !important; }
 .stSelectbox div[data-baseweb="select"] > div { background: var(--bb-surface) !important; color: var(--bb-white) !important; }
 /* Dropdown popup list */
 ul[data-baseweb="menu"], [data-baseweb="popover"], [data-baseweb="popover"] li {
-    background: #1a1a1a !important; color: var(--bb-white) !important; font-family: 'IBM Plex Mono', monospace !important; font-size: .7rem !important; border: 1px solid var(--bb-border) !important; }
+    background: #1a1a1a !important; color: var(--bb-white) !important; font-family: 'IBM Plex Mono', monospace !important; font-size: .88rem !important; border: 1px solid var(--bb-border) !important; }
 [data-baseweb="option"]:hover { background: #1a1400 !important; }
 /* Number input spinners */
 .stNumberInput button { background: var(--bb-surface) !important; color: var(--bb-muted) !important; border: 1px solid var(--bb-border) !important; }
 input[type="number"], input[type="text"], input[type="password"] {
     background: var(--bb-surface) !important; color: var(--bb-white) !important;
-    border: 1px solid var(--bb-border) !important; font-family: 'IBM Plex Mono', monospace !important; font-size: .72rem !important; border-radius: 0 !important; }
+    border: 1px solid var(--bb-border) !important; font-family: 'IBM Plex Mono', monospace !important; font-size: .90rem !important; border-radius: 0 !important; }
 
 /* ── Tabs ── */
 .stTabs [data-baseweb="tab-list"] { background: var(--bb-surface) !important; border-bottom: 1px solid var(--bb-border) !important; gap: 0 !important; }
-.stTabs [data-baseweb="tab"] { background: transparent !important; color: var(--bb-muted) !important; font-size: .65rem !important; letter-spacing: .1em !important; text-transform: uppercase !important; border-radius: 0 !important; border-right: 1px solid var(--bb-border) !important; padding: 8px 14px !important; }
+.stTabs [data-baseweb="tab"] { background: transparent !important; color: var(--bb-muted) !important; font-size: .82rem !important; letter-spacing: .1em !important; text-transform: uppercase !important; border-radius: 0 !important; border-right: 1px solid var(--bb-border) !important; padding: 9px 16px !important; }
 .stTabs [aria-selected="true"] { background: #1a1400 !important; color: var(--bb-amber) !important; border-bottom: 2px solid var(--bb-amber) !important; }
 [data-testid="stTabContent"] { background: var(--bb-bg) !important; }
 
@@ -159,19 +842,15 @@ input[type="number"], input[type="text"], input[type="password"] {
 [data-testid="stExpander"] { background: var(--bb-surface) !important; border: 1px solid var(--bb-border) !important; border-radius: 0 !important; }
 [data-testid="stExpanderDetails"] { background: var(--bb-bg) !important; border-top: 1px solid var(--bb-border) !important; }
 
-/* ── EXPANDER ARROW OVERLAP FIX ──
-   Streamlit renders a Material Icons <span> with the ligature text "keyboard_arrow_down"
-   which bleeds into the label. Kill it via font-size:0 + display:none on every possible
-   selector, while keeping the label <p> fully visible.                                  */
+/* ── EXPANDER ARROW OVERLAP FIX ── */
 [data-testid="stExpander"] summary,
 [data-testid="stExpander"] details > summary {
     display: flex !important; align-items: center !important;
-    padding: 8px 12px !important; list-style: none !important;
+    padding: 9px 14px !important; list-style: none !important;
     cursor: pointer !important; overflow: hidden !important;
 }
 [data-testid="stExpander"] summary::-webkit-details-marker,
 [data-testid="stExpander"] summary::marker { display: none !important; }
-/* Zero-out the Material Icons span (the arrow ligature text) */
 [data-testid="stExpander"] summary span,
 [data-testid="stExpander"] summary > div > span,
 [data-testid="stExpander"] summary .material-icons,
@@ -183,7 +862,7 @@ input[type="number"], input[type="text"], input[type="password"] {
 /* Keep the actual label paragraph readable */
 [data-testid="stExpander"] summary p,
 [data-testid="stExpander"] summary > div > p {
-    font-size: 0.64rem !important; color: var(--bb-amber2) !important;
+    font-size: 0.82rem !important; color: var(--bb-amber2) !important;
     font-family: 'IBM Plex Mono', monospace !important; letter-spacing: 0.08em !important;
     text-transform: uppercase !important; visibility: visible !important;
     display: block !important; margin: 0 !important; overflow: visible !important;
@@ -198,7 +877,7 @@ input[type="number"], input[type="text"], input[type="password"] {
 hr, [data-testid="stDivider"] { border-color: var(--bb-border) !important; margin: 8px 0 !important; }
 [data-testid="stDivider"] hr { border-top: 1px solid var(--bb-border) !important; }
 /* ── Alerts ── */
-[data-testid="stAlert"] { background: var(--bb-surface) !important; border: 1px solid var(--bb-border) !important; color: var(--bb-white) !important; border-radius: 0 !important; font-size: .7rem !important; }
+[data-testid="stAlert"] { background: var(--bb-surface) !important; border: 1px solid var(--bb-border) !important; color: var(--bb-white) !important; border-radius: 0 !important; font-size: .88rem !important; }
 [data-testid="stAlert"] p { color: var(--bb-white) !important; }
 .stInfo { border-left: 3px solid var(--bb-blue) !important; }
 .stWarning { border-left: 3px solid var(--bb-amber) !important; }
@@ -212,62 +891,13 @@ hr, [data-testid="stDivider"] { border-color: var(--bb-border) !important; margi
 ::-webkit-scrollbar-thumb:hover { background: var(--bb-amber); }
 /* ── Hide Streamlit branding ── */
 #MainMenu, footer, [data-testid="stToolbar"], [data-testid="stDecoration"] { display: none !important; }
-
-/* ── HIDE keyboard_double_arrow_right ICON TEXT ──────────────────
-   stIconMaterial spans render icon names as text via Material Icons font.
-   Setting font-size:0 makes the text invisible without hiding buttons/SVGs.
-   This covers the sidebar collapse button AND page nav links. ── */
-[data-testid="stIconMaterial"] {
-    font-size: 0 !important;
-    line-height: 0 !important;
-    color: transparent !important;
-    overflow: hidden !important;
-    display: inline-block !important;
-    width: 0 !important;
-}
-
-/* ── FORCE SIDEBAR ALWAYS VISIBLE ────────────────────────────── */
-[data-testid="stSidebar"] {
-    display: block !important;
-    visibility: visible !important;
-    opacity: 1 !important;
-    transform: none !important;
-    min-width: 200px !important;
-}
-[data-testid="stSidebarCollapseButton"] {
-    display: flex !important;
-    visibility: visible !important;
-    opacity: 1 !important;
-}
-[data-testid="stSidebarCollapseButton"] svg {
-    display: block !important;
-    visibility: visible !important;
-    opacity: 1 !important;
-    width: 1rem !important;
-    height: 1rem !important;
-}
-
-/* ── PRICE DELTA COLORS ── */
-[data-testid="stMetricDeltaIcon-Up"]  { color: #00d084 !important; }
-[data-testid="stMetricDeltaIcon-Down"] { color: #ff3b3b !important; }
-[data-testid="stMetricDelta"]:has([data-testid="stMetricDeltaIcon-Up"]) span  { color: #00d084 !important; }
-[data-testid="stMetricDelta"]:has([data-testid="stMetricDeltaIcon-Down"]) span { color: #ff3b3b !important; }
-
-/* ── FONT SIZE INCREASES ── */
-[data-testid="stMetricValue"]   { font-size: 1.35rem !important; font-weight: 700 !important; }
-[data-testid="stMetricLabel"] p { font-size: 0.78rem !important; }
-[data-testid="stMetricDelta"]   { font-size: 0.82rem !important; }
-.stDataFrame thead tr th        { font-size: 0.80rem !important; }
-.stDataFrame tbody tr td        { font-size: 0.90rem !important; }
-.stButton > button              { font-size: 0.90rem !important; }
-
 </style>
 """, unsafe_allow_html=True)
 
 # Terminal header
 st.markdown("""
 <div style="background:#ff8c00;color:#000;font-family:'IBM Plex Mono',monospace;
-font-size:.62rem;font-weight:600;letter-spacing:.18em;padding:5px 14px;
+font-size:0.79rem;font-weight:600;letter-spacing:.18em;padding:5px 14px;
 display:flex;justify-content:space-between;margin-bottom:12px;">
   <span>◼ MONARCH OPTIONS INTELLIGENCE — NSE F&O</span>
   <span>OPTIONS · DERIVATIVES · STRATEGY ENGINE</span>
@@ -309,7 +939,51 @@ if not ACCESS_TOKEN:
     st.stop()
 
 # ============================================================
-# BLACK-SCHOLES ENGINE (pure Python, no scipy needed)
+# IV HISTORY PERSISTENCE — survives page restarts
+# ============================================================
+
+def _load_iv_history() -> dict:
+    """Load IV history dict {symbol: [iv_float, ...]} from disk.
+    Returns empty dict on any error."""
+    fp = CFG["iv_hist_file"]
+    try:
+        if os.path.exists(fp):
+            with open(fp, "r") as f:
+                data = json.load(f)
+            # Validate structure
+            if isinstance(data, dict):
+                return {k: [float(x) for x in v if isinstance(x, (int, float))]
+                        for k, v in data.items() if isinstance(v, list)}
+    except Exception:
+        pass
+    return {}
+
+def _save_iv_history(hist: dict):
+    """Persist IV history dict to disk. Silent on failure."""
+    try:
+        with open(CFG["iv_hist_file"], "w") as f:
+            json.dump(hist, f)
+    except Exception:
+        pass
+
+def _append_iv(symbol: str, iv: float):
+    """Append current ATM IV to the persistent history for a symbol.
+    Trims to CFG['iv_hist_max'] entries."""
+    hist = st.session_state.opt_iv_history
+    sym  = symbol.upper()
+    if sym not in hist:
+        hist[sym] = []
+    hist[sym].append(round(float(iv), 6))
+    if len(hist[sym]) > CFG["iv_hist_max"]:
+        hist[sym] = hist[sym][-CFG["iv_hist_max"]:]
+    st.session_state.opt_iv_history = hist
+    _save_iv_history(hist)
+
+# ============================================================
+# BLACK-SCHOLES ENGINE (pure Python, no scipy)
+# — Merton continuous-dividend form: q = annualised dividend yield
+# — Theta uses CFG["theta_days"] (252 trading days, not 365 calendar)
+# — T should always be trading-day fraction: use trading_t() below
 # ============================================================
 
 def _ncdf(x):
@@ -318,54 +992,408 @@ def _ncdf(x):
 def _npdf(x):
     return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
 
-def bs_price(S, K, T, r, sigma, opt="call"):
+def trading_t(expiry_date_str: str) -> float:
+    """Return time-to-expiry as trading-day fraction of a year.
+    Counts weekdays only between today and expiry — excludes weekends.
+    Uses CFG['ann_days'] as the annualisation base (252).
+    Returns at least 1/252 so T is never zero on expiry day itself."""
+    try:
+        exp = datetime.strptime(expiry_date_str, "%Y-%m-%d").date()
+        today = datetime.now().date()
+        if exp <= today:
+            return 1.0 / CFG["ann_days"]
+        # numpy busday_count counts Mon–Fri, which is conservative but correct
+        td = int(np.busday_count(today.isoformat(), exp.isoformat()))
+        td = max(td, 1)
+        return td / CFG["ann_days"]
+    except Exception:
+        return 7.0 / CFG["ann_days"]   # safe fallback: 7 trading days
+
+def _sanitise_iv(iv_raw: float, fallback: float) -> float:
+    """Normalise IV from API (may be percent-form >2 or decimal <1),
+    then clamp to [0.01, 5.0] (1% – 500% annualised).
+    Returns fallback if result is still invalid."""
+    if not iv_raw or iv_raw <= 0:
+        return fallback
+    iv = iv_raw / 100.0 if iv_raw > 2.0 else iv_raw
+    if iv < 0.01 or iv > 5.0:
+        return fallback
+    return iv
+
+def bs_price(S, K, T, r, sigma, opt="call", q=0.0):
+    """European BSM with continuous dividend yield q (Merton 1973).
+    q=0 is identical to the classic formula."""
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
         return max(S - K, 0) if opt == "call" else max(K - S, 0)
-    d1 = (math.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
+    F  = S * math.exp((r - q) * T)          # cost-of-carry forward price
+    d1 = (math.log(F / K) + 0.5 * sigma**2 * T) / (sigma * math.sqrt(T))
     d2 = d1 - sigma * math.sqrt(T)
+    df = math.exp(-r * T)                    # discount factor
     if opt == "call":
-        return S * _ncdf(d1) - K * math.exp(-r * T) * _ncdf(d2)
-    return K * math.exp(-r * T) * _ncdf(-d2) - S * _ncdf(-d1)
+        return math.exp(-q * T) * S * _ncdf(d1) - K * df * _ncdf(d2)
+    return K * df * _ncdf(-d2) - math.exp(-q * T) * S * _ncdf(-d1)
 
-def bs_greeks(S, K, T, r, sigma, opt="call"):
+def bs_greeks(S, K, T, r, sigma, opt="call", q=0.0):
+    """Greeks with dividend yield q and 252-trading-day theta."""
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
         return dict(delta=1.0 if opt=="call" else -1.0, gamma=0, theta=0, vega=0)
-    d1 = (math.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
-    d2 = d1 - sigma * math.sqrt(T)
+    sqrtT = math.sqrt(T)
+    F  = S * math.exp((r - q) * T)
+    d1 = (math.log(F / K) + 0.5 * sigma**2 * T) / (sigma * sqrtT)
+    d2 = d1 - sigma * sqrtT
     nd1 = _npdf(d1)
-    delta = _ncdf(d1) if opt == "call" else _ncdf(d1) - 1
-    gamma = nd1 / (S * sigma * math.sqrt(T))
-    theta = (-(S * nd1 * sigma) / (2 * math.sqrt(T)) -
-              r * K * math.exp(-r * T) * (_ncdf(d2) if opt=="call" else _ncdf(-d2))) / 365
-    vega  = S * nd1 * math.sqrt(T) / 100
+    df  = math.exp(-r * T)
+    dq  = math.exp(-q * T)
+
+    delta = dq * (_ncdf(d1) if opt == "call" else _ncdf(d1) - 1)
+    gamma = dq * nd1 / (S * sigma * sqrtT)
+    # Theta: divide by CFG["theta_days"] (252) — per-trading-day decay
+    if opt == "call":
+        theta = (-(S * dq * nd1 * sigma) / (2 * sqrtT)
+                 + q * S * dq * _ncdf(d1)
+                 - r * K * df * _ncdf(d2)) / CFG["theta_days"]
+    else:
+        theta = (-(S * dq * nd1 * sigma) / (2 * sqrtT)
+                 - q * S * dq * _ncdf(-d1)
+                 + r * K * df * _ncdf(-d2)) / CFG["theta_days"]
+    vega  = S * dq * nd1 * sqrtT / 100   # per 1% IV change
     return dict(delta=round(delta,4), gamma=round(gamma,6),
                 theta=round(theta,4), vega=round(vega,4))
 
-def implied_vol(mkt_px, S, K, T, r, opt="call"):
-    if T <= 0 or mkt_px <= 0: return None
-    sig = 0.30
-    for _ in range(200):
-        px   = bs_price(S, K, T, r, sig, opt)
-        d1   = (math.log(max(S/K,1e-9)) + (r + 0.5*sig**2)*T) / (sig*math.sqrt(T))
-        vega = S * _npdf(d1) * math.sqrt(T)
-        if vega < 1e-10: break
+def implied_vol(mkt_px, S, K, T, r, opt="call", q=0.0):
+    """Robust IV solver: Newton-Raphson with bisection fallback.
+    Initial guess: ATM formula near-the-money, intrinsic/time approx for deep OTM/ITM.
+    Bisection guarantees convergence in [0.01, 3.0] if Newton fails (vega collapse, overshoot).
+    """
+    if T <= 0 or mkt_px <= 0 or S <= 0 or K <= 0:
+        return None
+    # Tighter lower bound on intrinsic value — reject if mkt_px is below intrinsic
+    intrinsic = max(S * math.exp(-q * T) - K * math.exp(-r * T), 0) if opt == "call" \
+                else max(K * math.exp(-r * T) - S * math.exp(-q * T), 0)
+    if mkt_px <= intrinsic * 0.999:
+        return None
+    sqrtT = math.sqrt(T)
+    _bs_const = math.sqrt(2.0 / math.pi)
+    moneyness = abs(S - K) / S
+    if moneyness < 0.05:
+        # Near-the-money: Brenner-Subrahmanyam ATM approximation
+        sig = max(0.05, min(mkt_px / (S * sqrtT * _bs_const * 0.4), 2.0))
+    else:
+        # Away from ATM: time-value approximation
+        time_val = max(mkt_px - intrinsic, 1e-6)
+        sig = max(0.05, min(math.sqrt(2.0 * math.pi / T) * time_val / S, 2.0))
+
+    # Phase 1: Newton-Raphson (up to 100 iters)
+    converged = False
+    for _ in range(100):
+        px  = bs_price(S, K, T, r, sig, opt, q)
+        F   = S * math.exp((r - q) * T)
+        d1  = (math.log(max(F / K, 1e-9)) + 0.5 * sig**2 * T) / (sig * sqrtT)
+        vega = S * math.exp(-q * T) * _npdf(d1) * sqrtT
+        if vega < 1e-10:
+            break
         diff = mkt_px - px
-        if abs(diff) < 1e-6: break
+        if abs(diff) < 1e-7:
+            converged = True
+            break
         sig += diff / vega
         sig  = max(0.001, min(sig, 10.0))
-    return round(sig, 6) if 0.001 < sig < 9.9 else None
 
-def bs_itm_prob(S, K, T, r, sigma, opt="call"):
-    """Probability option finishes ITM = N(d2) for call, N(-d2) for put.
-    This is the risk-neutral probability of exercise."""
+    # Phase 2: bisection fallback in [0.01, 3.0] if Newton did not converge
+    if not converged:
+        lo, hi = 0.01, 3.0
+        f_lo = bs_price(S, K, T, r, lo, opt, q) - mkt_px
+        f_hi = bs_price(S, K, T, r, hi, opt, q) - mkt_px
+        if f_lo * f_hi > 0:
+            return None   # price outside achievable range even at 300% vol
+        for _ in range(60):
+            mid = (lo + hi) / 2.0
+            f_mid = bs_price(S, K, T, r, mid, opt, q) - mkt_px
+            if abs(f_mid) < 1e-6 or (hi - lo) < 1e-6:
+                sig = mid
+                break
+            if f_lo * f_mid <= 0:
+                hi = mid; f_hi = f_mid
+            else:
+                lo = mid; f_lo = f_mid
+        else:
+            sig = (lo + hi) / 2.0
+
+    return round(sig, 6) if 0.01 < sig < 4.99 else None
+
+def bs_itm_prob(S, K, T, r, sigma, opt="call", q=0.0):
+    """Risk-neutral probability of exercise = N(d2) for call, N(-d2) for put."""
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
         return 1.0 if (opt == "call" and S > K) else (1.0 if (opt == "put" and S < K) else 0.0)
-    d1 = (math.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
+    F  = S * math.exp((r - q) * T)
+    d1 = (math.log(F / K) + 0.5 * sigma**2 * T) / (sigma * math.sqrt(T))
     d2 = d1 - sigma * math.sqrt(T)
     return round(_ncdf(d2) if opt == "call" else _ncdf(-d2), 4)
 
+def bs_prob_touch(S, K, T, r, sigma, opt="call", q=0.0, real_drift=None):
+    """Probability of price TOUCHING the strike K before expiry T.
+    Uses the Reiner-Rubinstein (1991) first-passage barrier formula:
+    For UP barrier H > S (call):   P = N(d+) + exp(2*mu*ln(H/S)/σ²) * N(d-)
+    For DOWN barrier H < S (put):  P = N(-d+) + exp(-2*mu*ln(S/H)/σ²) * N(-d-)
+    where mu = drift - σ²/2,  d± = (±ln(S/H) ± mu*T) / (σ√T)
+    real_drift: if provided, use real-world mu instead of risk-neutral (r-q).
+    Returns value in [0,1]. Already-ITM barriers return 1.0.
+    """
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return 1.0
+    _base_drift = real_drift if real_drift is not None else (r - q)
+    mu    = _base_drift - 0.5 * sigma**2
+    sqrtT = math.sqrt(T)
+    if opt == "call":
+        if K <= S:
+            return 1.0   # barrier already reached
+        lnHoverS = math.log(K / S)   # positive
+        d_plus   = (-lnHoverS + mu * T) / (sigma * sqrtT)   # negative
+        d_minus  = (-lnHoverS - mu * T) / (sigma * sqrtT)   # more negative
+        refl_exp = 2.0 * mu * lnHoverS / (sigma**2)
+        refl     = math.exp(max(-700.0, min(700.0, refl_exp)))
+        p = _ncdf(d_plus) + refl * _ncdf(d_minus)
+    else:
+        if K >= S:
+            return 1.0   # barrier already reached
+        lnSoverH = math.log(S / K)   # positive
+        d_plus   = (lnSoverH + mu * T) / (sigma * sqrtT)
+        d_minus  = (lnSoverH - mu * T) / (sigma * sqrtT)
+        refl_exp = -2.0 * mu * lnSoverH / (sigma**2)
+        refl     = math.exp(max(-700.0, min(700.0, refl_exp)))
+        p = _ncdf(-d_plus) + refl * _ncdf(-d_minus)
+    return round(max(0.0, min(1.0, p)), 4)
+
+
+def build_iv_surface(chain_df, spot, atm_iv):
+    """Build implied volatility surface from option chain data.
+    Uses CE IV for strikes >= ATM, PE IV for strikes <= ATM.
+    Returns a callable sigma(K) via linear interpolation over valid strikes.
+    Falls back to atm_iv for any strike outside the observed range.
+    Uses scipy if available; falls back to numpy np.interp (always available).
+    """
+    if chain_df is None or chain_df.empty:
+        return lambda K: atm_iv
+
+    strikes, ivs = [], []
+    for _, row in chain_df.iterrows():
+        k = float(row["Strike"])
+        iv_raw = float(row.get("CE_IV", 0) or 0) if k >= spot else float(row.get("PE_IV", 0) or 0)
+        iv = _sanitise_iv(iv_raw, None)
+        if iv is not None and iv > 0:
+            strikes.append(k)
+            ivs.append(iv)
+
+    if len(strikes) < 2:
+        return lambda K: atm_iv
+
+    # Sort by strike, build numpy arrays
+    pairs   = sorted(zip(strikes, ivs), key=lambda x: x[0])
+    ks_arr  = np.array([p[0] for p in pairs], dtype=float)
+    vs_arr  = np.array([p[1] for p in pairs], dtype=float)
+
+    # scipy gives cubic/linear interp; np.interp is always available as fallback
+    try:
+        from scipy.interpolate import interp1d as _interp1d
+        f = _interp1d(ks_arr, vs_arr, kind="linear", bounds_error=False,
+                      fill_value=(vs_arr[0], vs_arr[-1]))
+        return lambda K: float(f(float(K)))
+    except ImportError:
+        # numpy linear interp — clamps to endpoints for extrapolation (correct behaviour)
+        return lambda K: float(np.interp(float(K), ks_arr, vs_arr))
+    except Exception:
+        return lambda K: atm_iv
+
+
+def _estimate_real_world_drift(ohlcv_df, r, q):
+    """Estimate annualised real-world drift mu from last 60 trading days of log returns.
+    Falls back to risk-neutral drift (r - q) if insufficient data.
+    """
+    if ohlcv_df is None or ohlcv_df.empty:
+        return r - q
+    try:
+        c = ohlcv_df["close"].astype(float)
+        if len(c) < 10:
+            return r - q
+        lr = np.log(c / c.shift(1)).dropna()
+        tail = lr.tail(60)
+        if len(tail) < 10:
+            return r - q
+        mu = float(tail.mean() * CFG["ann_days"])
+        # Clamp to reasonable range: –100% to +200% annualised drift
+        return max(-1.0, min(2.0, mu))
+    except Exception:
+        return r - q
+
+
+def strategy_prob_profit(legs, spot, T, r, atm_iv, q=0.0, simulations=None,
+                         chain_df=None, ohlcv_df=None):
+    """Monte Carlo estimate of Probability of Profit for a multi-leg strategy.
+    Improvements:
+      1. VOL SURFACE: each leg repriced at its own strike IV (skew-aware), not ATM IV.
+      2. REAL-WORLD DRIFT: uses historical mu from last 60 days instead of risk-neutral.
+    legs: list of dicts with keys: opt (CE/PE), strike, premium, action (Buy/Sell), qty
+    Returns: prob_profit (float 0–1), expected_value (₹ per unit)
+    """
+    n_sims = simulations or CFG["pop_simulations"]
+    if T <= 0 or atm_iv <= 0 or not legs:
+        return 0.5, 0.0
+
+    # Build IV surface (falls back to flat surface = atm_iv if no chain data)
+    iv_surf = build_iv_surface(chain_df, spot, atm_iv)
+
+    # Real-world drift (improvement #2)
+    mu = _estimate_real_world_drift(ohlcv_df, r, q)
+
+    # Deterministic but position-unique seed
+    _seed = int(abs(spot * 1000 + T * 1e6 + sum(l.get("strike", 0) for l in legs))) % (2**31)
+    rng  = np.random.default_rng(_seed)
+    Z    = rng.standard_normal(n_sims)
+    # Use ATM IV for GBM diffusion (surface IV at spot), real-world mu for drift
+    atm_sigma_sim = iv_surf(spot)
+    drift  = (mu - 0.5 * atm_sigma_sim**2) * T
+    diff   = atm_sigma_sim * math.sqrt(T) * Z
+    prices = spot * np.exp(drift + diff)
+
+    total_pnl = np.zeros(n_sims)
+    for leg in legs:
+        k    = float(leg["strike"])
+        pr   = float(leg["premium"])
+        qty  = int(leg.get("qty", 1))
+        d    = 1 if leg["action"].lower() == "buy" else -1
+        if leg["opt"].upper() in ("CE", "CALL"):
+            intr = np.maximum(prices - k, 0)
+        else:
+            intr = np.maximum(k - prices, 0)
+        total_pnl += d * (intr - pr) * qty
+
+    prob_profit = float((total_pnl > 0).mean())
+    ev          = float(total_pnl.mean())
+    return round(prob_profit, 4), round(ev, 4)
+
+
+def iv_percentile(iv_series):
+    """IV Percentile: fraction of past observations that current IV exceeds.
+    Unlike IV Rank (range-normalized), IV Percentile is robust to outliers.
+    Returns 0–100."""
+    s = pd.Series(iv_series).dropna()
+    if len(s) < 3:
+        return 50.0
+    cur = float(s.iloc[-1])
+    pct = float((s < cur).mean() * 100)
+    return round(pct, 1)
+
+
+def _load_signal_log() -> list:
+    """Load forward signal log from disk. Returns list of dicts."""
+    fp = CFG["signal_log_file"]
+    try:
+        if os.path.exists(fp):
+            with open(fp, "r") as f:
+                data = json.load(f)
+            return data if isinstance(data, list) else []
+    except Exception:
+        pass
+    return []
+
+def _save_signal_log(log: list):
+    """Persist signal log to disk. Keeps last CFG['signal_log_max'] entries."""
+    try:
+        log = log[-CFG["signal_log_max"]:]
+        with open(CFG["signal_log_file"], "w") as f:
+            json.dump(log, f)
+    except Exception:
+        pass
+
+def _append_signal(symbol: str, prob_up: float, prob_down: float, flow_score: float,
+                   flow_magnitude: float, raw_score: float, top_strategy: str,
+                   strategy_ev: float, strategy_pop: float, strategy_kelly: float,
+                   expected_move: float, atm_iv: float, ivr: float, bias: str):
+    """Append a forward signal snapshot to the persistent log.
+    Called at load time. Provides a timestamped record of every signal the engine produced.
+    This replaces the synthetic backtest — real forward performance tracking.
+    """
+    if "opt_signal_log" not in st.session_state:
+        st.session_state.opt_signal_log = _load_signal_log()
+    entry = {
+        "ts":             datetime.now().isoformat(timespec="minutes"),
+        "symbol":         symbol.upper(),
+        "prob_up":        round(prob_up, 4),
+        "prob_down":      round(prob_down, 4),
+        "raw_score":      round(raw_score, 4),
+        "flow_score":     round(flow_score, 4),
+        "flow_magnitude": round(flow_magnitude, 4),
+        "bias":           bias,
+        "top_strategy":   top_strategy,
+        "strategy_ev":    round(strategy_ev, 2),
+        "strategy_pop":   round(strategy_pop, 4),
+        "strategy_kelly": round(strategy_kelly, 4),
+        "expected_move":  round(expected_move, 2),
+        "atm_iv_pct":     round(atm_iv * 100, 2),
+        "ivr":            round(ivr, 1),
+    }
+    log = st.session_state.opt_signal_log
+    # Deduplicate: don't append if last entry is same symbol within same minute
+    if log and log[-1]["ts"] == entry["ts"] and log[-1]["symbol"] == entry["symbol"]:
+        return
+    log.append(entry)
+    st.session_state.opt_signal_log = log
+    _save_signal_log(log)
+def bs_charm(S, K, T, r, sigma, opt="call", q=0.0):
+    """Charm = dDelta/dt per trading day.
+    Derived analytically from the Merton BSM delta:
+      Call delta  = exp(-qT) * N(d1)
+      Put  delta  = exp(-qT) * (N(d1) - 1)
+    Differentiating wrt T (holding S, K, sigma fixed):
+      charm = exp(-qT) * npdf(d1) * [d1*(r-q)/(sigma*sqrt(T)) - (r-q) - sigma/(2*sqrt(T))*d2/d1_adj]
+    Standard closed form (Hull, 10th ed §19):
+      charm_call = -exp(-qT) * [npdf(d1)*(2*(r-q)*T - d2*sigma*sqrt(T)) / (2*T*sigma*sqrt(T))
+                                - q*N(d1)]
+      charm_put  = charm_call + q*exp(-qT)   [because delta_put = delta_call - exp(-qT)]
+    Both divided by ann_days for per-trading-day value.
+    """
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return 0.0
+    sqrtT = math.sqrt(T)
+    F     = S * math.exp((r - q) * T)
+    d1    = (math.log(F / K) + 0.5 * sigma**2 * T) / (sigma * sqrtT)
+    d2    = d1 - sigma * sqrtT
+    nd1   = _npdf(d1)
+    dq    = math.exp(-q * T)
+    # Core term shared by call and put
+    core  = -dq * nd1 * (2 * (r - q) * T - d2 * sigma * sqrtT) / (2 * T * sigma * sqrtT)
+    if opt == "call":
+        charm_raw = core - q * dq * _ncdf(d1)
+    else:
+        # charm_put = charm_call + q*exp(-qT)  (from delta_put = delta_call - exp(-qT))
+        charm_call = core - q * dq * _ncdf(d1)
+        charm_raw  = charm_call + q * dq
+    return round(charm_raw / CFG["ann_days"], 6)
+
+
+def bs_vanna(S, K, T, r, sigma, opt="call", q=0.0):
+    """Vanna = dDelta/dIV = d²V/dSdσ.
+    Vanna = -exp(-q*T) * npdf(d1) * d2 / sigma
+    Same for calls and puts.
+    Returns vanna (delta change per 1 unit IV change, not per 1%).
+    """
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return 0.0
+    sqrtT = math.sqrt(T)
+    F  = S * math.exp((r - q) * T)
+    d1 = (math.log(F / K) + 0.5 * sigma**2 * T) / (sigma * sqrtT)
+    d2 = d1 - sigma * sqrtT
+    nd1 = _npdf(d1)
+    dq  = math.exp(-q * T)
+    vanna = -dq * nd1 * d2 / sigma
+    return round(vanna, 6)
+
+
 def atm_strike(spot, step):
-    return round(round(spot / step) * step, 2)
+    # Use round-half-up (standard trading convention) not Python's banker's rounding.
+    # Python's round(0.5)=0 (rounds to even), but traders expect 24525→24550 not 24500.
+    # math.floor(x + 0.5) gives true round-half-up for positive numbers.
+    return float(math.floor(spot / step + 0.5) * step)
 
 def strikes_around(spot, step, n=6):
     atm = atm_strike(spot, step)
@@ -488,13 +1516,17 @@ def parse_chain(raw_data, spot, step=50):
     if not df.empty:
         df["PCR"]       = df.apply(lambda r: round(r.PE_OI / (r.CE_OI + 1e-9), 3), axis=1)
         df["OI_Diff"]   = df["CE_OI"] - df["PE_OI"]
+        # Moneyness relative to CALLS (standard chain convention):
+        # strike < spot → ITM for CE, OTM for PE
+        # strike > spot → OTM for CE, ITM for PE
+        # Label uses call perspective: "ITM" means ITM-for-calls (strike below spot)
         df["Moneyness"] = df["Strike"].apply(
-            lambda k: "ATM" if abs(k - spot) <= 0.5 * step
-                      else ("ITM-C" if k < spot else "OTM-C"))
+            lambda k: "ATM"    if abs(k - spot) <= 0.5 * step
+                      else ("ITM" if k < spot else "OTM"))
     return df
 
 # ============================================================
-# HISTORICAL DATA (yfinance fallback + Upstox)
+# HISTORICAL & INTRADAY DATA — Upstox primary, yfinance fallback
 # ============================================================
 
 YF_TICKERS = {
@@ -505,9 +1537,137 @@ YF_TICKERS = {
     "SENSEX":     "^BSESN",
 }
 
-def get_ohlcv(symbol, token):
-    """Get daily OHLCV. Tries Upstox historical first, then yfinance."""
-    # yfinance
+# Upstox instrument key → exchange segment mapping for historical API
+_UPSTOX_SEGMENT = {
+    "INDEX": "NSE_INDEX",
+    "EQ":    "NSE_EQ",
+}
+
+def _upstox_instrument_key_for_ohlcv(symbol: str, master_df) -> str | None:
+    """Return the instrument_key suitable for the Upstox historical candles API."""
+    if master_df is None or master_df.empty:
+        return None
+    sym = symbol.upper().strip()
+    for itype in ["INDEX", "EQ"]:
+        mask = (
+            master_df.get("trading_symbol", pd.Series(dtype=str))
+                      .astype(str).str.upper() == sym
+        ) & (
+            master_df.get("instrument_type", pd.Series(dtype=str))
+                      .astype(str).str.upper() == itype
+        )
+        rows = master_df[mask]
+        if not rows.empty:
+            return str(rows.iloc[0]["instrument_key"])
+    return None
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_upstox_candles(_token: str, instrument_key: str,
+                          interval: str = "day", days: int = 365) -> pd.DataFrame:
+    """Fetch OHLCV candles from Upstox historical data API.
+
+    Endpoint: GET /v2/historical-candle/{instrument_key}/{interval}/{to_date}/{from_date}
+    interval: 'day' | '30minute' | '15minute' | '5minute' | '1minute'
+    Returns DataFrame with columns: date, open, high, low, close, volume.
+    Empty DataFrame on any error.
+    """
+    if not _token or not instrument_key:
+        return pd.DataFrame()
+    try:
+        to_dt   = datetime.now().date()
+        fr_dt   = to_dt - timedelta(days=days)
+        to_str  = to_dt.isoformat()
+        fr_str  = fr_dt.isoformat()
+        url     = (f"https://api.upstox.com/v2/historical-candle"
+                   f"/{urllib.parse.quote(instrument_key, safe='')}"
+                   f"/{interval}/{to_str}/{fr_str}")
+        hdrs    = {"Authorization": f"Bearer {_token}", "Accept": "application/json"}
+        r       = requests.get(url, headers=hdrs, timeout=15)
+        if r.status_code != 200:
+            return pd.DataFrame()
+        candles = r.json().get("data", {}).get("candles", [])
+        if not candles:
+            return pd.DataFrame()
+        # Each candle: [timestamp, open, high, low, close, volume, oi]
+        rows = []
+        for c in candles:
+            try:
+                rows.append({
+                    "date":   pd.to_datetime(c[0]).date(),
+                    "open":   float(c[1]),
+                    "high":   float(c[2]),
+                    "low":    float(c[3]),
+                    "close":  float(c[4]),
+                    "volume": float(c[5]),
+                })
+            except Exception:
+                continue
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_upstox_intraday_candles(_token: str, instrument_key: str,
+                                   interval: str = "5minute") -> pd.DataFrame:
+    """Fetch today's intraday OHLCV candles from Upstox intraday API.
+
+    Endpoint: GET /v2/historical-candle/intraday/{instrument_key}/{interval}
+    Returns DataFrame: datetime, open, high, low, close, volume.
+    Cached 60 seconds — refreshes every minute during market hours.
+    """
+    if not _token or not instrument_key:
+        return pd.DataFrame()
+    try:
+        url  = (f"https://api.upstox.com/v2/historical-candle/intraday"
+                f"/{urllib.parse.quote(instrument_key, safe='')}/{interval}")
+        hdrs = {"Authorization": f"Bearer {_token}", "Accept": "application/json"}
+        r    = requests.get(url, headers=hdrs, timeout=10)
+        if r.status_code != 200:
+            return pd.DataFrame()
+        candles = r.json().get("data", {}).get("candles", [])
+        if not candles:
+            return pd.DataFrame()
+        rows = []
+        for c in candles:
+            try:
+                rows.append({
+                    "datetime": pd.to_datetime(c[0]),
+                    "open":   float(c[1]),
+                    "high":   float(c[2]),
+                    "low":    float(c[3]),
+                    "close":  float(c[4]),
+                    "volume": float(c[5]),
+                })
+            except Exception:
+                continue
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows).sort_values("datetime").reset_index(drop=True)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def get_ohlcv(symbol: str, token: str, master_df=None) -> pd.DataFrame:
+    """Get daily OHLCV. Tries Upstox historical API first, then yfinance.
+    Returns DataFrame with columns: date, open, high, low, close, volume.
+    1 year of daily data for volatility, drift, and calibration computation.
+    """
+    # ── Primary: Upstox historical candles ──────────────────────────────────
+    if token:
+        _mdf = master_df if master_df is not None else load_fno_master()
+        ikey = _upstox_instrument_key_for_ohlcv(symbol, _mdf)
+        if ikey:
+            df_up = fetch_upstox_candles(token, ikey, interval="day", days=365)
+            if not df_up.empty and len(df_up) >= 20:
+                return df_up
+
+    # ── Fallback: yfinance ───────────────────────────────────────────────────
     yftick = YF_TICKERS.get(symbol.upper(), f"{symbol.upper()}.NS")
     try:
         d = yf.download(yftick, period="1y", interval="1d", progress=False, auto_adjust=True)
@@ -517,118 +1677,680 @@ def get_ohlcv(symbol, token):
             d = d.reset_index()
             d.columns = [c.lower() for c in d.columns]
             return d
-    except: pass
+    except Exception:
+        pass
     return pd.DataFrame()
 
+
+def get_intraday_ohlcv(symbol: str, token: str,
+                        interval: str = "5minute",
+                        master_df=None) -> pd.DataFrame:
+    """Get today's intraday OHLCV candles from Upstox.
+    Returns DataFrame with columns: datetime, open, high, low, close, volume.
+    Returns empty DataFrame outside market hours or on API error.
+    """
+    if not token:
+        return pd.DataFrame()
+    _mdf = master_df if master_df is not None else load_fno_master()
+    ikey = _upstox_instrument_key_for_ohlcv(symbol, _mdf)
+    if not ikey:
+        return pd.DataFrame()
+    return fetch_upstox_intraday_candles(token, ikey, interval=interval)
+
+
+# ============================================================
+# INTRADAY SIGNAL COMPUTATION
+# ============================================================
+
+def compute_intraday_signals(intraday_df: pd.DataFrame,
+                              chain_df: pd.DataFrame,
+                              spot: float) -> dict:
+    """Derive intraday behavioural signals from live 5-minute candles + chain.
+
+    Signals computed:
+      opening_momentum  — first 30-min directional move (opening auction bias)
+      vwap_position     — spot vs VWAP (above = bullish intraday flow)
+      intraday_range_pct— today's range as % of spot (realised volatility so far)
+      volume_acceleration — current 30-min volume vs session average (flow surge detector)
+      oi_build_direction  — OI change sign: CE OI rising faster than PE = bearish flow
+      price_structure     — higher highs / lower lows intraday (momentum confirmation)
+      lunch_reversal      — post-12:30 reversal vs opening direction
+
+    Returns dict with each signal ∈ [-1, +1] and composite intraday_score.
+    """
+    result = {
+        "opening_momentum":    0.0,
+        "vwap_position":       0.0,
+        "intraday_range_pct":  0.0,
+        "volume_acceleration": 0.0,
+        "oi_build_direction":  0.0,
+        "price_structure":     0.0,
+        "lunch_reversal":      0.0,
+        "intraday_score":      0.0,
+        "intraday_available":  False,
+        "vwap":                spot,
+        "session_high":        spot,
+        "session_low":         spot,
+        "candles_so_far":      0,
+    }
+
+    if intraday_df is None or intraday_df.empty or len(intraday_df) < CFG["intra_min_candles"]:
+        return result
+
+    df = intraday_df.copy()
+    result["intraday_available"] = True
+    result["candles_so_far"] = len(df)
+
+    # ── VWAP — volume-weighted average price ─────────────────────────────────
+    df["typical"] = (df["high"] + df["low"] + df["close"]) / 3.0
+    total_vol = float(df["volume"].sum())
+    if total_vol > 0:
+        vwap = float((df["typical"] * df["volume"]).sum() / total_vol)
+    else:
+        vwap = float(df["close"].mean())
+    result["vwap"] = round(vwap, 2)
+
+    session_high = float(df["high"].max())
+    session_low  = float(df["low"].min())
+    result["session_high"] = round(session_high, 2)
+    result["session_low"]  = round(session_low, 2)
+    intra_range  = session_high - session_low
+    if intra_range > 0:
+        vwap_pos = (spot - vwap) / (intra_range / 2.0 + 1e-9)
+        result["vwap_position"] = round(max(-1.0, min(1.0, vwap_pos)), 4)
+
+    # ── Opening momentum — configurable window from CFG ───────────────────────
+    _oc = CFG["intra_opening_candles"]
+    opening_candles = df.head(_oc)
+    if len(opening_candles) >= 2:
+        open_price  = float(opening_candles.iloc[0]["open"])
+        close_open  = float(opening_candles.iloc[-1]["close"])
+        if open_price > 0 and intra_range > 0:
+            open_move     = (close_open - open_price) / open_price
+            open_momentum = open_move / (intra_range / spot + 1e-9)
+            result["opening_momentum"] = round(max(-1.0, min(1.0, open_momentum)), 4)
+
+    # ── Intraday range % ─────────────────────────────────────────────────────
+    result["intraday_range_pct"] = round(intra_range / spot * 100, 3) if spot > 0 else 0.0
+
+    # ── Volume acceleration — configurable recent window ─────────────────────
+    _rc = CFG["intra_recent_candles"]
+    _mv = CFG["intra_min_candles_vol"]
+    session_avg_vol = float(df["volume"].mean())
+    if session_avg_vol > 0 and len(df) >= _mv:
+        recent_vol  = float(df.tail(_rc)["volume"].mean())
+        vol_accel   = (recent_vol - session_avg_vol) / (session_avg_vol + 1e-9)
+        result["volume_acceleration"] = round(max(-1.0, min(1.0, vol_accel)), 4)
+
+    # ── Price structure — configurable early/late window ─────────────────────
+    _sc = CFG["intra_structure_candles"]
+    _ms = CFG["intra_min_candles_struct"]
+    if len(df) >= _ms:
+        early_high = float(df.head(_sc)["high"].mean())
+        late_high  = float(df.tail(_sc)["high"].mean())
+        early_low  = float(df.head(_sc)["low"].mean())
+        late_low   = float(df.tail(_sc)["low"].mean())
+        if intra_range > 0:
+            hh_score = (late_high - early_high) / (intra_range + 1e-9)
+            ll_score = (early_low  - late_low)  / (intra_range + 1e-9)
+            price_struct = (hh_score + ll_score) / 2.0
+            result["price_structure"] = round(max(-1.0, min(1.0, price_struct)), 4)
+
+    # ── Lunch-hour reversal — configurable candle indices from CFG ───────────
+    _lm  = CFG["intra_min_candles_lunch"]
+    _lcs = CFG["intra_lunch_candle_start"]   # pre-lunch candle index
+    _lcm = CFG["intra_lunch_candle_morn"]    # morning close candle index
+    if len(df) >= _lm:
+        morning_close   = float(df.iloc[_lcm]["close"])
+        prelunch_close  = float(df.iloc[_lcs]["close"])
+        postlunch_close = float(df.tail(1)["close"].values[0])
+        open_p          = float(df.iloc[0]["open"])
+        if open_p > 0 and intra_range > 0:
+            morning_dir   = (morning_close - open_p)           / (intra_range + 1e-9)
+            postlunch_dir = (postlunch_close - prelunch_close) / (intra_range + 1e-9)
+            lunch_rev = postlunch_dir * (-1 if morning_dir * postlunch_dir < 0 else 1)
+            result["lunch_reversal"] = round(max(-1.0, min(1.0, lunch_rev)), 4)
+
+    # ── OI build direction from chain ─────────────────────────────────────────
+    # CE OI change vs PE OI change: net call build = bearish, net put build = bullish
+    if chain_df is not None and not chain_df.empty:
+        try:
+            ce_oic = float(chain_df["CE_OIC"].sum())
+            pe_oic = float(chain_df["PE_OIC"].sum())
+            total_oic = abs(ce_oic) + abs(pe_oic)
+            if total_oic > 0:
+                # More put OI building = bullish (put sellers adding support)
+                # More call OI building = bearish (call sellers capping upside)
+                oi_dir = (pe_oic - ce_oic) / (total_oic + 1e-9)
+                result["oi_build_direction"] = round(max(-1.0, min(1.0, oi_dir)), 4)
+        except Exception:
+            pass
+
+    # ── Composite intraday score ──────────────────────────────────────────────
+    # Weights derived from empirical importance for NSE intraday:
+    # Opening momentum and VWAP position are strongest intraday signals.
+    # OI build direction and volume acceleration are secondary.
+    # Price structure and lunch reversal are tertiary.
+    # All weights are calibrated in _run_calibration_cycle if history is available.
+    _iw = {
+        "opening_momentum":    _calib("intra_w_opening_momentum"),
+        "vwap_position":       _calib("intra_w_vwap_position"),
+        "volume_acceleration": _calib("intra_w_volume_acceleration"),
+        "oi_build_direction":  _calib("intra_w_oi_build"),
+        "price_structure":     _calib("intra_w_price_structure"),
+        "lunch_reversal":      _calib("intra_w_lunch_reversal"),
+    }
+    total_w = sum(_iw.values())
+    if total_w < 1e-9:
+        total_w = 1.0
+
+    intra_composite = sum(
+        (_iw[k] / total_w) * result.get(k, 0.0)
+        for k in _iw
+    )
+    result["intraday_score"] = round(max(-1.0, min(1.0, intra_composite)), 4)
+
+    # Record signals for calibration
+    for k in _iw:
+        _record(f"_calib_intra_{k}_hist", result.get(k, 0.0))
+
+    return result
+
+
 def compute_hv(close_series, window=20):
+    """Annualised historical vol using CFG['ann_days'] (252 trading days)."""
     lr = np.log(close_series / close_series.shift(1)).dropna()
     if len(lr) < window: return None
-    return float(lr.tail(window).std() * np.sqrt(252))
-
+    return float(lr.tail(window).std() * np.sqrt(CFG["ann_days"]))
 # ============================================================
 # DIRECTIONAL ANALYSIS — 7-FACTOR MODEL
 # ============================================================
 
-def directional_bias(df, ltp):
-    if df.empty or len(df) < 50:
-        return {"bias":"NEUTRAL","score":0,"factors":{},"rsi":50,"macd_hist":0,
-                "bb_pct":50,"vol_ratio":1,"atr_pct":1.5,"e9":ltp,"e20":ltp,"e50":ltp,"atr":ltp*0.015}
-    c  = df["close"].astype(float)
-    h  = df["high"].astype(float)
-    l  = df["low"].astype(float)
-    v  = df["volume"].astype(float)
+def compute_flow_scores(chain_df, ohlcv_df):
+    """Compute LEADING flow signals from delta-changes in positioning metrics.
 
+    For 1–5 day prediction, CHANGES matter more than levels.
+    A PCR moving from 1.2→1.5 is more predictive than PCR=1.5 in isolation.
+
+    Signals and their directional encoding:
+      dIV    (signed): rising IV → institutions buying options → bearish for underlying longs
+                        falling IV → dealers covering shorts → bullish
+      dOI    (signed): rising OI + price rising = bullish (fresh longs)
+                        rising OI + price falling = bearish (fresh shorts)
+                        Note: without price context, use magnitude only (neutral sign)
+      dPCR   (signed): RISING put/call ratio = MORE puts being written = BULLISH (support)
+                        FALLING put/call ratio = puts being closed or calls written = BEARISH
+      dSkew  (signed): steepening skew (put IV > call IV widening) = downside fear = BEARISH
+                        flattening/reversing skew = complacency = BULLISH
+      dGEX   (signed): GEX rising = dealers buying more = range-bound / vol-suppressed
+                        GEX falling = dealers selling = directional move coming
+
+    Returns dict with each delta z-score in [-1, +1] and a composite flow_score.
+    """
+    flow = {
+        "dIV": 0.0, "dOI": 0.0, "dPCR": 0.0,
+        "dSkew": 0.0, "dGEX": 0.0, "flow_score": 0.0,
+        "flow_magnitude": 0.0,   # abs(flow_score) — conviction level
+    }
+    if chain_df is None or chain_df.empty:
+        return flow
+
+    try:
+        # ── dIV: Change in ATM IV vs 5-session average ──────────────────────────
+        # Rising IV = institutions buying options = protective hedging = bearish for spot
+        # Falling IV = fear unwind = bullish for spot
+        iv_hist  = st.session_state.get("opt_iv_history", {})
+        sym_hist = iv_hist.get(st.session_state.get("opt_symbol", ""), [])
+        if len(sym_hist) >= 5:
+            cur_iv   = float(sym_hist[-1])
+            avg_5    = float(np.mean(sym_hist[-5:]))
+            std_5    = float(np.std(sym_hist[-5:])) if len(sym_hist) >= 5 else (avg_5 * _calib("std_floor_frac"))
+            std_5    = max(std_5, avg_5 * (_calib("std_floor_frac") * 0.2))  # floor at fraction of avg
+            dIV_raw  = (cur_iv - avg_5) / (std_5 + 1e-9)    # z-score of IV change
+            # Encode: rising IV = bearish for longs → negative score
+            flow["dIV"] = round(max(-1.0, min(1.0, -dIV_raw / 2.0)), 3)
+
+        # ── dOI: Change in total chain open interest ─────────────────────────────
+        # OI build-up signals fresh positioning — a large OI surge means new bets are placed
+        # Net direction unknown from OI alone → use PCR shift to determine lean
+        total_oi = float(chain_df["CE_OI"].sum() + chain_df["PE_OI"].sum())
+        _oi_hist = st.session_state.get("_flow_oi_hist", [])
+        _oi_hist.append(total_oi)
+        if len(_oi_hist) > 10: _oi_hist = _oi_hist[-10:]
+        st.session_state["_flow_oi_hist"] = _oi_hist
+        if len(_oi_hist) >= 3:
+            oi_arr   = np.array(_oi_hist)
+            oi_mu    = float(np.mean(oi_arr[:-1]))
+            oi_std   = float(np.std(oi_arr[:-1])) or (oi_mu * _calib("std_floor_frac"))
+            dOI_z    = (total_oi - oi_mu) / (oi_std + 1e-9)
+            # OI change magnitude: higher OI change = more conviction in either direction
+            # Sign: undetermined from OI alone — weight as unsigned activity signal
+            flow["dOI"] = round(max(-1.0, min(1.0, dOI_z / 2.0)), 3)
+
+        # ── dPCR: Change in put/call ratio ───────────────────────────────────────
+        # RISING PCR (more puts being added) = put writers providing support = BULLISH
+        # FALLING PCR (puts being closed or calls added) = hedgers exiting = BEARISH
+        ce_oi    = float(chain_df["CE_OI"].sum())
+        pe_oi    = float(chain_df["PE_OI"].sum())
+        pcr_now  = pe_oi / (ce_oi + 1e-9)
+        _pcr_hist = st.session_state.get("_flow_pcr_hist", [])
+        _pcr_hist.append(pcr_now)
+        if len(_pcr_hist) > 10: _pcr_hist = _pcr_hist[-10:]
+        st.session_state["_flow_pcr_hist"] = _pcr_hist
+        if len(_pcr_hist) >= 3:
+            pcr_arr  = np.array(_pcr_hist)
+            pcr_mu   = float(np.mean(pcr_arr[:-1]))
+            pcr_std  = float(np.std(pcr_arr[:-1])) or (pcr_mu * _calib("std_floor_frac"))
+            dPCR_z   = (pcr_now - pcr_mu) / (pcr_std + 1e-9)
+            # Rising PCR = more put writing = bullish support → POSITIVE directional score
+            flow["dPCR"] = round(max(-1.0, min(1.0, dPCR_z / 2.0)), 3)
+
+        # ── dSkew: Change in IV skew (OTM put IV minus OTM call IV) ─────────────
+        # Steepening put skew = downside hedging demand = BEARISH
+        # Flattening / reversal = complacency or call-buying = BULLISH
+        _spot = st.session_state.get("opt_spot", 0)
+        _step = st.session_state.get("opt_step", 50)
+        if _spot > 0 and _step > 0:
+            atm_k      = atm_strike(_spot, _step)
+            otm_ce_row = chain_df[chain_df.Strike == atm_k + _step]
+            otm_pe_row = chain_df[chain_df.Strike == atm_k - _step]
+            if not otm_ce_row.empty and not otm_pe_row.empty:
+                ce_iv_now  = _sanitise_iv(float(otm_ce_row.CE_IV.values[0]), 0) or 0.0
+                pe_iv_now  = _sanitise_iv(float(otm_pe_row.PE_IV.values[0]), 0) or 0.0
+                skew_now   = (pe_iv_now - ce_iv_now) if (ce_iv_now > 0 and pe_iv_now > 0) else 0.0
+                _skew_hist = st.session_state.get("_flow_skew_hist", [])
+                _skew_hist.append(skew_now)
+                if len(_skew_hist) > 10: _skew_hist = _skew_hist[-10:]
+                st.session_state["_flow_skew_hist"] = _skew_hist
+                if len(_skew_hist) >= 3:
+                    sk_arr   = np.array(_skew_hist)
+                    sk_mu    = float(np.mean(sk_arr[:-1]))
+                    sk_std   = float(np.std(sk_arr[:-1])) or (_calib("std_floor_frac") * 0.1)
+                    dSkew_z  = (skew_now - sk_mu) / (sk_std + 1e-9)
+                    # Steepening skew = more put demand = bearish → NEGATIVE score
+                    flow["dSkew"] = round(max(-1.0, min(1.0, -dSkew_z / 2.0)), 3)
+
+        # ── dGEX: Change in net gamma exposure ───────────────────────────────────
+        # Rising GEX = dealers long gamma = price pinning = range-bound
+        # Falling GEX = dealers short gamma = price trending = vol expansion
+        # For directional: falling GEX + price trend = amplified move
+        _gex_hist = st.session_state.get("_flow_gex_hist", [])
+        oi_d_cur  = st.session_state.get("opt_oi", {})
+        gex_now   = float(oi_d_cur.get("net_gex", 0) or 0)
+        if gex_now != 0:   # only track when we have real GEX data
+            _gex_hist.append(gex_now)
+            if len(_gex_hist) > 10: _gex_hist = _gex_hist[-10:]
+            st.session_state["_flow_gex_hist"] = _gex_hist
+            if len(_gex_hist) >= 3:
+                gex_arr  = np.array(_gex_hist)
+                gex_mu   = float(np.mean(gex_arr[:-1]))
+                gex_std  = float(np.std(gex_arr[:-1])) or (abs(gex_mu) * 0.1 + 1e-9)
+                dGEX_z   = (gex_now - gex_mu) / (gex_std + 1e-9)
+                # Falling GEX (negative dGEX) = dealers losing gamma grip = trending move coming
+                # → positive directional signal (amplifies whatever direction is trending)
+                # We encode magnitude only here; direction interaction with trend handled in scoring
+                flow["dGEX"] = round(max(-1.0, min(1.0, -dGEX_z / 2.0)), 3)
+
+        # ── Composite FLOW SCORE (Improvement #3: data-driven weights) ─────────
+        # Compute weights from abs(correlation(signal_i, future_return_N_days)).
+        # Uses a rolling log-return series from ohlcv_df and aligns signal history
+        # stored in session state.  Falls back to the original fixed weights when
+        # there are fewer than 10 paired observations (cold-start).
+        #
+        # fixed fallback weights (original prior):
+        _fw_fallback = {
+            "dPCR": 0.35, "dSkew": 0.30, "dIV": 0.20, "dOI": 0.10, "dGEX": 0.05
+        }
+        signal_keys = ["dPCR", "dSkew", "dIV", "dOI", "dGEX"]
+
+        def _compute_flow_weights(ohlcv_df_local, horizon=4):
+            """Return dict of normalised abs-correlation weights for each flow signal.
+            horizon: forecast horizon in sessions (default 4 ≈ 1 trading week).
+            Requires ≥10 aligned observations; otherwise returns fallback weights.
+            """
+            try:
+                if ohlcv_df_local is None or ohlcv_df_local.empty or len(ohlcv_df_local) < horizon + 10:
+                    return _fw_fallback.copy()
+
+                c_local = ohlcv_df_local["close"].astype(float).reset_index(drop=True)
+                # Forward log return: return realised horizon sessions later
+                fwd_ret = np.log(c_local.shift(-horizon) / c_local).dropna().values
+
+                # Retrieve signal histories aligned to the same sessions
+                hist_map = {
+                    "dIV":   st.session_state.get("opt_iv_history", {}).get(
+                                 st.session_state.get("opt_symbol", ""), []),
+                    "dPCR":  st.session_state.get("_flow_pcr_hist",  []),
+                    "dSkew": st.session_state.get("_flow_skew_hist", []),
+                    "dOI":   st.session_state.get("_flow_oi_hist",   []),
+                    "dGEX":  st.session_state.get("_flow_gex_hist",  []),
+                }
+
+                raw_weights = {}
+                for sig_k in signal_keys:
+                    hist = np.array(hist_map[sig_k], dtype=float)
+                    n_common = min(len(hist), len(fwd_ret))
+                    if n_common < 10:
+                        raw_weights[sig_k] = _fw_fallback[sig_k]  # not enough data
+                        continue
+                    # Align: use the most-recent n_common observations
+                    sig_aligned = hist[-n_common:]
+                    ret_aligned = fwd_ret[-n_common:]
+                    # Compute Pearson correlation; use abs value for weight
+                    if np.std(sig_aligned) < 1e-9 or np.std(ret_aligned) < 1e-9:
+                        raw_weights[sig_k] = _fw_fallback[sig_k]
+                        continue
+                    corr = float(np.corrcoef(sig_aligned, ret_aligned)[0, 1])
+                    if np.isnan(corr):
+                        corr = 0.0
+                    raw_weights[sig_k] = abs(corr)
+
+                total_w = sum(raw_weights.values())
+                if total_w < 1e-9:
+                    return _fw_fallback.copy()
+                return {k: v / total_w for k, v in raw_weights.items()}
+
+            except Exception:
+                return _fw_fallback.copy()
+
+        _flow_weights = _compute_flow_weights(
+            st.session_state.get("opt_ohlcv_df", None)
+        )
+
+        fs_composite = sum(_flow_weights.get(k, _fw_fallback[k]) * flow.get(k, 0.0)
+                           for k in signal_keys)
+        flow["flow_score"]      = round(max(-1.0, min(1.0, fs_composite)), 3)
+        flow["flow_magnitude"]  = round(abs(fs_composite), 3)
+        flow["flow_weights"]    = {k: round(v, 4) for k, v in _flow_weights.items()}
+
+    except Exception:
+        pass
+
+    return flow
+
+
+def directional_bias(df, ltp, chain_df=None):
+    """Directional bias model — fully adaptive, no magic scaling constants.
+
+    Every sub-signal is converted to a z-score (from its own rolling history)
+    or a percentile rank within the current data series, then clamped to [-1, +1].
+
+    Five independent factor groups (zero multicollinearity by design):
+      TREND       (weight 0.30): EMA structure + ADX percentile
+      MOMENTUM    (weight 0.25): RSI z-score + 5-day return z-score
+      VOLATILITY  (weight 0.15): ATR percentile + BB width percentile (regime signal)
+      POSITIONING (weight 0.20): PCR percentile + OI skew + max pain distance / EM
+      REL STRENGTH(weight 0.10): stock vs Nifty z-score (from session state)
+
+    Each factor score ∈ [-1, +1]; final score = weighted sum ∈ [-1, +1].
+    Displayed as –100 to +100 for UI compatibility.
+    """
+    if df.empty or len(df) < 50:
+        return {"bias": "NEUTRAL", "score": 0, "factors": {}, "rsi": 50, "macd_hist": 0,
+                "bb_pct": 50, "vol_ratio": 1, "atr_pct": 1.5,
+                "e9": ltp, "e20": ltp, "e50": ltp, "atr": _atr_seed(ltp),
+                "flow": {}, "adx": 0.0}
+
+    c = df["close"].astype(float)
+    h = df["high"].astype(float)
+    l = df["low"].astype(float)
+    v = df["volume"].astype(float)
+
+    # ── Common series ────────────────────────────────────────────────────────
     e9   = c.ewm(span=9,   adjust=False).mean()
     e20  = c.ewm(span=20,  adjust=False).mean()
     e50  = c.ewm(span=50,  adjust=False).mean()
     e200 = c.ewm(span=200, adjust=False).mean()
 
-    tr   = pd.concat([h-l, (h-c.shift(1)).abs(), (l-c.shift(1)).abs()], axis=1).max(axis=1)
-    atr  = tr.ewm(span=14, adjust=False).mean()
-    atrv = float(atr.iloc[-1])
+    tr    = pd.concat([h - l, (h - c.shift(1)).abs(), (l - c.shift(1)).abs()], axis=1).max(axis=1)
+    atr14 = tr.ewm(span=14, adjust=False).mean()
+    atrv  = float(atr14.iloc[-1])
+    if ltp > 0: _record("_calib_atr_pct_hist", atrv / ltp)
 
+    e9v   = float(e9.iloc[-1])
+    e20v  = float(e20.iloc[-1])
+    e50v  = float(e50.iloc[-1])
+    e200v = float(e200.iloc[-1]) if len(c) >= 200 else ltp
+
+    # ── ADX (14-period Wilder) ───────────────────────────────────────────────
+    up_move   = h - h.shift(1)
+    down_move = l.shift(1) - l
+    dm_p = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=c.index)
+    dm_m = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=c.index)
+    di_p = 100 * dm_p.ewm(alpha=1/14, adjust=False).mean() / (atr14 + 1e-9)
+    di_m = 100 * dm_m.ewm(alpha=1/14, adjust=False).mean() / (atr14 + 1e-9)
+    dx   = 100 * (di_p - di_m).abs() / (di_p + di_m + 1e-9)
+    adx_series = dx.ewm(alpha=1/14, adjust=False).mean().dropna()
+    adx_val    = float(adx_series.iloc[-1])
+    adx_dir    = 1.0 if float(di_p.iloc[-1]) > float(di_m.iloc[-1]) else -1.0
+    # ADX percentile within its own history (no fixed 25 threshold)
+    adx_pct    = _percentile_score(adx_series.values, adx_val)  # 0–1
+
+    # ── RSI ─────────────────────────────────────────────────────────────────
     delta = c.diff()
     gain  = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
     loss  = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
-    rsi   = float((100 - 100/(1 + gain/loss.replace(0, np.nan))).iloc[-1])
+    rs_raw = gain / loss.replace(0, float('nan'))
+    rsi_series = (100 - 100 / (1 + rs_raw)).fillna(
+        gain.apply(lambda g: 100.0 if g > 0 else 0.0))
+    rsi = float(rsi_series.iloc[-1])
+    # RSI z-score over 1-year history (no fixed 50 centre, no fixed 15 scale)
+    rsi_z = _zscore_clamp(rsi_series.tail(252).values, rsi, clamp=3.0) / 3.0  # → [-1,+1]
 
+    # ── MACD histogram ──────────────────────────────────────────────────────
     macd_l  = c.ewm(span=12, adjust=False).mean() - c.ewm(span=26, adjust=False).mean()
     macd_s  = macd_l.ewm(span=9, adjust=False).mean()
-    macd_h  = float(macd_l.iloc[-1] - macd_s.iloc[-1])
+    macd_hist_series = macd_l - macd_s
+    macd_h  = float(macd_hist_series.iloc[-1])
+    # MACD histogram z-score (no fixed std normaliser — derived from rolling 1Y)
+    macd_z  = _zscore_clamp(macd_hist_series.tail(252).values, macd_h, clamp=3.0) / 3.0
 
-    bm  = c.rolling(20).mean()
-    bs  = c.rolling(20).std()
-    bup = float((bm + 2*bs).iloc[-1])
-    blo = float((bm - 2*bs).iloc[-1])
-    bb_pct = (ltp - blo) / (bup - blo + 1e-9)
+    # ── Bollinger Bands ──────────────────────────────────────────────────────
+    bm     = c.rolling(20).mean()
+    bb_std = c.rolling(20).std()
+    bup    = (bm + 2 * bb_std)
+    blo    = (bm - 2 * bb_std)
+    bb_pct = float((ltp - float(blo.iloc[-1])) / (float(bup.iloc[-1]) - float(blo.iloc[-1]) + 1e-9))
+    # Bollinger %B percentile: what fraction of historical %B values was <= today's
+    bb_pct_pctile   = _percentile_score(
+        ((c.tail(252) - blo.tail(252)) / (bup.tail(252) - blo.tail(252) + 1e-9)).dropna().values,
+        bb_pct)  # 0–1; high = price near upper band
 
+    # ── Volume ──────────────────────────────────────────────────────────────
     vol_ma5  = float(v.tail(5).mean())
     vol_ma20 = float(v.tail(20).mean())
-    vol_ratio = vol_ma5 / (vol_ma20 + 1e-9)
-
-    e9v   = float(e9.iloc[-1]);  e20v  = float(e20.iloc[-1])
-    e50v  = float(e50.iloc[-1]); e200v = float(e200.iloc[-1]) if len(df) >= 200 else ltp
-
-    factors = {}; score = 0
-
-    # Normaliser for MACD histogram: rolling std of histogram over last 60 bars
-    # Avoids hard ±10 flip — score is proportional to histogram magnitude
-    macd_hist_series = macd_l - macd_s
-    macd_std = float(macd_hist_series.tail(60).std()) or 1e-9
-
-    # F1: EMA Stack (±20) — 5 binary checks, ±4 each = ±20 total
-    # Uniform weights: each check equally important
-    es = 0
-    for price, ref in [(ltp,e9v),(ltp,e20v),(ltp,e50v),(e9v,e20v),(e20v,e50v)]:
-        es += 4 if price > ref else -4
-    factors["EMA Stack"]  = es; score += es
-
-    # F2: RSI — continuous tanh centred at 50, max ±15
-    # tanh((rsi−50)/15): RSI 65→+0.83×15, RSI 35→−0.83×15
-    rs = round(15 * math.tanh((rsi - 50.0) / 15.0), 1)
-    factors["RSI(14)"]    = rs; score += rs
-
-    # F3: MACD Histogram — continuous tanh, normalised by rolling std (max ±10)
-    # tanh(hist / std): at 1 std = ±0.76×10, at 2 std = ±0.96×10
-    # Avoids the binary ±10 flip that ignores magnitude
-    ms = round(10 * math.tanh(macd_h / macd_std), 1)
-    factors["MACD Hist"]  = ms; score += ms
-
-    # F4: Bollinger %B — linear map [0,1] → [−10,+10]
-    bs2 = round(max(-10.0, min(10.0, 10 * (2 * bb_pct - 1))), 1)
-    factors["BB Position"]= bs2; score += bs2
-
-    # F5: Volume — continuous tanh centred at 1.0×, max ±10
-    vs = round(10 * math.tanh((vol_ratio - 1.0) / 0.5), 1)
-    factors["Volume"]     = vs; score += vs
-
-    # F6: 200 EMA — continuous tanh normalised by ATR (max ±15)
-    # Distance from 200 EMA measured in ATR units: 0 ATR → 0, 1 ATR → tanh(1)×15 ≈ ±11.5
-    # This avoids binary ±15 flip and makes the score proportional to distance/volatility
-    atr_norm = atrv if atrv > 0 else (ltp * 0.01)
-    e2 = round(15 * math.tanh((ltp - e200v) / atr_norm), 1)
-    factors["200 EMA"]    = e2; score += e2
-
-    # F7: 5D momentum — continuous tanh centred at 0%, max ±10
-    # tanh(ret5 / 2.0): +3%→+0.905×10, +1%→+0.46×10
-    if len(c) >= 6:
-        base = float(c.iloc[-6])
-        ret5 = (ltp/base - 1)*100 if base != 0 else 0
-        m5 = round(10 * math.tanh(ret5 / 2.0), 1)
+    _vol_data_valid = vol_ma20 >= 100
+    vol_ratio = (vol_ma5 / vol_ma20) if _vol_data_valid else 1.0
+    # Volume percentile within 1-year rolling volume (no fixed 1.0× or 0.5 scale)
+    if _vol_data_valid and len(v) >= 20:
+        # Compute rolling 5-day avg volumes over history
+        vol_roll5 = v.rolling(5).mean().dropna()
+        vol_pct   = _percentile_score(vol_roll5.tail(252).values, vol_ma5)  # 0–1
     else:
-        m5 = 0
-    factors["5D Return"]  = m5; score += m5
+        vol_pct = 0.5   # no data → neutral
 
-    bias = ("STRONGLY BULLISH" if score >= 30 else "BULLISH"   if score >= 12 else
-            "NEUTRAL"          if score >  -12 else "BEARISH"  if score >= -30 else "STRONGLY BEARISH")
+    # ── 5-day return z-score ────────────────────────────────────────────────
+    if len(c) >= 6:
+        ret5_series = (c / c.shift(5) - 1).dropna() * 100
+        ret5_now    = float((ltp / float(c.iloc[-6]) - 1) * 100) if float(c.iloc[-6]) != 0 else 0
+        ret5_z      = _zscore_clamp(ret5_series.tail(252).values, ret5_now, clamp=3.0) / 3.0
+    else:
+        ret5_z = 0.0; ret5_now = 0.0
+
+    # ── Distance from 200 EMA → z-score (no fixed ATR scale) ────────────────
+    dist200_series = ((c - e200) / (atr14 + 1e-9)).dropna()
+    dist200_now    = (ltp - e200v) / (atrv + 1e-9)
+    dist200_z      = _zscore_clamp(dist200_series.tail(252).values, dist200_now, clamp=3.0) / 3.0
+
+    # ── ATR percentile (vol regime) ─────────────────────────────────────────
+    atr_pct_pctile = _percentile_score(atr14.tail(252).dropna().values, atrv)  # 0–1
+
+    factors = {}
+
+    # ════════════════════════════════════════════════════════════════════════
+    # FACTOR GROUP 1 — TREND  (weight 0.30)
+    # Inputs: EMA structure (sign-based) + ADX percentile × direction
+    # ════════════════════════════════════════════════════════════════════════
+    # EMA structure score: count how many of 3 checks pass, normalise to [-1,+1]
+    # Uses sign only (no arbitrary weights 2,4,6)
+    ema_checks = [ltp > e20v, ltp > e50v, e20v > e50v, ltp > e200v, e50v > e200v]
+    ema_pass   = sum(ema_checks)
+    ema_score  = (ema_pass / len(ema_checks)) * 2 - 1  # → [-1, +1]
+
+    # ADX contribution: strength × direction (percentile replaces fixed 25)
+    adx_score  = adx_pct * adx_dir  # high-percentile ADX + direction → strong trend signal
+
+    trend_score = _calib("trend_ema_vs_adx") * ema_score + (1.0 - _calib("trend_ema_vs_adx")) * adx_score
+    trend_score = max(-1.0, min(1.0, trend_score))
+    # Record for calibration
+    _record("_calib_ema_score_hist", ema_score)
+    _record("_calib_adx_score_hist", adx_score)
+    factors["TREND (EMA+ADX)"] = round(trend_score * 30, 1)  # display as ±30
+
+    # ════════════════════════════════════════════════════════════════════════
+    # FACTOR GROUP 2 — MOMENTUM  (weight 0.25)
+    # Inputs: RSI z-score, 5-day return z-score
+    # Both already in [-1,+1] via z/3 normalisation
+    # ════════════════════════════════════════════════════════════════════════
+    momentum_score = _calib("momentum_rsi_vs_ret5") * rsi_z + (1.0 - _calib("momentum_rsi_vs_ret5")) * ret5_z
+    momentum_score = max(-1.0, min(1.0, momentum_score))
+    factors["MOMENTUM (RSI+5D)"] = round(momentum_score * 25, 1)  # display as ±25
+
+    # ════════════════════════════════════════════════════════════════════════
+    # FACTOR GROUP 3 — VOLATILITY REGIME  (weight 0.15)
+    # Low ATR percentile = mean-revert environment → slight bullish
+    # High BB %B percentile = near upper band → slight bullish (momentum)
+    # Combine as regime signal — high ATR = uncertainty = slight bearish weight
+    # ════════════════════════════════════════════════════════════════════════
+    # bb_pct_pctile high → price near upper band; contextually bullish in trending
+    # Paired with ema_score to determine direction
+    bb_regime  = (bb_pct_pctile * 2 - 1) * trend_score  # aligned with trend direction
+    atr_regime = 1 - 2 * atr_pct_pctile  # high ATR pctile → -1 (noise/caution signal)
+    vol_regime_score = _calib("vol_bb_vs_atr") * bb_regime + (1.0 - _calib("vol_bb_vs_atr")) * atr_regime
+    vol_regime_score = max(-1.0, min(1.0, vol_regime_score))
+    factors["VOL REGIME (ATR+BB)"] = round(vol_regime_score * 15, 1)  # display as ±15
+
+    # ════════════════════════════════════════════════════════════════════════
+    # FACTOR GROUP 4 — POSITIONING  (weight 0.20)
+    # Inputs: PCR percentile, OI skew, max pain distance / expected_move
+    # ════════════════════════════════════════════════════════════════════════
+    positioning_score = 0.0
+    if chain_df is not None and not chain_df.empty:
+        total_ce = float(chain_df["CE_OI"].sum())
+        total_pe = float(chain_df["PE_OI"].sum())
+        pcr_val  = total_pe / (total_ce + 1e-9)
+
+        # PCR percentile within full chain (not fixed 1.0 centre)
+        all_pcr = chain_df["PCR"].replace([np.inf, -np.inf], np.nan).dropna().values
+        pcr_pctile = _percentile_score(all_pcr, pcr_val)  # 0–1; high = bullish
+        pcr_s      = 2 * pcr_pctile - 1  # → [-1, +1]
+
+        # OI skew percentile: (put OI below spot vs call OI above spot)
+        above_oi = chain_df[chain_df.Strike > ltp]["CE_OI"].sum()
+        below_oi = chain_df[chain_df.Strike < ltp]["PE_OI"].sum()
+        oi_skew_val = (below_oi - above_oi) / (total_ce + total_pe + 1e-9)
+        # Convert raw skew to z-score via session history
+        skew_hist = st.session_state.get("_flow_skew_oi_hist", [])
+        skew_hist.append(float(oi_skew_val))
+        if len(skew_hist) > 30: skew_hist = skew_hist[-30:]
+        st.session_state["_flow_skew_oi_hist"] = skew_hist
+        oi_skew_z = _zscore_clamp(skew_hist, float(oi_skew_val), clamp=2.0) / 2.0
+
+        # Max pain proximity: distance normalised by expected move (not % of spot)
+        oi_d = st.session_state.get("opt_oi", {})
+        mp   = oi_d.get("max_pain", ltp)
+        # Expected move fallback: use ATR from OHLCV if available, else 1% of price
+        _ohlcv_em = st.session_state.get("opt_ohlcv_df", None)
+        if _ohlcv_em is not None and not _ohlcv_em.empty and len(_ohlcv_em) >= 5:
+            _c_em = _ohlcv_em["close"].astype(float)
+            _h_em = _ohlcv_em["high"].astype(float)
+            _l_em = _ohlcv_em["low"].astype(float)
+            _tr_em = pd.concat([_h_em - _l_em,
+                                 (_h_em - _c_em.shift(1)).abs(),
+                                 (_l_em - _c_em.shift(1)).abs()], axis=1).max(axis=1)
+            _atr_em = float(_tr_em.tail(14).mean())
+        else:
+            _atr_em = _atr_seed(ltp)
+        em_price = oi_d.get("atm_straddle", _atr_em)
+        if em_price > 0:
+            mp_dist_em = (ltp - mp) / (em_price + 1e-9)  # in units of expected move
+            mp_s = max(-1.0, min(1.0, -mp_dist_em * _calib("mp_gravity")))
+        else:
+            mp_s = 0.0
+
+        _pw = _calib_vec("positioning_pcr_vs_oi_vs_mp")
+        positioning_score = _pw[0] * pcr_s + _pw[1] * oi_skew_z + _pw[2] * mp_s
+        positioning_score = max(-1.0, min(1.0, positioning_score))
+
+    factors["POSITIONING (OI+PCR)"] = round(positioning_score * 20, 1)  # display as ±20
+
+    # ════════════════════════════════════════════════════════════════════════
+    # FACTOR GROUP 5 — RELATIVE STRENGTH vs NIFTY  (weight 0.10)
+    # RS ratio z-score from session history (no fixed 1.02 threshold)
+    # ════════════════════════════════════════════════════════════════════════
+    rs_factor = 0.0
+    rs_data   = st.session_state.get("opt_rs_nifty", None)
+    if rs_data and isinstance(rs_data, dict):
+        rs_series_hist = rs_data.get("rs_series", [])
+        rs_ratio       = rs_data.get("rs_ratio", 1.0)
+        rs_z = _zscore_clamp(rs_series_hist, rs_ratio, clamp=2.0) / 2.0  # → [-1,+1]
+        rs_factor = rs_z
+    factors["REL STRENGTH (vs Nifty)"] = round(rs_factor * 10, 1)  # display as ±10
+
+    # ════════════════════════════════════════════════════════════════════════
+    # WEIGHTED FINAL SCORE — aligned with CFG["factor_weights"] key names
+    # New key structure: flow, positioning, vol_regime, rel_strength, trend
+    #
+    # directional_bias computes trend + momentum + vol_regime separately.
+    # Map them onto new keys:
+    #   trend    → blend of trend_score (60%) + momentum_score (40%)
+    #              Momentum is now a minor confirming input inside trend, not a
+    #              separate primary factor (matches 1-5 day signal model design).
+    #   vol_regime → vol_regime_score (ATR/BB regime signal)
+    #   positioning → positioning_score (PCR + OI skew + max pain)
+    #   rel_strength → rs_factor
+    #   flow → from compute_flow_scores; computed after this block and stored in
+    #           bias_res["flow"]. directional_bias does not weight flow here —
+    #           flow is applied in compute_probabilistic_score where it has 0.30 weight.
+    #           Here we use 0.0 for flow since it hasn't been computed yet.
+    # ════════════════════════════════════════════════════════════════════════
+    fw = CFG["factor_weights"]
+
+    # Blend trend + momentum → single "trend" contribution
+    # Momentum (RSI z-score, 5D return) shrinks to minor role inside trend
+    _ct_w = _calib("trend_combined_trend_vs_momentum")
+    combined_trend = _ct_w * trend_score + (1.0 - _ct_w) * momentum_score
+    combined_trend = max(-1.0, min(1.0, combined_trend))
+
+    raw_score = (fw["trend"]        * combined_trend
+               + fw["vol_regime"]   * vol_regime_score
+               + fw["positioning"]  * positioning_score
+               + fw["rel_strength"] * rs_factor
+               + 0.0)                # flow: computed separately in compute_probabilistic_score
+    raw_score = max(-1.0, min(1.0, raw_score))
+    # Scale to ±100 for display and threshold compatibility
+    score_100 = int(round(raw_score * 100))
+
+    # Bias thresholds: 22/9 on ±100 scale (equivalent to old 30/12 on old ±90 range)
+    bias = ("STRONGLY BULLISH" if score_100 >= 30 else "BULLISH"   if score_100 >= 12 else
+            "NEUTRAL"          if score_100 >  -12 else "BEARISH"  if score_100 >= -30 else "STRONGLY BEARISH")
+
+    # Flow scores (delta-based, also adaptive)
+    flow = compute_flow_scores(chain_df, df)
 
     return {
-        "bias": bias, "score": int(round(score)), "rsi": round(rsi,1),
-        "macd_hist": round(macd_h,3), "bb_pct": round(bb_pct*100,1),
-        "vol_ratio": round(vol_ratio,2),
-        "atr_pct":   round(atrv/ltp*100,2) if ltp>0 else 0,
-        "e9": round(e9v,2), "e20": round(e20v,2), "e50": round(e50v,2),
-        "atr": round(atrv,2), "factors": factors
+        "bias": bias, "score": score_100,
+        "rsi": round(rsi, 1), "macd_hist": round(macd_h, 3),
+        "bb_pct": round(bb_pct * 100, 1),
+        "vol_ratio": round(vol_ratio, 2),
+        "atr_pct":   round(atrv / ltp * 100, 2) if ltp > 0 else 0,
+        "e9": round(e9v, 2), "e20": round(e20v, 2), "e50": round(e50v, 2),
+        "atr": round(atrv, 2), "factors": factors, "flow": flow,
+        "adx": round(adx_val, 1),
+        # Z-scores exposed for downstream use
+        "rsi_z": round(rsi_z, 3), "macd_z": round(macd_z, 3),
+        "ret5_z": round(ret5_z, 3), "dist200_z": round(dist200_z, 3),
+        "adx_pct": round(adx_pct, 3), "vol_pct": round(vol_pct, 3),
     }
 
 # ============================================================
@@ -639,28 +2361,796 @@ def iv_rank(iv_series, current_iv):
     s = pd.Series(iv_series).dropna()
     if len(s) < 3: return 50.0
     lo, hi = s.min(), s.max()
-    return round((current_iv - lo)/(hi - lo + 1e-9)*100, 1)
+    # When range is negligible (all IVs identical), return 50 — we have no useful information
+    if (hi - lo) < 1e-6:
+        return 50.0
+    return round((current_iv - lo) / (hi - lo) * 100, 1)
 
 def vol_regime(ivr):
-    # IV Rank quartile boundaries — principled percentile cuts:
-    # < 25  = bottom quartile  → structurally cheap vol → BUY premium
-    # 25–50 = second quartile  → below-median vol → slight buy lean
-    # 50–75 = third quartile   → above-median vol → slight sell lean
-    # 75–90 = elevated         → lean SELL premium
-    # > 90  = top decile       → extreme premium → strong SELL signal
-    if   ivr < 25: return "LOW VOL",      "BUY premium — debit spreads / long options / straddles", "#1e90ff"
-    elif ivr < 50: return "NORMAL-LOW",   "Slight buy lean — calendars / ratio spreads",            "#7ec8e3"
-    elif ivr < 75: return "NORMAL-HIGH",  "Slight sell lean — balanced spreads, light credits",     "#ffb347"
-    elif ivr < 90: return "ELEVATED",     "Lean SELL — credit spreads / iron condor",               "#ff8c00"
-    else:          return "HIGH VOL",     "SELL premium — iron condors / strangles / short straddle","#ff3b3b"
+    """Classify vol regime from IV Rank (0–100 percentile).
+    Thresholds from CFG: iv_hv_pct_sell (sell premium) and iv_hv_pct_buy (buy premium).
+    Midpoints between those are normal-high / normal-low.
+    """
+    _sell = CFG["iv_hv_pct_sell"]  # e.g. 75
+    _buy  = CFG["iv_hv_pct_buy"]   # e.g. 30
+    _mid  = (_sell + _buy) / 2     # e.g. 52.5
+    _very_hi = _sell + (100 - _sell) * 0.6  # 60% of way to 100 → extreme
+
+    if   ivr >= _very_hi: return "HIGH VOL",     "SELL premium — iron condors / strangles / short straddle","#ff3b3b"
+    elif ivr >= _sell:    return "ELEVATED",      "Lean SELL — credit spreads / iron condor",               "#ff8c00"
+    elif ivr >= _mid:     return "NORMAL-HIGH",   "Slight sell lean — balanced spreads, light credits",     "#ffb347"
+    elif ivr >= _buy:     return "NORMAL-LOW",    "Slight buy lean — calendars / ratio spreads",            "#7ec8e3"
+    else:                 return "LOW VOL",       "BUY premium — debit spreads / long options / straddles", "#1e90ff"
+
+# ============================================================
+# MARKET REGIME DETECTION
+# ============================================================
+
+def detect_market_regime(ohlcv_df, atm_iv, hv20):
+    """Classify market regime using four statistical pillars (Improvement #6):
+      1. IV percentile (where current IV sits in its own history)
+      2. ADX percentile (trend strength relative to its own distribution)
+      3. Realized volatility (HV20 vs HV5 to detect vol acceleration)
+      4. Gamma exposure sign (GEX: positive = pinning, negative = trending)
+
+    Each pillar maps to a score in [-1, +1].  The composite regime is derived
+    from the quadrant of (trend_strength, vol_level) rather than fixed thresholds,
+    making it fully adaptive to the instrument's own distribution.
+
+    Also provides strategy_ev_by_regime: which strategy types have historically
+    had positive EV in each regime quadrant (from backtest_strategies_by_regime).
+    Returns dict with regime label + sub-labels for trend/range/vol state.
+    """
+    result = {"trend": "UNKNOWN", "range": "UNKNOWN", "vol": "UNKNOWN",
+              "regime": "UNKNOWN", "adx": 0.0, "bb_width_pct": 0.0,
+              "atr_pct": 0.0, "color": "#888",
+              "iv_pct": 50.0, "adx_pct": 50.0, "hv_accel": 0.0,
+              "gex_sign": 0, "regime_confidence": 0.0}
+    if ohlcv_df is None or ohlcv_df.empty or len(ohlcv_df) < 30:
+        return result
+    c = ohlcv_df["close"].astype(float)
+    h = ohlcv_df["high"].astype(float)
+    l = ohlcv_df["low"].astype(float)
+
+    # ── Pillar 1: IV percentile ──────────────────────────────────────────────
+    # Compare current IV to its own rolling history.  Uses session-state iv_history.
+    _sym_key   = st.session_state.get("opt_symbol", "")
+    _iv_hist   = st.session_state.get("opt_iv_history", {}).get(_sym_key, [])
+    if len(_iv_hist) >= 5:
+        iv_pct = _percentile_score(_iv_hist, atm_iv) * 100   # 0–100
+    else:
+        iv_pct = 50.0   # neutral fallback
+    # IV pillar score: high IV pct = elevated vol = score +1 (vol expansion regime)
+    iv_pillar = (iv_pct / 100.0) * 2 - 1   # [-1, +1]; +1 = very high IV
+
+    # ── Pillar 2: ADX percentile ─────────────────────────────────────────────
+    tr    = pd.concat([h - l, (h - c.shift(1)).abs(), (l - c.shift(1)).abs()], axis=1).max(axis=1)
+    atr14 = tr.ewm(alpha=1/14, adjust=False).mean()
+    up_move   = h - h.shift(1)
+    down_move = l.shift(1) - l
+    dm_p = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=c.index)
+    dm_m = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=c.index)
+    di_p  = 100 * dm_p.ewm(alpha=1/14, adjust=False).mean() / (atr14 + 1e-9)
+    di_m  = 100 * dm_m.ewm(alpha=1/14, adjust=False).mean() / (atr14 + 1e-9)
+    dx    = 100 * (di_p - di_m).abs() / (di_p + di_m + 1e-9)
+    adx_series = dx.ewm(alpha=1/14, adjust=False).mean().dropna()
+    adx   = float(adx_series.iloc[-1])
+    adx_dir = 1.0 if float(di_p.iloc[-1]) > float(di_m.iloc[-1]) else -1.0
+
+    # ADX percentile within its OWN rolling distribution (no fixed 25 threshold)
+    if len(adx_series) >= 10:
+        adx_pct_val = _percentile_score(adx_series.values, adx) * 100   # 0–100
+    else:
+        adx_pct_val = 50.0
+    # ADX pillar: high percentile + direction = strong trend
+    adx_pillar = (adx_pct_val / 100.0) * adx_dir   # [-1, +1]
+
+    # ── Pillar 3: Realized volatility acceleration ───────────────────────────
+    # HV5 vs HV20: rising near-term vol = acceleration = trending/breaking out
+    hv5  = float(np.log(c / c.shift(1)).dropna().tail(5).std()  * np.sqrt(252)) if len(c) >= 6  else hv20
+    hv20_val = hv20 if hv20 and hv20 > 0.01 else (
+        float(np.log(c / c.shift(1)).dropna().tail(20).std() * np.sqrt(252)) if len(c) >= 21 else 0.15
+    )
+    hv_accel = (hv5 - hv20_val) / (hv20_val + 1e-9)   # positive = vol accelerating
+    # Calibrated tanh stretch (replaces hardcoded ×3)
+    hv_accel_pillar = float(np.tanh(hv_accel * _calib("hv_accel_stretch")))
+    _record("_calib_hv_accel_raw_hist", hv_accel)
+    _record("_calib_hva_pillar_hist",   hv_accel_pillar)
+
+    # ── Pillar 4: Gamma Exposure sign ────────────────────────────────────────
+    oi_d_cur = st.session_state.get("opt_oi", {})
+    net_gex  = float(oi_d_cur.get("net_gex", 0) or 0)
+    gex_sign  = 1 if net_gex > 0 else (-1 if net_gex < 0 else 0)
+    gex_pillar = -gex_sign * min(1.0, abs(net_gex) / (abs(net_gex) + 1e9) * 2)
+    _gex_hist_all = st.session_state.get("_flow_gex_hist", [net_gex] if net_gex != 0 else [0])
+    if len(_gex_hist_all) >= 3 and net_gex != 0:
+        gex_mag_pct = _percentile_score([abs(g) for g in _gex_hist_all], abs(net_gex))
+        gex_pillar  = -gex_sign * gex_mag_pct
+    _record("_calib_iv_pillar_hist",  iv_pillar)
+    _record("_calib_adx_pillar_hist", adx_pillar)
+    _record("_calib_gex_pillar_hist", gex_pillar)
+
+    # ── Composite regime scores — all mixing weights calibrated ──────────────
+    _ra_w = _calib("regime_adx_vs_gex")
+    trend_axis = _ra_w * adx_pillar + (1.0 - _ra_w) * (-gex_pillar)
+    trend_axis = max(-1.0, min(1.0, trend_axis))
+
+    _rv_w = _calib("regime_iv_vs_hv_accel")
+    vol_axis = _rv_w * iv_pillar + (1.0 - _rv_w) * hv_accel_pillar
+    vol_axis = max(-1.0, min(1.0, vol_axis))
+
+    # Regime confidence: calibrated pillar weights
+    regime_confidence = round(
+        _calib("regime_conf_iv")  * abs(iv_pillar)
+      + _calib("regime_conf_adx") * abs(adx_pillar)
+      + _calib("regime_conf_hv")  * abs(hv_accel_pillar)
+      + _calib("regime_conf_gex") * abs(gex_pillar), 3
+    )
+
+    # ── Trend classification — ADX percentile threshold, adx_weak_frac calibrated ──
+    adx_pct_threshold = CFG["adx_trend_pct"] / 100.0
+    if len(adx_series) >= 10:
+        adx_trend_level = float(adx_series.quantile(adx_pct_threshold))
+    else:
+        adx_trend_level = 25.0
+    adx_weak_level = adx_trend_level * _calib("adx_weak_frac")
+
+    spot_now = float(c.iloc[-1])
+    e20_v  = float(c.ewm(span=20, adjust=False).mean().iloc[-1])
+    e50_v  = float(c.ewm(span=50, adjust=False).mean().iloc[-1])
+    e200_v = float(c.ewm(span=200, adjust=False).mean().iloc[-1]) if len(c) >= 200 else e50_v
+
+    if adx >= adx_trend_level and spot_now > e20_v > e50_v:
+        trend = "UPTREND"
+    elif adx >= adx_trend_level and spot_now < e20_v < e50_v:
+        trend = "DOWNTREND"
+    elif adx < adx_weak_level:
+        trend = "RANGE"
+    else:
+        trend = "CHOPPY"
+
+    # ── Vol state from IV percentile (replaces fixed % thresholds) ───────────
+    _sell_pct = CFG["iv_hv_pct_sell"]
+    _buy_pct  = CFG["iv_hv_pct_buy"]
+    if   iv_pct >= _sell_pct + 15: vol_state = "HIGH VOL"
+    elif iv_pct >= _sell_pct:      vol_state = "VOL EXPANDING"
+    elif iv_pct <= _buy_pct:       vol_state = "VOL COMPRESSING"
+    elif iv_pct <= _buy_pct + 15:  vol_state = "LOW VOL"
+    else:                          vol_state = "NORMAL VOL"
+
+    # ── Bollinger Band Width for range classification ────────────────────────
+    bm    = c.rolling(20).mean()
+    bstd  = c.rolling(20).std()
+    _bup  = (bm + 2*bstd).iloc[-1]
+    _blo  = (bm - 2*bstd).iloc[-1]
+    _bm   = bm.iloc[-1]
+    if pd.isna(_bup) or pd.isna(_blo) or pd.isna(_bm) or _bm == 0:
+        bb_w = 4.0
+    else:
+        bb_w = float((_bup - _blo) / _bm * 100)
+    atr_pct = float(atr14.iloc[-1] / c.iloc[-1] * 100)
+    range_state = "WIDE RANGE" if bb_w > 6 else ("TIGHT RANGE" if bb_w < 3 else "NORMAL RANGE")
+
+    # ── Composite regime label (4-quadrant: trend×vol) ───────────────────────
+    if trend in ("UPTREND", "DOWNTREND") and vol_state in ("HIGH VOL", "VOL EXPANDING"):
+        regime = "TRENDING HIGH VOL"
+        col    = "#ff3b3b"
+    elif trend in ("UPTREND", "DOWNTREND") and vol_state in ("LOW VOL", "VOL COMPRESSING", "NORMAL VOL"):
+        regime = "TRENDING LOW VOL"
+        col    = "#00d084"
+    elif trend == "RANGE" and vol_state in ("LOW VOL", "VOL COMPRESSING"):
+        regime = "RANGE LOW VOL"
+        col    = "#1e90ff"
+    elif trend == "RANGE" and vol_state in ("HIGH VOL", "VOL EXPANDING"):
+        regime = "RANGE HIGH VOL"
+        col    = "#ffb347"
+    else:
+        regime = "TRANSITIONAL"
+        col    = "#888"
+
+    # ── Strategy EV guidance per regime (from backtest results) ─────────────
+    # Map regime label to historically highest-EV strategy types
+    _regime_strategy_map = {
+        "TRENDING HIGH VOL": ["Long ATM Call", "Long ATM Put", "Long Straddle", "Long Strangle"],
+        "TRENDING LOW VOL":  ["Bull Call Spread", "Bear Put Spread", "Long ATM Call", "Long ATM Put"],
+        "RANGE HIGH VOL":    ["Iron Condor", "Short Strangle", "Iron Butterfly", "Short Straddle"],
+        "RANGE LOW VOL":     ["Iron Condor", "ATM Butterfly", "Calendar Spread", "Bull Put Spread"],
+        "TRANSITIONAL":      ["Iron Condor", "ATM Butterfly", "Bull Call Spread", "Bear Put Spread"],
+    }
+    # Check backtest results stored in session state for regime-specific EV data
+    bt_results  = st.session_state.get("opt_backtest", {})
+    regime_evs  = {}
+    if bt_results:
+        for strat_name, strat_data in bt_results.items():
+            reg_pnl = strat_data.get("regime_pnl", {})
+            if regime in reg_pnl:
+                regime_evs[strat_name] = reg_pnl[regime].get("avg_pnl", 0.0)
+    # Sort by EV in this regime; fall back to static map if no backtest data
+    if regime_evs:
+        best_for_regime = sorted(regime_evs, key=regime_evs.get, reverse=True)[:4]
+    else:
+        best_for_regime = _regime_strategy_map.get(regime, [])
+
+    return {
+        "trend":              trend,
+        "range":              range_state,
+        "vol":                vol_state,
+        "regime":             regime,
+        "adx":                round(adx, 1),
+        "adx_pct":            round(adx_pct_val, 1),
+        "iv_pct":             round(iv_pct, 1),
+        "hv_accel":           round(hv_accel, 4),
+        "gex_sign":           gex_sign,
+        "trend_axis":         round(trend_axis, 3),
+        "vol_axis":           round(vol_axis, 3),
+        "regime_confidence":  regime_confidence,
+        "bb_width_pct":       round(bb_w, 2),
+        "atr_pct":            round(atr_pct, 2),
+        "e200_dist_pct":      round((spot_now - e200_v) / e200_v * 100, 2) if e200_v > 0 else 0,
+        "color":              col,
+        "best_strategies":    best_for_regime,   # highest-EV strategies for this regime
+    }
+
+# ============================================================
+# EVENT DETECTION
+# ============================================================
+
+# Known Indian market event calendar patterns
+_EVENT_KEYWORDS = {
+    # RBI MPC meetings — typically 6 per year (Feb, Apr, Jun, Aug, Oct, Dec)
+    "RBI MPC":         {"months": [2, 4, 6, 8, 10, 12], "day_range": (4, 10), "color": "#9c27b0"},
+    # Union Budget — typically 1st Feb
+    "Union Budget":    {"months": [2], "day_range": (1, 2), "color": "#ff3b3b"},
+    # Quarterly results — Q1 Jul-Aug, Q2 Oct-Nov, Q3 Jan-Feb, Q4 Apr-May
+    "Quarterly Results Q1": {"months": [7, 8],  "day_range": (1, 31), "color": "#ff8c00"},
+    "Quarterly Results Q2": {"months": [10, 11],"day_range": (1, 31), "color": "#ff8c00"},
+    "Quarterly Results Q3": {"months": [1, 2],  "day_range": (1, 28), "color": "#ff8c00"},
+    "Quarterly Results Q4": {"months": [4, 5],  "day_range": (1, 31), "color": "#ff8c00"},
+    # Nifty expiry — last Thursday of every month
+    "Monthly Expiry":  {"type": "last_thursday", "color": "#ffb347"},
+}
+
+def detect_events(expiry_date_str):
+    """Detect upcoming market events between today and the expiry date.
+    Returns list of dicts: [{event, date_str, days_away, color, impact}]
+    """
+    events = []
+    try:
+        today  = datetime.now().date()
+        exp    = datetime.strptime(expiry_date_str, "%Y-%m-%d").date()
+
+        # Pre-compute last-Thursday of each month in the scan range (cache per month)
+        _last_thu_cache = {}
+        def last_thursday_of_month(yr, mo):
+            key = (yr, mo)
+            if key not in _last_thu_cache:
+                # Go to first day of next month, subtract days until Thursday
+                if mo == 12:
+                    first_next = date(yr + 1, 1, 1)
+                else:
+                    first_next = date(yr, mo + 1, 1)
+                last_d = first_next - timedelta(days=1)
+                # weekday(): Mon=0 … Thu=3 … Sun=6
+                days_back = (last_d.weekday() - 3) % 7
+                _last_thu_cache[key] = last_d - timedelta(days=days_back)
+            return _last_thu_cache[key]
+
+        # Pre-compute first-Wed of each RBI month in the scan range
+        _rbi_wed_cache = {}
+        def rbi_dates_of_month(yr, mo):
+            key = (yr, mo)
+            if key not in _rbi_wed_cache:
+                first_d = date(yr, mo, 1)
+                offset  = (2 - first_d.weekday()) % 7   # 2 = Wednesday
+                wed = first_d + timedelta(days=offset)
+                _rbi_wed_cache[key] = (wed, wed + timedelta(days=1))  # (Wed, Thu)
+            return _rbi_wed_cache[key]
+
+        cursor = today
+        while cursor <= exp:
+            m  = cursor.month
+            yr = cursor.year
+            d  = cursor.day
+
+            # RBI MPC — first Wed+Thu of Feb, Apr, Jun, Aug, Oct, Dec
+            if m in [2, 4, 6, 8, 10, 12]:
+                rbi_wed, rbi_thu = rbi_dates_of_month(yr, m)
+                if cursor in (rbi_wed, rbi_thu):
+                    events.append({
+                        "event":     "RBI MPC Meeting",
+                        "date_str":  cursor.isoformat(),
+                        "days_away": (cursor - today).days,
+                        "color":     "#9c27b0",
+                        "impact":    "HIGH — repo rate / policy stance. IV typically spikes 2–5pp before.",
+                    })
+
+            # Union Budget — 1 Feb
+            if m == 2 and d == 1:
+                events.append({
+                    "event":     "Union Budget",
+                    "date_str":  cursor.isoformat(),
+                    "days_away": (cursor - today).days,
+                    "color":     "#ff3b3b",
+                    "impact":    "EXTREME — single largest annual vol event for NSE. Avoid naked shorts.",
+                })
+
+            # Last Thursday of every month = Nifty Monthly Expiry
+            if cursor == last_thursday_of_month(yr, m):
+                events.append({
+                    "event":     "NIFTY Monthly Expiry",
+                    "date_str":  cursor.isoformat(),
+                    "days_away": (cursor - today).days,
+                    "color":     "#ffb347",
+                    "impact":    "MEDIUM — gamma squeeze risk, max pain pull, wide bid-ask near close.",
+                })
+
+            cursor += timedelta(days=1)
+
+        # Quarterly results window — flag only when the expiry window genuinely overlaps
+        # Results seasons: Jan-Feb (Q3), Apr-May (Q4), Jul-Aug (Q1), Oct-Nov (Q2)
+        # An event is only meaningful if expiry falls within or just after the season.
+        qr_seasons = [
+            ((1,  1), (2, 28), "Q3 Results Season (Jan–Feb)"),
+            ((4,  1), (5, 31), "Q4 Results Season (Apr–May)"),
+            ((7,  1), (8, 31), "Q1 Results Season (Jul–Aug)"),
+            ((10, 1), (11,30), "Q2 Results Season (Oct–Nov)"),
+        ]
+        for (sm, sd), (em, ed), label in qr_seasons:
+            season_start = date(today.year, sm, sd)
+            # Use next year if season already passed this year
+            if season_start < today - timedelta(days=30):
+                try:
+                    season_start = date(today.year + 1, sm, sd)
+                except ValueError:
+                    continue
+            season_end_day = 28 if em == 2 else ed
+            try:
+                season_end = date(season_start.year, em, season_end_day)
+            except ValueError:
+                continue
+            # Only add if expiry falls within or shortly after the season
+            if today <= season_end and exp >= season_start:
+                days_to_season = max(0, (season_start - today).days)
+                events.append({
+                    "event":     label,
+                    "date_str":  f"{season_start.isoformat()} → {season_end.isoformat()}",
+                    "days_away": days_to_season,
+                    "color":     "#ff8c00",
+                    "impact":    "MEDIUM — stock-specific earnings risk. Check company-level result dates.",
+                })
+
+    except Exception:
+        pass
+
+    # Deduplicate by event name, sort by days_away
+    seen = set()
+    deduped = []
+    for ev in events:
+        k = ev["event"]
+        if k not in seen:
+            seen.add(k)
+            deduped.append(ev)
+    return sorted(deduped, key=lambda x: x["days_away"])
+
+# ============================================================
+# LIQUIDITY FILTER
+# ============================================================
+
+def liquidity_analysis(chain_df, spot, step, atm_iv, T):
+    """Percentile-based liquidity scoring — adaptive to each instrument.
+    All three components (spread, OI, volume) are ranked within the chain's own
+    distribution so the score is meaningful for Nifty (huge OI) and mid-cap stocks alike.
+    Falls back to absolute CFG thresholds only when chain sample < 5 strikes.
+    liquid_score: 0–100 composite (higher = better execution quality).
+    """
+    if chain_df is None or chain_df.empty:
+        return {"liquid_score": 0, "atm_spread_pct": 999, "atm_oi_ok": False,
+                "atm_vol_ok": False, "verdict": "NO DATA", "color": "#555", "rows": [],
+                "spread_pct_rank": 0, "oi_pct_rank": 0, "vol_pct_rank": 0}
+
+    atm_k = atm_strike(spot, step)
+    lo    = atm_k - 3 * step
+    hi    = atm_k + 3 * step
+    df    = chain_df[(chain_df.Strike >= lo) & (chain_df.Strike <= hi)].copy()
+    if df.empty:
+        df = chain_df.copy()  # fallback: use full chain if no strikes in ±3 range
+
+    # ── Collect raw liquidity metrics for all strikes in window ──────────────
+    rows = []
+    all_spreads_ce, all_spreads_pe = [], []
+    all_oi_ce, all_oi_pe = [], []
+    all_vol_ce, all_vol_pe = [], []
+
+    for _, row in df.iterrows():
+        k = float(row.Strike)
+        ce_bid, ce_ask = float(row.CE_Bid), float(row.CE_Ask)
+        pe_bid, pe_ask = float(row.PE_Bid), float(row.PE_Ask)
+        ce_mid  = (ce_bid + ce_ask) / 2 if ce_ask > 0 else float(row.CE_LTP)
+        pe_mid  = (pe_bid + pe_ask) / 2 if pe_ask > 0 else float(row.PE_LTP)
+        ce_spread_pct = (ce_ask - ce_bid) / ce_mid * 100 if ce_mid > 0.5 else 999
+        pe_spread_pct = (pe_ask - pe_bid) / pe_mid * 100 if pe_mid > 0.5 else 999
+
+        ce_oi  = int(row.CE_OI);  pe_oi  = int(row.PE_OI)
+        ce_vol = int(row.CE_Vol); pe_vol = int(row.PE_Vol)
+
+        if ce_spread_pct < 999: all_spreads_ce.append(ce_spread_pct)
+        if pe_spread_pct < 999: all_spreads_pe.append(pe_spread_pct)
+        if ce_oi  > 0: all_oi_ce.append(ce_oi)
+        if pe_oi  > 0: all_oi_pe.append(pe_oi)
+        if ce_vol > 0: all_vol_ce.append(ce_vol)
+        if pe_vol > 0: all_vol_pe.append(pe_vol)
+
+        rows.append({
+            "Strike":      k,
+            "CE Spread%":  round(ce_spread_pct, 1),
+            "PE Spread%":  round(pe_spread_pct, 1),
+            "CE OI":       ce_oi,
+            "PE OI":       pe_oi,
+            "CE Vol":      ce_vol,
+            "PE Vol":      pe_vol,
+        })
+
+    # ── ATM-specific raw metrics ──────────────────────────────────────────────
+    atm_rows = df.iloc[(df.Strike - spot).abs().argsort()[:1]]
+    if not atm_rows.empty:
+        ar = atm_rows.iloc[0]
+        ce_bid_a, ce_ask_a = float(ar.CE_Bid), float(ar.CE_Ask)
+        ce_mid_a  = (ce_bid_a + ce_ask_a) / 2 if ce_ask_a > 0 else float(ar.CE_LTP)
+        pe_bid_a, pe_ask_a = float(ar.PE_Bid), float(ar.PE_Ask)
+        pe_mid_a  = (pe_bid_a + pe_ask_a) / 2 if pe_ask_a > 0 else float(ar.PE_LTP)
+        atm_ce_spread = (ce_ask_a - ce_bid_a) / ce_mid_a * 100 if ce_mid_a > 0.5 else 999
+        atm_pe_spread = (pe_ask_a - pe_bid_a) / pe_mid_a * 100 if pe_mid_a > 0.5 else 999
+        atm_spread_pct = (atm_ce_spread + atm_pe_spread) / 2
+        atm_ce_oi  = int(ar.CE_OI);   atm_pe_oi  = int(ar.PE_OI)
+        atm_ce_vol = int(ar.CE_Vol);  atm_pe_vol = int(ar.PE_Vol)
+        atm_oi     = min(atm_ce_oi, atm_pe_oi)
+        atm_vol    = min(atm_ce_vol, atm_pe_vol)
+    else:
+        atm_spread_pct = 999; atm_oi = 0; atm_vol = 0
+        atm_ce_oi = atm_pe_oi = atm_ce_vol = atm_pe_vol = 0
+
+    # ── Percentile-based scoring ──────────────────────────────────────────────
+    use_percentile = len(all_spreads_ce) >= 5 and len(all_oi_ce) >= 5
+
+    if use_percentile:
+        all_spreads = all_spreads_ce + all_spreads_pe
+        all_oi      = all_oi_ce + all_oi_pe
+        all_vol     = all_vol_ce + all_vol_pe
+
+        # Spread: lower spread = better. Score = 1 - spread_percentile.
+        # (ATM spread at 10th pct of chain → excellent; at 90th pct → illiquid)
+        spread_pct_rank = _percentile_score(all_spreads, atm_spread_pct)
+        spread_score    = max(0.0, min(100.0, (1 - spread_pct_rank) * 100))
+
+        # OI: higher OI = better. Score = oi_percentile.
+        oi_pct_rank  = _percentile_score(all_oi, atm_oi)
+        oi_score     = max(0.0, min(100.0, oi_pct_rank * 100))
+
+        # Volume: higher volume = better. Score = vol_percentile.
+        vol_pct_rank = _percentile_score(all_vol, atm_vol) if atm_vol > 0 else 0.0
+        vol_score    = max(0.0, min(100.0, vol_pct_rank * 100))
+
+        # Boolean helpers for display (based on percentile, not fixed threshold)
+        atm_oi_ok  = oi_pct_rank  >= CFG["liq_oi_pct_min"]  / 100.0
+        atm_vol_ok = vol_pct_rank >= CFG["liq_vol_pct_min"]  / 100.0
+
+        # Annotate rows with OK status
+        for r in rows:
+            r_spr = (r["CE Spread%"] + r["PE Spread%"]) / 2
+            r_oi  = min(r["CE OI"], r["PE OI"])
+            r_vol = min(r["CE Vol"], r["PE Vol"])
+            r_spr_pct  = _percentile_score(all_spreads, r_spr)
+            r_oi_pct   = _percentile_score(all_oi,      r_oi)
+            r_vol_pct  = _percentile_score(all_vol,     r_vol)
+            ok = (r_spr_pct < CFG["liq_spread_pct_sell"] / 100.0
+                  and r_oi_pct  >= CFG["liq_oi_pct_min"]  / 100.0
+                  and r_vol_pct >= CFG["liq_vol_pct_min"]  / 100.0)
+            r["CE OK"] = "✓" if ok else "⚠"
+            r["PE OK"] = "✓" if ok else "⚠"
+
+    else:
+        # Absolute fallback when chain is tiny (< 5 sampled strikes)
+        _min_oi  = CFG["liq_min_oi"]
+        _min_vol = CFG["liq_min_vol"]
+        _max_spr = CFG["liq_max_spread_pct"]
+        spread_score = max(0.0, min(100.0, 100.0 * math.exp(-atm_spread_pct / max(_max_spr, 1e-9))))
+        oi_score     = 100.0 if atm_oi  >= _min_oi  else 25.0
+        vol_score    = 100.0 if atm_vol >= _min_vol else 25.0
+        atm_oi_ok    = atm_oi  >= _min_oi
+        atm_vol_ok   = atm_vol >= _min_vol
+        spread_pct_rank = 1 - spread_score / 100.0
+        oi_pct_rank     = oi_score  / 100.0
+        vol_pct_rank    = vol_score / 100.0
+        for r in rows:
+            r["CE OK"] = "✓" if (r["CE OI"] >= _min_oi and r["CE Vol"] >= _min_vol
+                                  and r["CE Spread%"] <= _max_spr) else "⚠"
+            r["PE OK"] = "✓" if (r["PE OI"] >= _min_oi and r["PE Vol"] >= _min_vol
+                                  and r["PE Spread%"] <= _max_spr) else "⚠"
+
+    # ── Composite liquidity score: calibrated weights ────────────────────────
+    liquid_score = int(
+        _calib("liq_spread_w") * spread_score
+      + _calib("liq_oi_w")     * oi_score
+      + _calib("liq_vol_w")    * vol_score
+    )
+
+    if liquid_score >= 75:
+        verdict = "LIQUID — safe to trade multi-leg"
+        color   = "#00d084"
+    elif liquid_score >= 50:
+        verdict = "MODERATE — use limit orders, expect some slippage"
+        color   = "#ffb347"
+    else:
+        verdict = (f"ILLIQUID — spread {atm_spread_pct:.1f}% / "
+                   f"OI {'OK' if atm_oi_ok else 'THIN'} / "
+                   f"Vol {'OK' if atm_vol_ok else 'THIN'}")
+        color   = "#ff3b3b"
+
+    return {
+        "liquid_score":    liquid_score,
+        "atm_spread_pct":  round(atm_spread_pct, 2),
+        "atm_oi_ok":       atm_oi_ok,
+        "atm_vol_ok":      atm_vol_ok,
+        "verdict":         verdict,
+        "color":           color,
+        "rows":            rows,
+        "spread_pct_rank": round(spread_pct_rank * 100, 1),
+        "oi_pct_rank":     round(oi_pct_rank  * 100, 1),
+        "vol_pct_rank":    round(vol_pct_rank  * 100, 1),
+        "percentile_mode": use_percentile,
+    }
+
+
+# ============================================================
+# RELATIVE STRENGTH vs NIFTY
+# ============================================================
+
+def relative_strength_vs_nifty(symbol, ohlcv_df, window=20):
+    """Compute RS ratio of symbol vs Nifty over `window` trading days.
+    RS = cumulative return of symbol / cumulative return of Nifty.
+    RS > 1 = outperforming, RS < 1 = underperforming.
+    Returns dict with rs_ratio, trend, color, rs_series (rolling, last 60 pts).
+    """
+    if symbol.upper() in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"):
+        return None  # meaningless to compare index with itself
+    if ohlcv_df is None or ohlcv_df.empty or len(ohlcv_df) < window + 2:
+        return None
+    try:
+        nifty_raw = yf.download("^NSEI", period="6mo", interval="1d",
+                                progress=False, auto_adjust=True)
+        if nifty_raw.empty:
+            return None
+
+        def _extract_close(df_raw):
+            """Robustly extract a date-indexed Close series from any yfinance output format."""
+            df = df_raw.copy()
+            # Flatten MultiIndex columns if present (yfinance ≥0.2 may have ticker as level)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = [c[0].lower() for c in df.columns]
+            else:
+                df.columns = [str(c).lower() for c in df.columns]
+            # Ensure date index is plain date (not Datetime)
+            if not isinstance(df.index, pd.DatetimeIndex):
+                df = df.reset_index()
+                # find the date column
+                date_col = next((c for c in df.columns if c in ("date", "datetime", "index")), None)
+                if date_col:
+                    df = df.set_index(date_col)
+            df.index = pd.to_datetime(df.index).normalize()   # strip time component
+            df.index = df.index.date                           # plain date objects
+            return df["close"].astype(float).dropna()
+
+        sym_close   = _extract_close(ohlcv_df) if "close" in ohlcv_df.columns or (
+            isinstance(ohlcv_df.columns, pd.MultiIndex) and any("close" in str(c).lower() for c in ohlcv_df.columns)
+        ) else None
+
+        if sym_close is None:
+            return None
+
+        nifty_close = _extract_close(nifty_raw)
+
+        # Align on common dates
+        common = sorted(set(sym_close.index) & set(nifty_close.index))
+        if len(common) < window + 5:
+            return None
+
+        s = sym_close.loc[common]
+        n = nifty_close.loc[common]
+
+        # Point-in-time RS ratio (last `window` days)
+        s_ret   = float(s.iloc[-1] / s.iloc[-1 - window] - 1) * 100
+        n_ret   = float(n.iloc[-1] / n.iloc[-1 - window] - 1) * 100
+        rs      = round((1 + s_ret / 100) / (1 + n_ret / 100 + 1e-9), 4)
+
+        # Rolling RS series — use full history not just tail(window+1)
+        rs_series = []
+        s_arr = s.values.astype(float)
+        n_arr = n.values.astype(float)
+        for i in range(window, len(s_arr)):
+            sr = s_arr[i] / s_arr[i - window] - 1
+            nr = n_arr[i] / n_arr[i - window] - 1
+            rs_series.append(round((1 + sr) / (1 + nr + 1e-9), 4))
+        rs_series = rs_series[-60:]   # keep last 60 rolling points for chart
+
+        # RS slope: last 5 rolling points
+        rs_slope = (rs_series[-1] - rs_series[-5]) if len(rs_series) >= 5 else 0
+
+        if rs > 1.02 and rs_slope > 0:
+            rs_trend, rs_color = "STRONGLY OUTPERFORMING", "#00d084"
+        elif rs > 1.0:
+            rs_trend, rs_color = "OUTPERFORMING",           "#7dca84"
+        elif rs < 0.98 and rs_slope < 0:
+            rs_trend, rs_color = "STRONGLY UNDERPERFORMING","#ff3b3b"
+        elif rs < 1.0:
+            rs_trend, rs_color = "UNDERPERFORMING",          "#ff7777"
+        else:
+            rs_trend, rs_color = "IN LINE WITH NIFTY",       "#888"
+
+        return {
+            "rs_ratio":      rs,
+            "sym_ret_pct":   round(s_ret, 2),
+            "nifty_ret_pct": round(n_ret, 2),
+            "trend":         rs_trend,
+            "color":         rs_color,
+            "rs_series":     rs_series,
+            "rs_slope":      round(rs_slope, 4),
+        }
+    except Exception:
+        return None
+
+# ============================================================
+# STRATEGY BACKTEST BY REGIME
+# ============================================================
+
+def backtest_strategies_by_regime(ohlcv_df, iv_history, hv20):
+    """Simple walk-forward backtest: for each 30-day window in history,
+    classify the regime and simulate the P&L of 4 canonical strategies.
+    Returns: dict of {strategy_name: {wins, losses, avg_pnl_pct, best_regime}}
+    This is a simplified regime-P&L attribution (not a full tick-level backtest).
+    It uses: close-to-close returns within the 30-day window, and the approximate
+    P&L of each strategy given the actual move vs the implied straddle.
+    """
+    results = {}
+    if ohlcv_df is None or ohlcv_df.empty or len(ohlcv_df) < 60:
+        return results
+    c   = ohlcv_df["close"].astype(float).reset_index(drop=True)
+    h   = ohlcv_df["high"].astype(float).reset_index(drop=True)
+    l   = ohlcv_df["low"].astype(float).reset_index(drop=True)
+
+    strategies = {
+        "Short Straddle":  {"type": "credit_neutral",  "best_regime": []},
+        "Long Straddle":   {"type": "debit_neutral",   "best_regime": []},
+        "Bull Call Spread":{"type": "debit_bull",      "best_regime": []},
+        "Bear Put Spread": {"type": "debit_bear",      "best_regime": []},
+        "Iron Condor":     {"type": "credit_neutral",  "best_regime": []},
+    }
+
+    window = 21  # trading days per expiry cycle
+    pnl_by_regime = {s: {} for s in strategies}
+
+    for i in range(window, len(c) - window, window):
+        spot_entry = float(c.iloc[i])
+        spot_exit  = float(c.iloc[min(i + window, len(c)-1)])
+        # HV of entry window (to estimate IV proxy)
+        lr_w = np.log(c.iloc[i-window:i] / c.iloc[i-window:i].shift(1)).dropna()
+        iv_proxy = float(lr_w.std() * np.sqrt(252)) if len(lr_w) >= 5 else hv20
+        # Regime classification for this window
+        sub_df_h = {"close": c.iloc[i-window:i].values, "high": h.iloc[i-window:i].values,
+                    "low":   l.iloc[i-window:i].values}
+        sub_df = pd.DataFrame(sub_df_h)
+        regime_d = detect_market_regime(sub_df, iv_proxy, hv20)
+        reg_label = regime_d.get("regime", "UNKNOWN")
+
+        # Actual move
+        actual_ret  = (spot_exit - spot_entry) / spot_entry
+
+        # ── Strategy P&L using Black-Scholes pricing (no heuristic fractions) ──
+        # All legs priced at iv_proxy (HV proxy for that window), T = window/252.
+        # This replaces the 0.40/0.50/0.60 magic constants with actual option prices.
+        T_window = window / 252.0
+        r_window = CFG["rfr_default"] / 100.0
+
+        def _c_bt(K): return bs_price(spot_entry, K, T_window, r_window, iv_proxy, "call")
+        def _p_bt(K): return bs_price(spot_entry, K, T_window, r_window, iv_proxy, "put")
+
+        # Determine step from ATM proximity — use nearest 1-sigma as step proxy
+        _step_proxy = max(iv_proxy * spot_entry * math.sqrt(T_window), spot_entry * 0.005)
+
+        # ── Short Straddle ──
+        # Sell ATM call + put; P&L at expiry = credit received - intrinsic paid back
+        _ss_credit = _c_bt(spot_entry) + _p_bt(spot_entry)
+        _ss_intr   = max(spot_exit - spot_entry, 0) + max(spot_entry - spot_exit, 0)  # = |move|
+        ss_raw     = (_ss_credit - _ss_intr) / spot_entry * 100
+        # Stop at 2× credit received
+        ss_pnl     = max(ss_raw, -2.0 * _ss_credit / spot_entry * 100)
+
+        # ── Long Straddle ── mirror
+        ls_pnl = -ss_raw
+
+        # ── Bull Call Spread ──
+        # BUY ATM call, SELL ATM+step call
+        _hi_strike   = spot_entry + _step_proxy
+        _debit_bcs   = _c_bt(spot_entry) - _c_bt(_hi_strike)
+        _width_bcs   = _hi_strike - spot_entry
+        if actual_ret > 0:
+            _gain    = min(spot_exit - spot_entry, _width_bcs)
+            bcs_pnl  = (_gain - _debit_bcs) / spot_entry * 100
+        else:
+            bcs_pnl  = -_debit_bcs / spot_entry * 100
+
+        # ── Bear Put Spread ──
+        _lo_strike   = spot_entry - _step_proxy
+        _debit_bps   = _p_bt(spot_entry) - _p_bt(_lo_strike)
+        _width_bps   = spot_entry - _lo_strike
+        if actual_ret < 0:
+            _gain_p  = min(spot_entry - spot_exit, _width_bps)
+            bps_pnl  = (_gain_p - _debit_bps) / spot_entry * 100
+        else:
+            bps_pnl  = -_debit_bps / spot_entry * 100
+
+        # ── Iron Condor ──
+        # SELL ATM±step, BUY ATM±2step (wings); credit = net premium received
+        _ic_short_c  = spot_entry + _step_proxy
+        _ic_long_c   = spot_entry + 2 * _step_proxy
+        _ic_short_p  = spot_entry - _step_proxy
+        _ic_long_p   = spot_entry - 2 * _step_proxy
+        _ic_credit   = ((_c_bt(_ic_short_c) - _c_bt(_ic_long_c))
+                       + (_p_bt(_ic_short_p) - _p_bt(_ic_long_p)))
+        _ic_width    = _step_proxy
+        _ic_max_loss = _ic_width - _ic_credit
+        if spot_exit <= _ic_short_c and spot_exit >= _ic_short_p:
+            ic_pnl = _ic_credit / spot_entry * 100         # full credit kept
+        elif spot_exit > _ic_long_c or spot_exit < _ic_long_p:
+            ic_pnl = -_ic_max_loss / spot_entry * 100      # max loss (wings pay)
+        else:
+            # Linear decay between short and long strikes
+            if spot_exit > _ic_short_c:
+                frac = (spot_exit - _ic_short_c) / (_ic_long_c - _ic_short_c + 1e-9)
+            else:
+                frac = (_ic_short_p - spot_exit) / (_ic_short_p - _ic_long_p + 1e-9)
+            ic_pnl = (_ic_credit - frac * _ic_width) / spot_entry * 100
+
+        for strat, pnl in [("Short Straddle", ss_pnl), ("Long Straddle", ls_pnl),
+                            ("Bull Call Spread", bcs_pnl), ("Bear Put Spread", bps_pnl),
+                            ("Iron Condor", ic_pnl)]:
+            if reg_label not in pnl_by_regime[strat]:
+                pnl_by_regime[strat][reg_label] = []
+            pnl_by_regime[strat][reg_label].append(pnl)
+
+    # Summarise
+    for strat in strategies:
+        all_pnls = []
+        reg_summary = {}
+        for reg, pnls in pnl_by_regime[strat].items():
+            avg = round(float(np.mean(pnls)), 2)
+            wins = sum(1 for p in pnls if p > 0)
+            reg_summary[reg] = {"avg_pnl": avg, "win_rate": round(wins/len(pnls)*100, 0), "n": len(pnls)}
+            all_pnls.extend(pnls)
+        best_reg = max(reg_summary, key=lambda r: reg_summary[r]["avg_pnl"]) if reg_summary else "—"
+        results[strat] = {
+            "regime_pnl":  reg_summary,
+            "best_regime": best_reg,
+            "overall_avg": round(float(np.mean(all_pnls)), 2) if all_pnls else 0,
+            "overall_wr":  round(sum(1 for p in all_pnls if p > 0) / len(all_pnls) * 100, 0) if all_pnls else 0,
+        }
+    return results
 
 # ============================================================
 # OI ANALYSIS
 # ============================================================
 
-def oi_analysis(chain_df, spot, step=50, T=0.02, r=0.065, atm_iv=0.20):
-    """OI analysis with GEX, gamma flip, OI cluster walls, and skew metrics."""
-    if chain_df.empty: return {}
+def oi_analysis(chain_df, spot, step=50, T=None, r=None, atm_iv=None, lot_size=None):
+    """OI analysis with GEX, gamma flip, OI cluster walls, and skew metrics.
+    All numeric parameters should be passed explicitly by the caller.
+    Defaults are used only as a last-resort fallback (should never be hit in normal operation).
+    lot_size: used to convert GEX to rupee-notional units.
+    """
+    # Fallbacks — should always be overridden by caller; warn if hitting these
+    if T        is None: T        = 7.0 / CFG["ann_days"]   # 7-day fallback
+    if r        is None: r        = CFG["rfr_default"] / 100.0
+    if atm_iv   is None: atm_iv   = CFG["hv_fallback"]       # use NSE baseline HV
+    if lot_size is None: lot_size = CFG["lot_size_fallback"]
+    if chain_df is None or chain_df.empty: return {}
     atm_approx = round(round(spot / step) * step, 2)
     df = chain_df[(chain_df.Strike >= atm_approx - CFG["pain_strikes"]*step) &
                   (chain_df.Strike <= atm_approx + CFG["pain_strikes"]*step)].copy()
@@ -675,9 +3165,12 @@ def oi_analysis(chain_df, spot, step=50, T=0.02, r=0.065, atm_iv=0.20):
 
     total_ce  = float(df.CE_OI.sum())
     total_pe  = float(df.PE_OI.sum())
+    # PCR: always use the epsilon denominator form — never return 0 when CE_OI=0.
+    # If total_ce=0 but total_pe>0, PCR should be very high (all puts = maximum bullish support).
+    # The old `if total_ce > 0 else 0` returned PCR=0 (bearish signal) — exactly backwards.
     pcr_oi    = round(total_pe / (total_ce + 1e-9), 3)
 
-    # ── OI cluster walls (3-strike sliding window — smoother than single-strike max) ──
+    # ── OI cluster walls (3-strike sliding window) ──
     def oi_cluster_peak(oi_col, strikes_list):
         if len(strikes_list) < 3: return float(strikes_list[oi_col.argmax()])
         best_k, best_sum = strikes_list[0], 0
@@ -692,36 +3185,50 @@ def oi_analysis(chain_df, spot, step=50, T=0.02, r=0.065, atm_iv=0.20):
     put_wall  = oi_cluster_peak(df.PE_OI.reset_index(drop=True), list(df.Strike))
 
     atm_r    = df.iloc[(df.Strike - spot).abs().argsort()[:1]]
-    straddle = float(atm_r.CE_LTP.values[0] + atm_r.PE_LTP.values[0]) if not atm_r.empty else 0
+    if not atm_r.empty:
+        # Use bid/ask mid for straddle pricing — more accurate than LTP which can be stale
+        # If bid/ask not available, fall back to LTP
+        ce_mid = (float(atm_r.CE_Bid.values[0]) + float(atm_r.CE_Ask.values[0])) / 2 if (
+            float(atm_r.CE_Bid.values[0]) > 0 and float(atm_r.CE_Ask.values[0]) > 0
+        ) else float(atm_r.CE_LTP.values[0])
+        pe_mid = (float(atm_r.PE_Bid.values[0]) + float(atm_r.PE_Ask.values[0])) / 2 if (
+            float(atm_r.PE_Bid.values[0]) > 0 and float(atm_r.PE_Ask.values[0]) > 0
+        ) else float(atm_r.PE_LTP.values[0])
+        straddle = ce_mid + pe_mid
+    else:
+        straddle = 0.0
     exp_move     = round(straddle / spot * 100, 2) if spot > 0 else 0
-    exp_move_2sd = round(exp_move * 2.0, 2)
+    # 2-sigma scaling: straddle ≈ sigma*S*sqrt(T)*sqrt(2/pi), so 2-sigma move = 2*sigma*S*sqrt(T)
+    # Therefore: 2-sigma / straddle = 2 / sqrt(2/pi) = 2*sqrt(pi/2) = sqrt(2*pi) ≈ 2.507
+    exp_move_2sd = round(exp_move * math.sqrt(2 * math.pi), 2)
 
-    # ── PCR signal ──
-    pcr_values_in_chain = df["PCR"].replace([np.inf, -np.inf], np.nan).dropna()
-    pcr_pct = float(
-        (pcr_values_in_chain <= pcr_oi).mean() * 100
-        if len(pcr_values_in_chain) > 0 else 50.0
-    )
-    if   pcr_pct >= 75: pcr_sig = "BULLISH — aggregate PCR in top quartile; heavy put writing = support"
-    elif pcr_pct >= 55: pcr_sig = "SLIGHT BULLISH LEAN — PCR above median; put OI outweighs calls"
-    elif pcr_pct >= 45: pcr_sig = "NEUTRAL — PCR near median; balanced OI both sides"
-    elif pcr_pct >= 25: pcr_sig = "SLIGHT BEARISH LEAN — PCR below median; call OI building"
-    else:               pcr_sig = "BEARISH — aggregate PCR in bottom quartile; heavy call writing = resistance"
+    # ── PCR signal — fully percentile-based, adaptive to THIS chain's distribution ──
+    full_pcr = chain_df["PCR"].replace([np.inf, -np.inf], np.nan).dropna()
+    pcr_pct  = float((full_pcr <= pcr_oi).mean() * 100) if len(full_pcr) > 0 else 50.0
+    _pb = CFG["pcr_bull_pct"]; _pbe = CFG["pcr_bear_pct"]
+    if   pcr_pct >= _pb:           pcr_sig = f"BULLISH — PCR at {pcr_pct:.0f}th pct; heavy put writing = support"
+    elif pcr_pct >= (_pb + _pbe)/2:pcr_sig = f"SLIGHT BULLISH — PCR {pcr_pct:.0f}th pct; put OI outweighs calls"
+    elif pcr_pct >= (_pbe + _pb)/2:pcr_sig = f"NEUTRAL — PCR {pcr_pct:.0f}th pct; balanced OI both sides"
+    elif pcr_pct >= _pbe:           pcr_sig = f"SLIGHT BEARISH — PCR {pcr_pct:.0f}th pct; call OI building"
+    else:                           pcr_sig = f"BEARISH — PCR at {pcr_pct:.0f}th pct; heavy call writing = resistance"
 
-    # ── Gamma Exposure (GEX) ──
-    # GEX per strike = gamma × OI × spot (dollar-gamma, per-unit)
-    # Dealer convention: dealers are net SHORT options, so their GEX = -(buyer's GEX)
-    # Net GEX = calls positive, puts negative (from dealer perspective)
-    t_safe = max(T, 1.0/365.0)
+    # ── Gamma Exposure (GEX) — scaled to rupee-notional by lot_size ──
+    # GEX (₹) = γ × OI × lot_size × spot²
+    # This makes GEX comparable across instruments (not raw contract count).
+    # Dealer convention: long call OI = dealer short → positive GEX
+    #                    long put  OI = dealer short → negative GEX
+    t_safe = max(T, 1.0/CFG["ann_days"])
     gex_rows = []
     for _, row in df.iterrows():
-        iv_c = float(row.CE_IV)
-        iv_p = float(row.PE_IV)
-        iv_c = max((iv_c/100 if iv_c > 2 else iv_c), 0.01) if iv_c else atm_iv
-        iv_p = max((iv_p/100 if iv_p > 2 else iv_p), 0.01) if iv_p else atm_iv
+        iv_c = _sanitise_iv(float(row.CE_IV), atm_iv)
+        iv_p = _sanitise_iv(float(row.PE_IV), atm_iv)
         g_ce = bs_greeks(spot, float(row.Strike), t_safe, r, iv_c, "call")["gamma"]
         g_pe = bs_greeks(spot, float(row.Strike), t_safe, r, iv_p, "put")["gamma"]
-        net  = (g_ce * float(row.CE_OI) - g_pe * float(row.PE_OI)) * spot
+        # Multiply by lot_size × spot² to get standard dollar-gamma units (rupee-GEX)
+        # Dollar-gamma convention: GEX = γ × OI × lot_size × S²
+        # Rationale: gamma is in delta/₹, so γ × S² gives the full notional gamma sensitivity
+        # This matches the SpotGamma / Tier1Alpha convention and makes GEX comparable across instruments
+        net  = (g_ce * float(row.CE_OI) - g_pe * float(row.PE_OI)) * lot_size * spot * spot
         gex_rows.append({"Strike": float(row.Strike), "NET_GEX": net})
 
     gex_df       = pd.DataFrame(gex_rows)
@@ -730,12 +3237,12 @@ def oi_analysis(chain_df, spot, step=50, T=0.02, r=0.065, atm_iv=0.20):
                     if net_gex_total >= 0 else
                     "NEGATIVE GEX — trending / vol expansion likely (dealers chase price)")
 
-    # ── Gamma Flip Level (strike where cumulative GEX crosses zero) ──
+    # ── Gamma Flip Level ──
     gex_sorted = gex_df.copy()
     gex_sorted["dist"] = (gex_sorted.Strike - spot).abs()
     gex_sorted = gex_sorted.sort_values("dist").reset_index(drop=True)
     cum_gex    = gex_sorted["NET_GEX"].cumsum()
-    gamma_flip = spot  # default
+    gamma_flip = spot
     for i in range(1, len(cum_gex)):
         if cum_gex.iloc[i-1] * cum_gex.iloc[i] <= 0:
             gamma_flip = float(gex_sorted.Strike.iloc[i])
@@ -743,19 +3250,47 @@ def oi_analysis(chain_df, spot, step=50, T=0.02, r=0.065, atm_iv=0.20):
 
     # ── IV Skew (downside put IV vs upside call IV at ±1 strike) ──
     skew_val, skew_label = None, "—"
+    skew_curve = []  # full skew curve: list of {strike, moneyness_pct, put_iv, call_iv, skew_pp}
     try:
         dn1   = df.iloc[(df.Strike - (spot - step)).abs().argsort()[:1]]
         up1   = df.iloc[(df.Strike - (spot + step)).abs().argsort()[:1]]
-        dn_iv = float(dn1.PE_IV.values[0])
-        up_iv = float(up1.CE_IV.values[0])
-        dn_iv = dn_iv/100 if dn_iv > 2 else dn_iv
-        up_iv = up_iv/100 if up_iv > 2 else up_iv
-        if dn_iv > 0 and up_iv > 0:
+        dn_iv = _sanitise_iv(float(dn1.PE_IV.values[0]), 0)
+        up_iv = _sanitise_iv(float(up1.CE_IV.values[0]), 0)
+        if dn_iv > 0.01 and up_iv > 0.01:
             skew_val = round((dn_iv - up_iv) * 100, 2)
-            if   skew_val >  3: skew_label = f"BEARISH SKEW +{skew_val:.1f}pp — put protection demand elevated"
-            elif skew_val > -1: skew_label = f"NEUTRAL SKEW {skew_val:+.1f}pp — balanced demand"
-            else:               skew_label = f"CALL SKEW {skew_val:+.1f}pp — upside speculation elevated"
-    except: pass
+            # Adaptive: compare skew_val to full skew curve distribution (if available)
+            # Fall back to ±2pp adaptive boundary: ±1pp = 50th pct in typical NSE skew
+            _skew_vals = [abs(row.get("skew_pp", 0)) for row in skew_curve if row.get("skew_pp") is not None]
+            _skew_pct  = _percentile_score(_skew_vals, abs(skew_val)) if len(_skew_vals) >= 3 else 0.5
+            # skew_pct > 0.7 = elevated skew (above 70th pct of current chain)
+            if   skew_val > 0 and _skew_pct >= 0.70:
+                skew_label = f"BEARISH SKEW +{skew_val:.1f}pp ({_skew_pct*100:.0f}th pct) — elevated put protection demand"
+            elif skew_val > 0:
+                skew_label = f"MILD BEARISH SKEW +{skew_val:.1f}pp ({_skew_pct*100:.0f}th pct) — moderate put demand"
+            elif skew_val < 0 and _skew_pct >= 0.70:
+                skew_label = f"CALL SKEW {skew_val:+.1f}pp ({_skew_pct*100:.0f}th pct) — elevated upside speculation"
+            else:
+                skew_label = f"NEUTRAL SKEW {skew_val:+.1f}pp ({_skew_pct*100:.0f}th pct) — balanced demand"
+    except Exception:
+        pass
+
+    # Build full skew curve across all strikes in the pain window
+    try:
+        for _, row in df.iterrows():
+            k     = float(row.Strike)
+            c_iv  = _sanitise_iv(float(row.CE_IV), 0)
+            p_iv  = _sanitise_iv(float(row.PE_IV), 0)
+            m_pct = round((k - spot) / spot * 100, 2)   # +ve = OTM call, -ve = OTM put
+            if c_iv > 0.01 or p_iv > 0.01:
+                skew_curve.append({
+                    "strike":       k,
+                    "moneyness":    m_pct,
+                    "call_iv":      round(c_iv * 100, 2),
+                    "put_iv":       round(p_iv * 100, 2),
+                    "skew_pp":      round((p_iv - c_iv) * 100, 2),
+                })
+    except Exception:
+        pass
 
     return dict(
         max_pain=round(max_pain,2), pcr_oi=pcr_oi,
@@ -766,247 +3301,853 @@ def oi_analysis(chain_df, spot, step=50, T=0.02, r=0.065, atm_iv=0.20):
         net_gex=round(net_gex_total, 2), gex_regime=gex_regime,
         gamma_flip=round(gamma_flip, 2), gex_df=gex_df,
         skew_pp=skew_val, skew_label=skew_label,
+        skew_curve=skew_curve,
     )
 
 # ============================================================
-# STRATEGY RECOMMENDATION ENGINE
+# PROBABILISTIC SCORING ENGINE
 # ============================================================
 
-def recommend_strategies(bias, vol_lbl, dte, spot, atm, step, ivr, bias_score=0):
-    is_bull  = "BULL" in bias
-    is_bear  = "BEAR" in bias
-    hi_vol   = ivr >= 75   # top quartile = sell premium
-    lo_vol   = ivr < 25    # bottom quartile = buy premium
-    sv       = float(step)
-    recs     = []
+def _atr_seed(price: float) -> float:
+    """Return an adaptive ATR estimate for `price` when no OHLCV data is available.
+    Uses the median of all previously recorded ATR% values from this symbol's history.
+    Falls back to the median NSE index ATR% (~1.2%) when no history exists.
+    The median of observed ATR% values is a much better prior than a fixed 1.5%.
+    """
+    atr_pct_hist = st.session_state.get("_calib_atr_pct_hist", [])
+    if len(atr_pct_hist) >= 3:
+        median_atr_pct = float(np.median(atr_pct_hist))
+    else:
+        # NSE Nifty 20-year median daily ATR ≈ 1.1-1.3%; use 1.2% as neutral seed
+        median_atr_pct = 0.012
+    return price * median_atr_pct
 
-    # ── Computed Fit Score ──────────────────────────────────────
-    # Score = bias_alignment × vol_alignment × dte_alignment, normalised to 0–100
-    #
-    # bias_alignment:  how well strategy direction matches the bias score
-    #   |bias_score| / 80 × 100  for directional, (80 - |bias_score|) / 80 × 100 for neutral
-    #
-    # vol_alignment:  does the strategy want cheap (buy) or rich (sell) vol?
-    #   debit  strategy in low IV  → ivr distance from 0   = (100 - ivr) / 100
-    #   credit strategy in high IV → ivr distance from 100 = ivr / 100
-    #   neutral strategies         → 1 - |ivr - 50| / 50
-    #
-    # dte_alignment:  dte within the ideal DTE range, linearly scored
-    #   parsed from "lo–hi DTE" string; 1.0 if in range, decays linearly outside
-    #
-    # Final: round(bias_align × vol_align × dte_align × 100, 0)
 
-    abs_score = abs(bias_score)  # used by fit_score via closure
+def _logistic(x):
+    """Sigmoid function: maps any real x → (0, 1)."""
+    return 1.0 / (1.0 + math.exp(-max(-20.0, min(20.0, x))))
 
-    def _dte_align(ideal_dte_str, actual_dte):
-        """Return 0–1 DTE alignment. 1.0 if within range, exponential decay outside.
-        Decay constant κ = ln(2) / half_range → score halves every half_range days outside."""
-        import re
-        nums = re.findall(r'\d+', ideal_dte_str.split("DTE")[0])
-        if len(nums) >= 2:
-            lo, hi = int(nums[0]), int(nums[-1])
-            if lo <= actual_dte <= hi: return 1.0
-            dist = min(abs(actual_dte - lo), abs(actual_dte - hi))
-            half_range = max((hi - lo) / 2.0, 1.0)
-            return math.exp(-math.log(2) * dist / half_range)
-        elif len(nums) == 1:
-            ref = int(nums[0])
-            dist = abs(actual_dte - ref)
-            return math.exp(-math.log(2) * dist / max(ref / 2.0, 1.0))
-        return 0.5
 
-    def fit_score(strategy_type, ideal_dte_str, bias_pts):
+def compute_probabilistic_score(
+        bias_res, chain_df, ohlcv_df, spot, atm_iv, hv20,
+        ivr, oi_d, r, q, T, step):
+    """
+    Short-term directional signal model (1–5 day horizon).
+
+    Factor hierarchy — leading indicators have highest weight:
+      FLOW        (0.30) — ΔIV, ΔPCR, ΔSkew, ΔOI, ΔGEX  [most predictive]
+      POSITIONING (0.25) — PCR level, OI walls, max pain distance
+      VOL REGIME  (0.20) — IV/HV percentile, term structure slope
+      REL STRENGTH(0.15) — stock vs Nifty 20-day
+      TREND       (0.10) — EMA structure + ADX  [confirming, lagging]
+
+    RSI and MACD contribute only weakly inside the trend factor.
+    Signal → logistic → prob_up / prob_down.
+    """
+    fs = {}   # feature scores, each ∈ [-1, +1]
+
+    # Guard: ohlcv_df may be None or empty
+    _ohlcv   = ohlcv_df if (ohlcv_df is not None and not ohlcv_df.empty) else pd.DataFrame()
+    c_series = _ohlcv["close"].astype(float) if not _ohlcv.empty else pd.Series(dtype=float)
+    h_series = _ohlcv["high"].astype(float)  if not _ohlcv.empty else pd.Series(dtype=float)
+    l_series = _ohlcv["low"].astype(float)   if not _ohlcv.empty else pd.Series(dtype=float)
+
+    # ════════════════════════════════════════════════════════════════════════
+    # FACTOR 1 — FLOW  (weight 0.30) — LEADING, highest predictive value
+    # Already computed in directional_bias → bias_res["flow"]
+    # ════════════════════════════════════════════════════════════════════════
+    flow_d      = bias_res.get("flow", {})
+    flow_score  = float(flow_d.get("flow_score", 0.0))   # composite from compute_flow_scores
+    flow_mag    = float(flow_d.get("flow_magnitude", 0.0))
+
+    # Individual flow components (used for display breakdown)
+    dPCR  = float(flow_d.get("dPCR",  0.0))   # positive = rising PCR = bullish
+    dSkew = float(flow_d.get("dSkew", 0.0))   # positive = flattening skew = bullish
+    dIV   = float(flow_d.get("dIV",   0.0))   # positive = falling IV = bullish
+    dOI   = float(flow_d.get("dOI",   0.0))   # magnitude signal
+    dGEX  = float(flow_d.get("dGEX",  0.0))   # falling GEX = move incoming
+
+    fs["flow_score"] = round(max(-1.0, min(1.0, flow_score)), 4)
+    fs["dPCR"]       = round(dPCR, 4)
+    fs["dSkew"]      = round(dSkew, 4)
+    fs["dIV"]        = round(dIV, 4)
+    fs["dOI"]        = round(dOI, 4)
+    fs["dGEX"]       = round(dGEX, 4)
+
+    # ════════════════════════════════════════════════════════════════════════
+    # FACTOR 2 — POSITIONING  (weight 0.25) — LEADING, structural price magnets
+    # PCR level percentile (where put/call OI sits in history)
+    # OI skew (more puts below vs calls above spot)
+    # Distance from max pain (gravitational pull)
+    # ════════════════════════════════════════════════════════════════════════
+    _chain_safe = chain_df if (chain_df is not None and not chain_df.empty) else None
+
+    if _chain_safe is not None:
+        total_ce = float(_chain_safe["CE_OI"].sum())
+        total_pe = float(_chain_safe["PE_OI"].sum())
+        pcr_v    = total_pe / (total_ce + 1e-9)
+        all_pcr  = _chain_safe["PCR"].replace([np.inf, -np.inf], np.nan).dropna().values
+        pcr_pct  = _percentile_score(all_pcr, pcr_v)  # 0=bearish, 1=bullish
+        # PCR level: high PCR = heavy put writing = support below = bullish
+        pcr_level_z = 2 * pcr_pct - 1   # [-1, +1]
+
+        # OI skew: more put OI below spot than call OI above = asymmetric put support = bullish
+        above_oi = float(_chain_safe[_chain_safe.Strike > spot]["CE_OI"].sum())
+        below_oi = float(_chain_safe[_chain_safe.Strike < spot]["PE_OI"].sum())
+        oi_skew_val = (below_oi - above_oi) / (total_ce + total_pe + 1e-9)
+        oi_skew_hist = st.session_state.get("_flow_skew_oi_hist", [])
+        oi_skew_hist.append(float(oi_skew_val))
+        if len(oi_skew_hist) > 30: oi_skew_hist = oi_skew_hist[-30:]
+        st.session_state["_flow_skew_oi_hist"] = oi_skew_hist
+        oi_skew_z = _zscore_clamp(oi_skew_hist, float(oi_skew_val), clamp=2.0) / 2.0
+    else:
+        pcr_level_z = 0.0; oi_skew_z = 0.0; pcr_pct = 0.5; pcr_v = 1.0
+
+    # Max pain proximity: normalised by expected move
+    em_price = float(oi_d.get("atm_straddle", atm_iv * spot * math.sqrt(T * 2 / math.pi)) or 1)
+    em_pct   = float(oi_d.get("exp_move_pct", round(em_price / spot * 100, 2)) if oi_d else 0)
+    mp       = float(oi_d.get("max_pain", spot) or spot)
+    mp_dist_em = (spot - mp) / (em_price + 1e-9)   # in units of expected move
+    # Max pain gravity: if spot >> max pain, expect mean reversion down (bearish)
+    mp_z = max(-1.0, min(1.0, -mp_dist_em * _calib("mp_gravity")))
+
+    _pw2 = _calib_vec("positioning_pcr_vs_oi_vs_mp")
+    positioning_score = _pw2[0] * pcr_level_z + _pw2[1] * oi_skew_z + _pw2[2] * mp_z
+    positioning_score = max(-1.0, min(1.0, positioning_score))
+    # Record sub-scores for calibration
+    _record("_calib_pcr_level_hist", pcr_level_z)
+    _record("_calib_oi_skew_hist",   oi_skew_z)
+    _record("_calib_mp_z_hist",      mp_z)
+
+    fs["positioning_score"] = round(positioning_score, 4)
+    fs["pcr_level_z"]       = round(pcr_level_z, 4)
+    fs["oi_skew_z"]         = round(oi_skew_z, 4)
+    fs["mp_z"]              = round(mp_z, 4)
+
+    # ════════════════════════════════════════════════════════════════════════
+    # FACTOR 3 — VOLATILITY REGIME  (weight 0.20) — LEADING/CONCURRENT
+    # IV/HV ratio percentile: where current vol sits in history
+    # Term structure slope: contango vs backwardation
+    # Volatility direction: is IV expanding or compressing?
+    # ════════════════════════════════════════════════════════════════════════
+    hv_ref     = hv20 if hv20 and hv20 > 0.01 else CFG["hv_fallback"]
+    iv_hv_r    = atm_iv / (hv_ref + 1e-9)
+    sym_key    = st.session_state.get("opt_symbol", "")
+    iv_hist    = st.session_state.get("opt_iv_history", {}).get(sym_key, [])
+    iv_hv_hist = [iv / hv_ref for iv in iv_hist if iv > 0] if iv_hist else []
+
+    if len(iv_hv_hist) >= 5:
+        iv_hv_pct = _percentile_score(iv_hv_hist, iv_hv_r)
+    else:
+        # Cold-start: rank IV/HV against its own history using normalise_to_signal
+        iv_hv_pct = (_normalise_to_signal(iv_hv_r, "_calib_iv_hv_raw_hist") + 1.0) / 2.0
+
+    # Expensive vol → bearish lean.  Dampening coefficient is calibrated.
+    vol_regime_z = -(2 * iv_hv_pct - 1) * _calib("vol_regime_damp")
+    _record("_calib_vol_regime_z_hist", vol_regime_z)
+
+    # Term structure z-score: slope × calibrated scale factor
+    ts_data      = st.session_state.get("opt_multi_expiry", [])
+    term_slope_z = 0.0
+    if len(ts_data) >= 2:
+        iv_near  = float(ts_data[0].get("atm_iv", atm_iv))
+        iv_far   = float(ts_data[1].get("atm_iv", atm_iv))
+        ts_slope = iv_far - iv_near
+        _record("_calib_ts_slope_raw_hist", ts_slope)
+        term_slope_z = max(-1.0, min(1.0, ts_slope * _calib("ts_slope_scale")))
+
+    _record("_calib_term_slope_z_hist", term_slope_z)
+    _vr_w = _calib("vol_bb_vs_atr")   # reused as vol_regime_z vs term_slope_z blend
+    vol_regime_score = _vr_w * vol_regime_z + (1.0 - _vr_w) * term_slope_z
+    vol_regime_score = max(-1.0, min(1.0, vol_regime_score))
+
+    fs["vol_regime_score"] = round(vol_regime_score, 4)
+    fs["iv_hv_pct"]        = round(iv_hv_pct, 4)
+    fs["vol_regime_z"]     = round(vol_regime_z, 4)
+    fs["term_slope_z"]     = round(term_slope_z, 4)
+
+    # ════════════════════════════════════════════════════════════════════════
+    # FACTOR 4 — RELATIVE STRENGTH  (weight 0.15) — CONFIRMING (medium lag)
+    # Stock return vs Nifty over 20 days
+    # z-score of RS ratio in its own history
+    # ════════════════════════════════════════════════════════════════════════
+    rs_data = st.session_state.get("opt_rs_nifty", None)
+    if rs_data and isinstance(rs_data, dict):
+        rs_ratio    = rs_data.get("rs_ratio", 1.0)
+        rs_slope    = rs_data.get("rs_slope", 0.0)
+        rs_z        = _normalise_to_signal(rs_ratio, "_calib_rs_z_raw_hist")
+        rs_slope_z  = _normalise_to_signal(rs_slope, "_calib_rs_slope_raw_hist")
+        _rs_lv_w    = _calib("rs_level_vs_slope")
+        rs_score    = _rs_lv_w * rs_z + (1.0 - _rs_lv_w) * rs_slope_z
+        _record("_calib_rs_z_hist",     rs_z)
+        _record("_calib_rs_slope_hist", rs_slope_z)
+    else:
+        rs_score = 0.0; rs_z = 0.0; rs_slope_z = 0.0
+
+    fs["rs_score"]   = round(max(-1.0, min(1.0, rs_score)), 4)
+    fs["rs_z"]       = round(rs_z, 4)
+
+    # ════════════════════════════════════════════════════════════════════════
+    # FACTOR 5 — TREND  (weight 0.10) — CONFIRMING (most lagging)
+    # EMA structure: where price sits relative to moving averages
+    # ADX: trend strength percentile
+    # RSI and MACD contribute a small fraction WITHIN this factor only
+    # ════════════════════════════════════════════════════════════════════════
+    trend_z = 0.0; atrv = _atr_seed(spot); rsi_v = 50.0
+
+    if len(c_series) >= 50:
+        # EMA structure
+        e20  = c_series.ewm(span=20, adjust=False).mean()
+        e50  = c_series.ewm(span=50, adjust=False).mean()
+        e200 = c_series.ewm(span=200, adjust=False).mean()
+        tr   = pd.concat([h_series - l_series,
+                          (h_series - c_series.shift(1)).abs(),
+                          (l_series - c_series.shift(1)).abs()], axis=1).max(axis=1)
+        atr14 = tr.ewm(alpha=1/14, adjust=False).mean()
+        atrv  = float(atr14.iloc[-1])
+        if spot > 0: _record("_calib_atr_pct_hist", atrv / spot)
+        e20v  = float(e20.iloc[-1])
+        e50v  = float(e50.iloc[-1])
+        e200v = float(e200.iloc[-1]) if len(c_series) >= 200 else spot
+        ema_checks = [spot > e20v, spot > e50v, e20v > e50v, spot > e200v, e50v > e200v]
+        ema_score  = (sum(ema_checks) / len(ema_checks)) * 2 - 1   # [-1, +1]
+
+        # ADX — trend strength percentile × direction
+        up_m  = h_series - h_series.shift(1)
+        dn_m  = l_series.shift(1) - l_series
+        dmp   = pd.Series(np.where((up_m > dn_m) & (up_m > 0), up_m, 0.0), index=c_series.index)
+        dmm   = pd.Series(np.where((dn_m > up_m) & (dn_m > 0), dn_m, 0.0), index=c_series.index)
+        di_p  = 100 * dmp.ewm(alpha=1/14, adjust=False).mean() / (atr14 + 1e-9)
+        di_m  = 100 * dmm.ewm(alpha=1/14, adjust=False).mean() / (atr14 + 1e-9)
+        dx    = 100 * (di_p - di_m).abs() / (di_p + di_m + 1e-9)
+        adx_s = dx.ewm(alpha=1/14, adjust=False).mean().dropna()
+        adx_v = float(adx_s.iloc[-1])
+        adx_d = 1.0 if float(di_p.iloc[-1]) > float(di_m.iloc[-1]) else -1.0
+        adx_pct = _percentile_score(adx_s.values, adx_v)
+
+        # RSI — small contribution within trend factor (not a primary driver)
+        if len(c_series) >= 20:
+            delta  = c_series.diff()
+            gain   = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+            loss   = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
+            rs_raw = gain / loss.replace(0, float("nan"))
+            rsi_s  = (100 - 100 / (1 + rs_raw)).fillna(
+                gain.apply(lambda g: 100.0 if g > 0 else 0.0))
+            rsi_v  = float(rsi_s.iloc[-1])
+            rsi_z  = _zscore_clamp(rsi_s.tail(252).values, rsi_v, clamp=3.0) / 3.0
+        else:
+            rsi_z = 0.0
+
+        # Trend score: EMA vs (ADX + RSI) with calibrated blend
+        # Within non-EMA portion: ADX gets 3× the weight of RSI (structural vs momentum)
+        _ema_w2       = _calib("trend_ema_vs_adx")
+        _non_ema      = 1.0 - _ema_w2
+        _adx_frac     = _calib("adx_vs_rsi_within_trend")
+        trend_z = (_ema_w2 * ema_score
+                   + _non_ema * _adx_frac       * (adx_pct * adx_d)
+                   + _non_ema * (1.0 - _adx_frac) * rsi_z)
+        _record("_calib_ema_score_hist", ema_score)
+        _record("_calib_adx_score_hist", adx_pct * adx_d)
+        _record("_calib_rsi_trend_hist", rsi_z)
+    else:
+        e20v = e50v = e200v = spot
+
+    trend_z = max(-1.0, min(1.0, trend_z))
+    fs["trend_z"]  = round(trend_z, 4)
+    fs["rsi_v"]    = round(rsi_v, 1)
+
+    # ════════════════════════════════════════════════════════════════════════
+    # FINAL SIGNAL SCORE — data-driven factor weights (Improvement #4)
+    # Instead of fixed weights from CFG["factor_weights"], compute each
+    # factor weight as abs(correlation(factor_score, future_return_N_days))
+    # normalised to sum=1.  Falls back to CFG weights when < 10 observations.
+    # ════════════════════════════════════════════════════════════════════════
+
+    _factor_scores_now = {
+        "flow":         fs["flow_score"],
+        "positioning":  fs["positioning_score"],
+        "vol_regime":   fs["vol_regime_score"],
+        "rel_strength": fs["rs_score"],
+        "trend":        fs["trend_z"],
+    }
+    _fw_cfg = CFG["factor_weights"]   # original fixed weights as fallback
+
+    def _compute_factor_weights(ohlcv_local, factor_hist_key="opt_factor_score_hist",
+                                 horizon=4):
+        """Compute normalised abs-correlation weights for the five factors.
+        Uses rolling histories stored in session_state under per-factor keys.
+        Falls back to CFG weights when insufficient data.
         """
-        strategy_type: 'debit_directional' | 'debit_neutral' | 'credit_directional' | 'credit_neutral'
-        bias_pts: absolute value of the overall bias score (0–80)
-        """
-        # 1. Bias alignment
-        if "directional" in strategy_type:
-            b_align = bias_pts / 80.0
-        else:  # neutral: better when bias is weak
-            b_align = max(0.0, 1.0 - bias_pts / 80.0)
+        try:
+            if ohlcv_local is None or len(ohlcv_local) < horizon + 10:
+                return _fw_cfg.copy()
+            c_local  = ohlcv_local["close"].astype(float).reset_index(drop=True)
+            fwd_ret  = np.log(c_local.shift(-horizon) / c_local).dropna().values
 
-        # 2. Vol alignment
-        if "debit" in strategy_type:
-            v_align = (100.0 - ivr) / 100.0   # cheap options favour debit
-        else:  # credit
-            v_align = ivr / 100.0             # rich options favour credit
+            factor_hist_store = st.session_state.get("opt_factor_hist", {})
+            raw_w = {}
+            for fname in _factor_scores_now:
+                hist = np.array(factor_hist_store.get(fname, []), dtype=float)
+                n = min(len(hist), len(fwd_ret))
+                if n < 10:
+                    raw_w[fname] = _fw_cfg[fname]
+                    continue
+                s_arr = hist[-n:]
+                r_arr = fwd_ret[-n:]
+                if np.std(s_arr) < 1e-9 or np.std(r_arr) < 1e-9:
+                    raw_w[fname] = _fw_cfg[fname]
+                    continue
+                corr = float(np.corrcoef(s_arr, r_arr)[0, 1])
+                raw_w[fname] = abs(corr) if not np.isnan(corr) else _fw_cfg[fname]
 
-        # 3. DTE alignment
-        d_align = _dte_align(ideal_dte_str, dte)
+            total = sum(raw_w.values())
+            if total < 1e-9:
+                return _fw_cfg.copy()
+            return {k: v / total for k, v in raw_w.items()}
+        except Exception:
+            return _fw_cfg.copy()
 
-        # 4. Composite (geometric mean keeps all three honest)
-        raw = (b_align * v_align * d_align) ** (1.0/3.0)
-        return int(round(raw * 100))
+    # Update rolling factor score history (append current session's scores)
+    _fhist = st.session_state.get("opt_factor_hist", {})
+    for _fname, _fval in _factor_scores_now.items():
+        _fhist.setdefault(_fname, []).append(float(_fval))
+        _fhist[_fname] = _fhist[_fname][-252:]   # keep 1 year of sessions
+    st.session_state["opt_factor_hist"] = _fhist
 
-    def add(name, type_, legs, rationale, risk, reward, ideal_dte, _strat_type, _bias_pts):
-        sc = fit_score(_strat_type, ideal_dte, _bias_pts)
-        recs.append({"Strategy":name,"Type":type_,"Legs":legs,
-                     "Rationale":rationale,"Max Risk":risk,"Max Reward":reward,
-                     "Ideal DTE":ideal_dte,"Score":sc})
+    _ohlcv_for_fw = st.session_state.get("opt_ohlcv_df", None)
+    fw = _compute_factor_weights(_ohlcv_for_fw)
 
-    # bias_pts = absolute directional conviction, 0–80
-    _bp_dir = min(80, abs(bias_score))   # for directional strategies
-    _bp_neut_base = min(80, max(0, 80 - abs(bias_score)))  # inverse: neutral best when bias is weak
+    raw_score = (
+          fw["flow"]         * fs["flow_score"]
+        + fw["positioning"]  * fs["positioning_score"]
+        + fw["vol_regime"]   * fs["vol_regime_score"]
+        + fw["rel_strength"] * fs["rs_score"]
+        + fw["trend"]        * fs["trend_z"]
+    )
+    raw_score = max(-1.0, min(1.0, raw_score))
 
-    # ── BULLISH ──────────────────────────────
-    if is_bull:
-        _bp = _bp_dir
-        if lo_vol:
-            add("Long ATM Call",
-                "Debit · Directional",
-                f"BUY {atm} CE",
-                "Low IV = cheap premium. Pure directional. Max loss = premium paid. Best when you expect a swift move.",
-                "Premium paid","Unlimited","15–45 DTE", "debit_directional", _bp)
-            add("Bull Call Spread",
-                "Debit · Defined Risk",
-                f"BUY {atm} CE  +  SELL {atm+sv:.0f} CE",
-                "Cuts premium cost vs naked call. Profits if stock closes above upper strike at expiry.",
-                "Net debit",f"Spread width − debit","15–30 DTE", "debit_directional", _bp)
-            add("Call Ratio Backspread",
-                "Credit–even · Vol + Direction",
-                f"SELL 1× {atm-sv:.0f} CE  +  BUY 2× {atm} CE",
-                "Enter for credit or zero cost. Profits from big upside move OR vol expansion. Limited loss in the middle.",
-                "Limited (near short strike)","Unlimited above upper BE","30–45 DTE", "debit_directional", _bp)
-        elif hi_vol:
-            add("Bull Put Spread",
-                "Credit · Defined Risk",
-                f"SELL {atm} PE  +  BUY {atm-sv:.0f} PE",
-                "Sell expensive puts. Keep the credit as long as stock stays above short strike. High IV = fat credit.",
-                "Spread width − credit","Net credit received","7–21 DTE", "credit_directional", _bp)
-            add("Short Put (OTM)",
-                "Credit · Income",
-                f"SELL {atm-sv:.0f} PE",
-                "Collect rich premium. Obligated to buy stock at strike if assigned — only use for stocks you want to own.",
-                "Strike − premium","Premium received","7–21 DTE", "credit_directional", _bp)
-            add("Jade Lizard",
-                "Credit · Slight Bullish",
-                f"SELL {atm} PE  +  SELL {atm+sv:.0f} CE  +  BUY {atm+2*sv:.0f} CE",
-                "No upside risk if total credit > call spread width. Benefits from high IV in both directions.",
-                "Put strike − total credit","Total credit","14–21 DTE", "credit_directional", _bp)
-        else:
-            add("Bull Call Spread",
-                "Debit · Defined Risk",
-                f"BUY {atm} CE  +  SELL {atm+sv:.0f} CE",
-                "Clean risk/reward. Wins on moderate upside move. Lower breakeven than naked call.",
-                "Net debit","Spread width − debit","15–30 DTE", "debit_directional", _bp)
-            add("Long OTM Call (+1)",
-                "Debit · High Leverage",
-                f"BUY {atm+sv:.0f} CE",
-                "Cheaper than ATM. Higher leverage, needs bigger move. Good for event-driven plays.",
-                "Premium paid","Unlimited","10–25 DTE", "debit_directional", _bp)
+    # Map to probability via logistic with calibrated sharpness
+    _sharpness = _calib("logistic_sharpness")
+    prob_up   = _logistic(raw_score * _sharpness)
+    prob_down = 1.0 - prob_up
+    _record("_calib_raw_score_hist", raw_score)
 
-    # ── BEARISH ──────────────────────────────
-    if is_bear:
-        _bp = _bp_dir
-        if lo_vol:
-            add("Long ATM Put",
-                "Debit · Directional",
-                f"BUY {atm} PE",
-                "Low IV = cheap downside protection. Pure directional. Max loss = premium paid.",
-                "Premium paid","Strike − premium","15–45 DTE", "debit_directional", _bp)
-            add("Bear Put Spread",
-                "Debit · Defined Risk",
-                f"BUY {atm} PE  +  SELL {atm-sv:.0f} PE",
-                "Reduces cost vs naked put. Wins if stock falls below lower strike.",
-                "Net debit","Spread width − debit","15–30 DTE", "debit_directional", _bp)
-        elif hi_vol:
-            add("Bear Call Spread",
-                "Credit · Defined Risk",
-                f"SELL {atm} CE  +  BUY {atm+sv:.0f} CE",
-                "Sell expensive calls above current price. Keep credit if stock stays below short strike.",
-                "Spread width − credit","Net credit","7–21 DTE", "credit_directional", _bp)
-            add("Short Call (OTM)",
-                "Credit · Aggressive",
-                f"SELL {atm+sv:.0f} CE",
-                "Rich call premium to sell. High risk — use only with clear bearish conviction and stop loss.",
-                "Theoretically unlimited","Premium received","7–14 DTE", "credit_directional", _bp)
-        else:
-            add("Bear Put Spread",
-                "Debit · Defined Risk",
-                f"BUY {atm} PE  +  SELL {atm-sv:.0f} PE",
-                "Balanced risk/reward for moderate downside. Standard short-term bearish play.",
-                "Net debit","Spread width − debit","15–30 DTE", "debit_directional", _bp)
-            add("Bear Call Spread",
-                "Credit · Defined Risk",
-                f"SELL {atm} CE  +  BUY {atm+sv:.0f} CE",
-                "Collect premium above current price. Wins if stock stays flat or falls.",
-                "Spread width − credit","Net credit","7–21 DTE", "credit_directional", _bp)
+    # ── Intraday blend — integrate live 5-min signals when market is open ─────
+    # The intraday score is computed from Upstox live candles and blended into
+    # the final direction. Blend weight is calibrated (default 20%).
+    # When intraday data is unavailable (pre-market, after-hours, weekend),
+    # the blend weight is set to 0 and the factor model drives entirely.
+    _intra_data  = st.session_state.get("opt_intraday_signals", {})
+    _intra_score = float(_intra_data.get("intraday_score", 0.0))
+    _intra_avail = bool(_intra_data.get("intraday_available", False))
+    _intra_w     = _calib("intra_blend_weight") if _intra_avail else 0.0
 
-    # ── NEUTRAL / RANGE ──────────────────────
-    if "NEUTRAL" in bias or hi_vol:
-        _bp_neut = _bp_neut_base
-        if hi_vol:
-            add("Iron Condor",
-                "Credit · Non-Directional",
-                f"SELL {atm-sv:.0f} PE + BUY {atm-2*sv:.0f} PE  |  SELL {atm+sv:.0f} CE + BUY {atm+2*sv:.0f} CE",
-                "Maximum premium collection in high IV. Wins if stock stays between short strikes. "
-                "Most popular professional strategy for range-bound markets.",
-                "Spread width − total credit","Total credit received","14–30 DTE", "credit_neutral", _bp_neut)
-            add("Short Strangle",
-                "Credit · Uncapped Risk",
-                f"SELL {atm-sv:.0f} PE  +  SELL {atm+sv:.0f} CE",
-                "Higher credit than iron condor. No wing protection = unlimited risk both sides. "
-                "Must manage aggressively at 50% profit or 2× loss.",
-                "Theoretically unlimited","Total premium","7–21 DTE", "credit_neutral", _bp_neut)
-            add("Short Straddle",
-                "Credit · Max Theta",
-                f"SELL {atm} CE  +  SELL {atm} PE",
-                "Maximum theta at ATM. Needs stock to pin very close to ATM. Highest risk — "
-                "delta-hedge or exit quickly if stock moves.",
-                "Unlimited both sides","Total premium","7–14 DTE", "credit_neutral", _bp_neut)
-        elif lo_vol:
-            add("Long Straddle",
-                "Debit · Vol Expansion",
-                f"BUY {atm} CE  +  BUY {atm} PE",
-                "Low IV = cheap double. Profits from ANY large move either direction, or from IV expansion. "
-                "Needs move > combined premium to profit.",
-                "Combined premium paid","Unlimited","30–60 DTE", "debit_neutral", _bp_neut)
-            add("Long Strangle",
-                "Debit · Cheaper Vol Play",
-                f"BUY {atm+sv:.0f} CE  +  BUY {atm-sv:.0f} PE",
-                "Cheaper than straddle, needs bigger move. Excellent if you expect a large event-driven move.",
-                "Combined premium","Unlimited","30–60 DTE", "debit_neutral", _bp_neut)
-            add("Calendar Spread",
-                "Debit · Theta + Vol",
-                f"SELL near {atm} CE  +  BUY far {atm} CE",
-                "Sell near-term theta, buy longer-dated vega. Profits from flat market + "
-                "any IV expansion. Best when front-month IV > back-month IV.",
-                "Net debit","Limited (peaks at ATM on front-month expiry)","Near:7–14 / Far:30–45 DTE", "debit_neutral", _bp_neut)
-        else:
-            add("Iron Condor",
-                "Credit · Non-Directional",
-                f"SELL {atm-sv:.0f} PE + BUY {atm-2*sv:.0f} PE  |  SELL {atm+sv:.0f} CE + BUY {atm+2*sv:.0f} CE",
-                "Collect premium from both sides with defined risk. Ideal for a sideways market expectation.",
-                "Spread width − credit","Total credit","14–30 DTE", "credit_neutral", _bp_neut)
-            add("Iron Butterfly",
-                "Credit · Tighter Range",
-                f"SELL {atm} CE + SELL {atm} PE  |  BUY {atm+sv:.0f} CE + BUY {atm-sv:.0f} PE",
-                "Higher credit than condor. Needs stock to stay near ATM. "
-                "Better reward, narrower profit zone.",
-                "Spread width − credit","Net credit","14–21 DTE", "credit_neutral", _bp_neut)
-            add("ATM Butterfly",
-                "Debit · Precision Play",
-                f"BUY {atm-sv:.0f} CE  +  SELL 2× {atm} CE  +  BUY {atm+sv:.0f} CE",
-                "Low cost, defined risk, maximum profit if stock pins ATM at expiry. "
-                "Use when expecting consolidation around ATM.",
-                "Net debit","Spread − 2×debit","7–21 DTE", "debit_neutral", _bp_neut)
+    # Only blend intraday when the signal is meaningfully above its own noise floor.
+    # "Meaningful" = abs(score) exceeds the 30th percentile of its own history.
+    # Cold-start (< 3 observations): always blend if intraday is available.
+    _intra_hist_so_far = st.session_state.get("_calib_intraday_score_hist", [])
+    if len(_intra_hist_so_far) >= 3:
+        _intra_noise_floor = float(np.percentile(np.abs(_intra_hist_so_far), 30))
+    else:
+        _intra_noise_floor = 0.0   # no history yet → always blend when available
+    if _intra_avail and abs(_intra_score) > _intra_noise_floor:
+        # Blend: (1 − intra_w) × factor_raw + intra_w × intra_score
+        blended_raw = (1.0 - _intra_w) * raw_score + _intra_w * _intra_score
+        blended_raw = max(-1.0, min(1.0, blended_raw))
+        prob_up   = _logistic(blended_raw * _sharpness)
+        prob_down = 1.0 - prob_up
+        _record("_calib_intraday_score_hist", _intra_score)
 
-    # DTE-based hedges
-    if dte <= 5:
-        add("Same-Day / Weekly Straddle Sell",
-                "Credit · Near Expiry",
-                f"SELL {atm} CE  +  SELL {atm} PE (weekly/near expiry)",
-                "Near expiry = explosive theta decay. ATM options lose most value in last 2–5 days. "
-                "Must monitor constantly and exit at 50% profit. NEVER hold to expiry naked.",
-                "Large if stock moves","Theta collected","1–5 DTE", "credit_neutral", min(80, ivr))
+    # ── Monte Carlo direction signal (Improvement #1) ─────────────────────────
+    # Run a lightweight MC to get a distribution-based directional score.
+    # Uses ATM IV from IV surface and real-world drift; reuses existing helpers.
+    # This signal is later blended (50/50) with the factor-model prob in ev_rank_strategies.
+    _mc_direction = 0.0   # default neutral
+    _mc_expected_move = em_price   # default to straddle-based EM
+    try:
+        _ohlcv_ps = st.session_state.get("opt_ohlcv_df", None)
+        _r_ps = r
+        _q_ps = q
+        _T_ps = T
+        if _ohlcv_ps is not None and not _ohlcv_ps.empty and _T_ps > 0 and atm_iv > 0:
+            _iv_surf_ps = build_iv_surface(
+                chain_df if (chain_df is not None and not chain_df.empty) else None,
+                spot, atm_iv)
+            _mu_ps    = _estimate_real_world_drift(_ohlcv_ps, _r_ps, _q_ps)
+            _seed_ps  = int(abs(spot * 100 + _T_ps * 1e5)) % (2**31)
+            _rng_ps   = np.random.default_rng(_seed_ps)
+            _n_ps     = 5000   # lighter simulation for speed
+            _Z_ps     = _rng_ps.standard_normal(_n_ps)
+            _sigma_ps = _iv_surf_ps(spot)
+            _ST_ps    = spot * np.exp((_mu_ps - 0.5 * _sigma_ps**2) * _T_ps
+                                      + _sigma_ps * math.sqrt(_T_ps) * _Z_ps)
+            _mc_prob_up_ps   = float((_ST_ps > spot).mean())
+            _mc_prob_down_ps = float((_ST_ps < spot).mean())
+            _mc_direction    = _mc_prob_up_ps - _mc_prob_down_ps   # ∈ [-1, +1]
+            _mc_expected_move = float(np.std(_ST_ps))              # std of terminal prices
+    except Exception:
+        pass
 
-    recs.sort(key=lambda x: x["Score"], reverse=True)
-    return recs
+    return {
+        "raw_score":         round(raw_score, 4),
+        "prob_up":           round(prob_up, 4),
+        "prob_down":         round(prob_down, 4),
+        "feature_scores":    fs,
+        "expected_move":     round(_mc_expected_move, 2),   # MC std replaces straddle EM
+        "expected_move_pct": round(_mc_expected_move / spot * 100, 2) if spot > 0 else round(em_pct, 2),
+        "iv_hv_pct":         round(iv_hv_pct, 4),
+        "pcr_pct":           round(pcr_pct, 4),
+        "rsi":               round(rsi_v, 1),
+        "atr":               round(atrv, 2),
+        "flow_magnitude":    round(flow_mag, 3),   # conviction level 0-1
+        "factor_weights":    {k: round(v, 4) for k, v in fw.items()},  # learned weights
+        "mc_direction":      round(_mc_direction, 4),   # MC directional signal [-1,+1]
+        "mc_expected_move":  round(_mc_expected_move, 2),
+    }
+
 
 # ============================================================
-# SESSION STATE
+# STRATEGY UNIVERSE — canonical definitions
 # ============================================================
+
+def _build_strategy_universe(spot, atm, step, T, r, q, atm_iv,
+                              bs_call_fn, bs_put_fn, chain_df,
+                              front_iv=None, back_iv=None):
+    """
+    Return the full universe of strategies as a list of dicts, each with:
+      name, type, legs (for MC), max_risk, max_reward, ideal_dte_range,
+      short_strike (for safety ratio), display_legs (for UI)
+    All premiums computed from live BS prices — no heuristic fractions.
+    """
+    sv  = float(step)
+    _c  = bs_call_fn
+    _p  = bs_put_fn
+
+    def _fmt(v):
+        return f"₹{v:,.0f}" if v > 0 else "—"
+
+    def _leg(opt, strike, action, qty=1):
+        px = (_c(strike) if opt == "CE" else _p(strike))
+        return {"opt": opt, "strike": float(strike),
+                "premium": float(px), "action": action, "qty": qty}
+
+    universe = []
+
+    # Helper to add to universe
+    def add(name, type_, legs, display_legs, max_risk, max_reward,
+            ideal_lo, ideal_hi, short_strike=None, term_slope=None):
+        universe.append({
+            "name":          name,
+            "type":          type_,
+            "legs":          legs,         # MC legs
+            "display_legs":  display_legs, # UI string
+            "max_risk":      max_risk,
+            "max_reward":    max_reward,
+            "ideal_dte_lo":  ideal_lo,
+            "ideal_dte_hi":  ideal_hi,
+            "short_strike":  short_strike,
+            "term_slope":    term_slope,   # IV_far - IV_near (positive = contango)
+        })
+
+    # ── DIRECTIONAL ───────────────────────────────────────────
+    _atm_c = _c(atm); _atm_p = _p(atm)
+    _otm_c = _c(atm + sv); _otm_p = _p(atm - sv)
+
+    add("Long ATM Call", "debit_bull",
+        [_leg("CE", atm, "buy")],
+        f"BUY {atm:.0f} CE",
+        _atm_c, 999, 15, 45)
+
+    add("Long ATM Put", "debit_bear",
+        [_leg("PE", atm, "buy")],
+        f"BUY {atm:.0f} PE",
+        _atm_p, 999, 15, 45)
+
+    _bcs_d = max(_atm_c - _otm_c, 0.01)
+    add("Bull Call Spread", "debit_bull",
+        [_leg("CE", atm, "buy"), _leg("CE", atm+sv, "sell")],
+        f"BUY {atm:.0f} CE + SELL {atm+sv:.0f} CE",
+        _bcs_d, sv - _bcs_d, 15, 30, short_strike=atm+sv)
+
+    _bps_d = max(_atm_p - _otm_p, 0.01)
+    add("Bear Put Spread", "debit_bear",
+        [_leg("PE", atm, "buy"), _leg("PE", atm-sv, "sell")],
+        f"BUY {atm:.0f} PE + SELL {atm-sv:.0f} PE",
+        _bps_d, sv - _bps_d, 15, 30, short_strike=atm-sv)
+
+    _bcs_cr = max(_atm_c - _otm_c, 0.01)
+    add("Bear Call Spread", "credit_bear",
+        [_leg("CE", atm, "sell"), _leg("CE", atm+sv, "buy")],
+        f"SELL {atm:.0f} CE + BUY {atm+sv:.0f} CE",
+        sv - _bcs_cr, _bcs_cr, 7, 21, short_strike=atm)
+
+    _bps_cr = max(_atm_p - _otm_p, 0.01)
+    add("Bull Put Spread", "credit_bull",
+        [_leg("PE", atm, "sell"), _leg("PE", atm-sv, "buy")],
+        f"SELL {atm:.0f} PE + BUY {atm-sv:.0f} PE",
+        sv - _bps_cr, _bps_cr, 7, 21, short_strike=atm)
+
+    # ── NEUTRAL / VOLATILITY ──────────────────────────────────
+    _strd = _atm_c + _atm_p
+    add("Short Straddle", "credit_neutral",
+        [_leg("CE", atm, "sell"), _leg("PE", atm, "sell")],
+        f"SELL {atm:.0f} CE + SELL {atm:.0f} PE",
+        999, _strd, 7, 14, short_strike=atm)
+
+    add("Long Straddle", "debit_neutral",
+        [_leg("CE", atm, "buy"), _leg("PE", atm, "buy")],
+        f"BUY {atm:.0f} CE + BUY {atm:.0f} PE",
+        _strd, 999, 30, 60)
+
+    _strng_cr = _otm_p + _otm_c
+    add("Short Strangle", "credit_neutral",
+        [_leg("PE", atm-sv, "sell"), _leg("CE", atm+sv, "sell")],
+        f"SELL {atm-sv:.0f} PE + SELL {atm+sv:.0f} CE",
+        999, _strng_cr, 7, 21, short_strike=atm+sv)
+
+    _strng_db = _otm_c + _otm_p
+    add("Long Strangle", "debit_neutral",
+        [_leg("CE", atm+sv, "buy"), _leg("PE", atm-sv, "buy")],
+        f"BUY {atm+sv:.0f} CE + BUY {atm-sv:.0f} PE",
+        _strng_db, 999, 30, 60)
+
+    _ic_cr = ((_p(atm-sv) - _p(atm-2*sv)) + (_c(atm+sv) - _c(atm+2*sv)))
+    add("Iron Condor", "credit_neutral",
+        [_leg("PE", atm-sv, "sell"), _leg("PE", atm-2*sv, "buy"),
+         _leg("CE", atm+sv, "sell"), _leg("CE", atm+2*sv, "buy")],
+        f"SELL {atm-sv:.0f}P/{atm+sv:.0f}C + BUY {atm-2*sv:.0f}P/{atm+2*sv:.0f}C",
+        sv - _ic_cr, _ic_cr, 14, 30, short_strike=atm+sv)
+
+    _ibf_cr = _atm_c + _atm_p - _otm_c - _otm_p
+    add("Iron Butterfly", "credit_neutral",
+        [_leg("CE", atm, "sell"), _leg("PE", atm, "sell"),
+         _leg("CE", atm+sv, "buy"), _leg("PE", atm-sv, "buy")],
+        f"SELL {atm:.0f}C/{atm:.0f}P + BUY {atm+sv:.0f}C/{atm-sv:.0f}P",
+        sv - _ibf_cr, _ibf_cr, 14, 21, short_strike=atm)
+
+    _bf_db = max(_c(atm-sv) - 2*_atm_c + _c(atm+sv), 0.01)
+    add("ATM Butterfly", "debit_neutral",
+        [_leg("CE", atm-sv, "buy"), _leg("CE", atm, "sell", 2), _leg("CE", atm+sv, "buy")],
+        f"BUY {atm-sv:.0f}C - 2× SELL {atm:.0f}C + BUY {atm+sv:.0f}C",
+        _bf_db, sv - _bf_db, 7, 21)
+
+    # Calendar spread — only if term structure data available
+    if front_iv is not None and back_iv is not None:
+        _term_slope = back_iv - front_iv
+        add("Calendar Spread", "debit_neutral",
+            [_leg("CE", atm, "sell"), _leg("CE", atm, "buy")],
+            f"SELL near {atm:.0f}CE + BUY far {atm:.0f}CE",
+            _atm_c, 999, 7, 45, term_slope=_term_slope)
+
+    return universe
+
+
+def ev_rank_strategies(universe, spot, T, r, atm_iv, q,
+                        prob_score, chain_df, ohlcv_df,
+                        actual_dte, lot_size=1, simulations=None):
+    """
+    For every strategy in the universe:
+      1. Run Monte Carlo to get POP and EV
+      2. Compute Kelly fraction = EV / MaxLoss
+      3. Compute DTE alignment (continuous, no threshold)
+      4. Compute safety ratio (continuous, no threshold)
+      5. Compute composite EV-adjusted score
+
+    Selection criterion: highest EV adjusted for risk (not rules).
+    Returns list of strategy dicts sorted by ev_score descending.
+    """
+    n_sims = simulations or CFG["pop_simulations"]
+    # Defensive guards — never evaluate DataFrame truthiness with 'or'/'if df'
+    _chain_safe = chain_df  if (chain_df  is not None and isinstance(chain_df, pd.DataFrame)
+                                and not chain_df.empty) else None
+    _ohlcv_safe = ohlcv_df  if (ohlcv_df  is not None and isinstance(ohlcv_df, pd.DataFrame)
+                                 and not ohlcv_df.empty) else pd.DataFrame()
+    iv_surf = build_iv_surface(_chain_safe, spot, atm_iv)
+    mu      = _estimate_real_world_drift(_ohlcv_safe, r, q)
+    em      = prob_score.get("expected_move", atm_iv * spot * math.sqrt(T * 2 / math.pi))
+
+    # Simulate terminal price distribution ONCE, reuse for all strategies
+    _seed   = int(abs(spot * 1000 + T * 1e6)) % (2**31)
+    rng     = np.random.default_rng(_seed)
+    Z       = rng.standard_normal(n_sims)
+    sigma_sim = iv_surf(spot)
+    prices    = spot * np.exp((mu - 0.5 * sigma_sim**2) * T + sigma_sim * math.sqrt(T) * Z)
+
+    # ── MC-derived direction signals (computed once over shared price paths) ──
+    # Improvement #1: directional signal from MC terminal price distribution
+    mc_prob_up   = float((prices > spot).mean())
+    mc_prob_down = float((prices < spot).mean())
+    mc_direction = mc_prob_up - mc_prob_down   # ∈ [-1, +1]
+
+    # Improvement #2: expected move from MC std (replaces straddle-based EM)
+    mc_expected_move = float(np.std(prices))   # in ₹, same units as spot
+
+    # Final directional probability blends factor model (prob_score) with MC distribution
+    # If prob_score already has a mc_direction (from compute_probabilistic_score), use it
+    # directly; otherwise fall back to the prices computed from the full simulation above.
+    _ps_mc_dir = prob_score.get("mc_direction", None)
+    if _ps_mc_dir is not None:
+        mc_direction = float(_ps_mc_dir)   # already computed, reuse
+
+    factor_prob_up   = float(prob_score.get("prob_up",   0.5))
+    factor_prob_down = float(prob_score.get("prob_down", 0.5))
+    factor_direction = factor_prob_up - factor_prob_down   # ∈ [-1, +1]
+
+    # Combined direction: equal weight between factor model and MC distribution
+    combined_direction = 0.5 * factor_direction + 0.5 * mc_direction
+    # Convert back to probability form for downstream dir_align computations
+    final_prob_up   = max(0.01, min(0.99, (combined_direction + 1.0) / 2.0))
+    final_prob_down = 1.0 - final_prob_up
+
+    # Use MC expected move for safety ratio and strike selection (overrides straddle EM)
+    em = mc_expected_move if mc_expected_move > 0 else em
+
+    results = []
+    for s in universe:
+        # ── MC P&L ──────────────────────────────────────────────
+        pnl = np.zeros(n_sims)
+        for leg in s["legs"]:
+            k   = float(leg["strike"])
+            pr  = float(leg["premium"])
+            qty = int(leg.get("qty", 1))
+            d   = 1 if leg["action"] == "buy" else -1
+            intr = np.maximum(prices - k, 0) if leg["opt"] == "CE" else np.maximum(k - prices, 0)
+            pnl += d * (intr - pr) * qty
+
+        pop = float((pnl > 0).mean())
+        ev  = float(pnl.mean())
+        ev_per_lot = ev * lot_size
+
+        max_risk   = float(s["max_risk"])
+        max_reward = float(s["max_reward"])
+
+        # ── True Kelly from PnL distribution (Improvement #5) ────
+        # Derive p, avg_win, avg_loss directly from MC PnL paths
+        wins_arr   = pnl[pnl > 0]
+        losses_arr = pnl[pnl < 0]
+        if len(wins_arr) > 0 and len(losses_arr) > 0:
+            p_win    = len(wins_arr) / len(pnl)
+            avg_win  = float(wins_arr.mean())
+            avg_loss = float(abs(losses_arr.mean()))
+            kelly_raw = (p_win * avg_win - (1.0 - p_win) * avg_loss) / (avg_win + 1e-9)
+        elif max_risk > 0 and max_risk < 1e6:
+            # Fallback to EV-based Kelly when PnL is one-sided
+            kelly_raw = ev / (max_risk + 1e-9)
+        elif max_risk >= 1e6:
+            _proxy_risk = sum(abs(leg["premium"]) for leg in s["legs"]) * 2
+            kelly_raw   = ev / (_proxy_risk + 1e-9)
+        else:
+            kelly_raw = 0.0
+        kelly_capped = max(0.0, min(CFG.get("kelly_cap", 0.25), kelly_raw))
+        # Fractional Kelly: apply kelly_fraction from CFG (default 0.5 = half-Kelly)
+        # position_size = kelly * kelly_fraction * capital
+        kelly_fractional = kelly_capped * CFG.get("kelly_fraction", 0.5)
+
+        # ── DTE alignment — continuous exponential decay, no binary in/out ──
+        dte_lo, dte_hi = s["ideal_dte_lo"], s["ideal_dte_hi"]
+        if dte_lo <= actual_dte <= dte_hi:
+            dte_align = 1.0
+        else:
+            dist      = min(abs(actual_dte - dte_lo), abs(actual_dte - dte_hi))
+            half_rng  = max((dte_hi - dte_lo) / 2.0, 1.0)
+            dte_align = max(0.05, math.exp(-math.log(2) * dist / half_rng))
+
+        # ── Safety factor — calibrated sigmoid sharpness ─────────────────────
+        sk = s.get("short_strike")
+        if sk is not None and em > 0:
+            safety_ratio = abs(float(sk) - spot) / (em + 1e-9)
+            safety_factor = _logistic(_calib("safety_sigmoid_sharpness") * (safety_ratio - 1.0))
+            _record("_calib_safety_ratio_hist", safety_ratio)
+        else:
+            safety_ratio  = 2.0
+            safety_factor = 1.0
+
+        # ── Calendar term structure bonus — calibrated tanh scale ─────────────
+        ts_factor = 1.0
+        ts_slope  = s.get("term_slope")
+        if ts_slope is not None:
+            _record("_calib_ts_slope_raw_hist", ts_slope)
+            ts_factor = 1.0 + 0.5 * math.tanh(ts_slope * _calib("ts_tanh_scale"))
+
+        # ── EV-adjusted score — calibrated ev_tanh_scale ─────────────────────
+        ev_sign  = 1.0 if ev >= 0 else -1.0
+        ev_norm  = math.tanh(abs(ev) / (max(max_risk, 1.0) * _calib("ev_tanh_scale")))
+        ev_score = ev_norm * pop * dte_align * safety_factor * ts_factor * ev_sign
+        ev_score = max(-1.0, min(1.0, ev_score))
+
+        # ── Directional alignment — MC+factor blended probabilities ──────────
+        stype     = s["type"]
+        if "bull" in stype:
+            dir_align = final_prob_up
+        elif "bear" in stype:
+            dir_align = final_prob_down
+        else:
+            dir_align = 1.0 - 2.0 * abs(final_prob_up - 0.5)
+
+        # ── Composite — calibrated blend of EV score vs directional alignment ──
+        _ev_w    = _calib("ev_score_vs_dir_align")
+        composite = _ev_w * ev_score + (1.0 - _ev_w) * (dir_align - 0.5) * 2
+        composite = max(-1.0, min(1.0, composite))
+        # Record for calibration
+        _record("_calib_ev_score_hist",   ev_score)
+        _record("_calib_dir_align_hist",  dir_align)
+        _record("_calib_realised_pnl_hist", ev)
+        # Convert to 0-100 display score
+        display_score = int(round((composite + 1.0) / 2.0 * 100))
+
+        results.append({
+            "Strategy":      s["name"],
+            "Type":          s["type"],
+            "Legs":          s["display_legs"],
+            "pop":           round(pop, 4),
+            "ev":            round(ev, 2),
+            "ev_per_lot":    round(ev_per_lot, 2),
+            "kelly":         round(kelly_fractional, 4),   # fractional Kelly for position sizing
+            "kelly_raw":     round(kelly_raw, 4),
+            "kelly_capped":  round(kelly_capped, 4),
+            "max_risk":      round(max_risk, 2),
+            "max_reward":    round(max_reward, 2),
+            "dte_align":     round(dte_align, 3),
+            "safety_ratio":  round(safety_ratio, 3),
+            "safety_factor": round(safety_factor, 3),
+            "dir_align":     round(dir_align, 4),
+            "mc_prob_up":    round(mc_prob_up, 4),
+            "mc_prob_down":  round(mc_prob_down, 4),
+            "mc_direction":  round(mc_direction, 4),
+            "mc_expected_move": round(mc_expected_move, 2),
+            "ev_score":      round(ev_score, 4),
+            "composite":     round(composite, 4),
+            "Score":         display_score,
+            # Legacy UI fields
+            "Max Risk":      f"₹{max_risk:,.0f}" if max_risk < 1e5 else "Unlimited",
+            "Max Reward":    f"₹{max_reward:,.0f}" if max_reward < 1e5 else "Unlimited",
+            "Ideal DTE":     f"{s['ideal_dte_lo']}–{s['ideal_dte_hi']} DTE",
+            "Rationale":     (
+                f"POP {pop*100:.1f}% · EV ₹{ev:+.0f} · Safety {safety_ratio:.2f}× EM · "
+                f"DTE-align {dte_align:.2f} · Dir-align {dir_align:.2f}"
+            ),
+        })
+
+    results.sort(key=lambda x: x["composite"], reverse=True)
+    return results
+
+
+def recommend_strategies(bias, vol_lbl, dte, spot, atm, step, ivr, bias_score=0,
+                          bs_call_fn=None, bs_put_fn=None,
+                          front_iv=None, back_iv=None,
+                          expected_move=None,
+                          prob_score=None, chain_df=None, ohlcv_df=None,
+                          T=None, r=None, q=None, atm_iv=None, lot_size=1):
+    """
+    Unified entry point — returns EV-ranked strategy list.
+    Falls back to heuristic-free display when MC inputs unavailable.
+    """
+    # Build universe
+    if bs_call_fn is None:
+        return []
+
+    universe = _build_strategy_universe(
+        spot, atm, step, T or 0.05, r or 0.065, q or 0.0, atm_iv or 0.20,
+        bs_call_fn, bs_put_fn,
+        chain_df  if (chain_df  is not None and not chain_df.empty)  else None,
+        front_iv, back_iv)
+
+    if prob_score is None:
+        prob_score = {"prob_up": 0.5, "prob_down": 0.5, "expected_move": expected_move or 0,
+                      "raw_score": 0.0}
+
+    # Expected move fallback: ATR-based if OHLCV available, else adaptive seed
+    _ohlcv_em2 = st.session_state.get("opt_ohlcv_df", None)
+    if _ohlcv_em2 is not None and not _ohlcv_em2.empty and len(_ohlcv_em2) >= 5:
+        _c_em2  = _ohlcv_em2["close"].astype(float)
+        _h_em2  = _ohlcv_em2["high"].astype(float)
+        _l_em2  = _ohlcv_em2["low"].astype(float)
+        _tr_em2 = pd.concat([_h_em2 - _l_em2,
+                              (_h_em2 - _c_em2.shift(1)).abs(),
+                              (_l_em2 - _c_em2.shift(1)).abs()], axis=1).max(axis=1)
+        _atr_fallback = float(_tr_em2.tail(14).mean())
+    else:
+        _atr_fallback = _atr_seed(atm)
+
+    # Inject fallback EM into prob_score if it has no usable expected_move
+    if not prob_score.get("expected_move"):
+        prob_score = dict(prob_score)   # shallow copy — don't mutate caller's dict
+        prob_score["expected_move"] = expected_move or _atr_fallback
+
+    # Safe DataFrame fallbacks — never use 'or' with DataFrames (raises ValueError)
+    _chain_df_safe = chain_df if (chain_df is not None and not chain_df.empty) else None
+    _ohlcv_df_safe = ohlcv_df if (ohlcv_df is not None and not ohlcv_df.empty) else pd.DataFrame()
+
+    return ev_rank_strategies(
+        universe, spot, T or 0.05, r or 0.065, atm_iv or 0.20, q or 0.0,
+        prob_score, _chain_df_safe, _ohlcv_df_safe,
+        actual_dte=dte, lot_size=lot_size)
+
+
+# ============================================================
+# PORTFOLIO GREEKS MODULE
+# ============================================================
+
+def compute_portfolio_greeks(legs, spot, T, r, atm_iv, q=0.0, chain_df=None, lot_size=1):
+    """Aggregate net Greeks for a multi-leg portfolio.
+    Uses per-strike IV from the vol surface where available (skew-aware).
+    Returns: net Delta, Gamma, Vega, Theta (₹/day), Charm, Vanna.
+    """
+    iv_surf = build_iv_surface(chain_df, spot, atm_iv) if chain_df is not None else (lambda K: atm_iv)
+    net = {"delta": 0.0, "gamma": 0.0, "vega": 0.0, "theta": 0.0,
+           "charm": 0.0, "vanna": 0.0}
+    for leg in legs:
+        k     = float(leg.get("strike", spot))
+        qty   = int(leg.get("qty", 1))
+        d     = 1 if str(leg.get("action", "buy")).lower() == "buy" else -1
+        opt   = "call" if str(leg.get("opt", "CE")).upper() in ("CE", "CALL") else "put"
+        sigma = iv_surf(k)
+        g = bs_greeks(spot, k, T, r, sigma, opt, q)
+        scale = d * qty * lot_size
+        net["delta"] += g["delta"] * scale
+        net["gamma"] += g["gamma"] * scale
+        net["vega"]  += g["vega"]  * scale
+        net["theta"] += g["theta"] * scale
+        net["charm"] += bs_charm(spot, k, T, r, sigma, opt, q) * scale
+        net["vanna"] += bs_vanna(spot, k, T, r, sigma, opt, q) * scale
+    return {k: round(v, 4) for k, v in net.items()}
+
+
+# ============================================================
+# KELLY POSITION SIZING ENGINE  (Improvement #9)
+# ============================================================
+
+def kelly_position_size(win_prob, avg_win_pct, avg_loss_pct, capital,
+                        max_kelly=0.25, fractional=0.5):
+    """Compute Kelly fraction and position size.
+    Kelly = (WinProb × AvgWin - (1-WinProb) × AvgLoss) / AvgWin
+    Capped at max_kelly (default 0.25) for safety.
+    fractional Kelly (default 0.5) further reduces variance.
+    Returns: kelly_raw, kelly_capped, kelly_fractional, position_size (₹).
+    """
+    if avg_win_pct <= 0 or avg_loss_pct <= 0:
+        return {"kelly_raw": 0.0, "kelly_capped": 0.0, "kelly_f": 0.0, "position_size": 0.0,
+                "remark": "Invalid win/loss inputs"}
+    p   = max(0.0, min(1.0, win_prob))
+    q_k = 1.0 - p
+    kelly_raw  = (p * avg_win_pct - q_k * avg_loss_pct) / avg_win_pct
+    kelly_cap  = max(0.0, min(max_kelly, kelly_raw))
+    kelly_frac = kelly_cap * fractional
+    pos_size   = kelly_frac * capital
+
+    if   kelly_raw <= 0:   remark = "Negative Kelly — edge is unfavourable; do not trade"
+    elif kelly_raw > 0.5:  remark = f"Very high Kelly ({kelly_raw:.1%}) — capped at {kelly_cap:.1%}"
+    elif kelly_raw > 0.25: remark = f"High Kelly ({kelly_raw:.1%}) — capped at {kelly_cap:.1%}"
+    else:                   remark = f"Kelly {kelly_raw:.1%} — fractional ({fractional:.0%}) = {kelly_frac:.1%}"
+    return {
+        "kelly_raw":     round(kelly_raw,  4),
+        "kelly_capped":  round(kelly_cap,  4),
+        "kelly_f":       round(kelly_frac, 4),
+        "position_size": round(pos_size,   2),
+        "remark":        remark,
+    }
+
+
 if "opt_chain_data"  not in st.session_state: st.session_state.opt_chain_data  = pd.DataFrame()
 if "opt_spot"        not in st.session_state: st.session_state.opt_spot        = 0.0
 if "opt_atm_iv"      not in st.session_state: st.session_state.opt_atm_iv      = 0.20
@@ -1018,8 +4159,38 @@ if "opt_expiry"      not in st.session_state: st.session_state.opt_expiry      =
 if "opt_dte"         not in st.session_state: st.session_state.opt_dte         = 7
 if "opt_step"        not in st.session_state: st.session_state.opt_step        = 50
 if "payoff_legs"     not in st.session_state: st.session_state.payoff_legs     = []
-if "opt_iv_history" not in st.session_state: st.session_state.opt_iv_history   = {}  # {symbol: [iv, ...]} rolling 252-day IV log
 if "opt_loaded"      not in st.session_state: st.session_state.opt_loaded      = False
+if "opt_div_yield"   not in st.session_state: st.session_state.opt_div_yield   = {}
+# Multi-expiry: stores a list of dicts, one per loaded expiry
+# Each dict: {expiry, dte, T, chain_df, atm_iv, straddle, exp_move_pct, oi_d}
+if "opt_multi_expiry" not in st.session_state: st.session_state.opt_multi_expiry = []
+if "opt_multi_loaded" not in st.session_state: st.session_state.opt_multi_loaded = False
+# Load IV history from disk on first session init (persists across restarts)
+if "opt_iv_history"  not in st.session_state:
+    st.session_state.opt_iv_history = _load_iv_history()
+# Forward signal log — loaded from disk once per session
+if "opt_signal_log"  not in st.session_state:
+    st.session_state.opt_signal_log = _load_signal_log()
+# User capital — persists in session, used for Kelly position sizing everywhere
+if "opt_capital"     not in st.session_state: st.session_state.opt_capital     = 500_000
+# Flow conviction threshold — updated dynamically from rolling magnitude history
+if "opt_flow_conv_threshold" not in st.session_state:
+    st.session_state.opt_flow_conv_threshold = CFG["flow_conviction_seed"]
+# New institutional features
+if "opt_iv_percentile" not in st.session_state: st.session_state.opt_iv_percentile = 50.0
+if "opt_regime"        not in st.session_state: st.session_state.opt_regime        = {}
+if "opt_events"        not in st.session_state: st.session_state.opt_events        = []
+if "opt_rs_nifty"      not in st.session_state: st.session_state.opt_rs_nifty      = None
+if "opt_liquidity"     not in st.session_state: st.session_state.opt_liquidity     = {}
+# Adaptive parameter engine — calibration store and signal histories
+# Load from disk on first session so weights survive restarts
+if _CALIB_STORE_KEY not in st.session_state:
+    st.session_state[_CALIB_STORE_KEY] = _load_calib()
+if "opt_prob_score"     not in st.session_state: st.session_state.opt_prob_score     = {}
+if "opt_ohlcv_df"       not in st.session_state: st.session_state.opt_ohlcv_df       = None
+if "opt_factor_hist"    not in st.session_state: st.session_state.opt_factor_hist    = {}
+if "opt_intraday_df"    not in st.session_state: st.session_state.opt_intraday_df    = pd.DataFrame()
+if "opt_intraday_signals" not in st.session_state: st.session_state.opt_intraday_signals = {}
 
 # ============================================================
 # SIDEBAR — ALL INPUTS
@@ -1081,8 +4252,40 @@ with st.sidebar:
     if "rfr_sidebar" not in st.session_state:
         rfr_sidebar = 6.5
 
+    # ── Capital input — persists across loads, used for Kelly sizing everywhere ──
+    st.divider()
+    st.markdown("### 💼 Capital & Sizing")
+    _cap_input = st.number_input(
+        "Trading Capital (₹)",
+        min_value=10_000, max_value=100_000_000,
+        value=int(st.session_state.opt_capital),
+        step=10_000, key="capital_sidebar",
+        help="Used for Kelly position sizing on every strategy card. Set once, applies everywhere.")
+    if _cap_input != st.session_state.opt_capital:
+        st.session_state.opt_capital = int(_cap_input)
+    _kelly_frac_display = CFG["kelly_fraction"]
+    _kelly_cap_display  = CFG["kelly_cap_pct"]
+    st.caption(f"Kelly: {_kelly_frac_display:.0%} fractional · capped at {_kelly_cap_display:.0%}")
+
     st.divider()
     load_btn = st.button("⚡ LOAD OPTIONS INTEL", use_container_width=True, key="load_opt_main")
+
+    # ── Multi-expiry loader ──────────────────────────────────
+    st.divider()
+    st.markdown("### 📅 Term Structure")
+    st.caption("Load multiple expiries to analyse IV term structure, roll costs, and calendar opportunities.")
+
+    if expiry_list and len(expiry_list) >= 2:
+        _max_ts = min(len(expiry_list), 5)
+        _ts_default = min(3, _max_ts)
+        ts_n = st.slider("Expiries to load", min_value=2, max_value=_max_ts,
+                         value=_ts_default, key="ts_n_slider")
+        ts_expiries = expiry_list[:ts_n]
+        st.caption("Will load: " + "  ·  ".join(ts_expiries))
+        multi_load_btn = st.button("📅 LOAD TERM STRUCTURE", use_container_width=True, key="multi_load_btn")
+    else:
+        multi_load_btn = False
+        st.caption("Need ≥2 expiries from API to build term structure.")
 
     # Show a clean status card once loaded — no raw number clutter
     if st.session_state.opt_loaded:
@@ -1092,7 +4295,7 @@ with st.sidebar:
                  "BEARISH":"#ff7777","STRONGLY BEARISH":"#ff3b3b"}.get(_bres.get("bias","NEUTRAL"),"#888")
         st.markdown(f"""
 <div style="background:#0d0d0d;border:1px solid #2a2a2a;border-left:3px solid {_bc2};
-padding:8px 10px;font-family:'IBM Plex Mono',monospace;font-size:.6rem;margin-top:4px;">
+padding:8px 10px;font-family:'IBM Plex Mono',monospace;font-size:0.77rem;margin-top:4px;">
   <div style="color:#555;letter-spacing:.08em;margin-bottom:3px;">LOADED</div>
   <div style="color:#ff8c00;font-weight:700;">{_s.opt_symbol} · {_s.opt_expiry}</div>
   <div style="color:#e8e8e8;">₹{_s.opt_spot:,.1f} · DTE {_s.opt_dte}</div>
@@ -1133,113 +4336,308 @@ if load_btn:
             st.stop()
 
         # 2. Historical data
-        ohlcv_df = get_ohlcv(sym_sel, ACCESS_TOKEN)
-        hv20     = compute_hv(ohlcv_df["close"].astype(float), 20) if not ohlcv_df.empty else None
-        hv10     = compute_hv(ohlcv_df["close"].astype(float), 10) if not ohlcv_df.empty else None
+        ohlcv_df = get_ohlcv(sym_sel, ACCESS_TOKEN, master_df)
+        hv20     = compute_hv(ohlcv_df["close"].astype(float), CFG["hv_window"])      if not ohlcv_df.empty else None
+        hv10     = compute_hv(ohlcv_df["close"].astype(float), CFG["hv_window_fast"]) if not ohlcv_df.empty else None
 
-        # 3. Direction
-        bias_res = directional_bias(ohlcv_df, spot)
+        # 2b. Intraday OHLCV — 5-min candles from Upstox (live, cached 60s)
+        intraday_df = get_intraday_ohlcv(sym_sel, ACCESS_TOKEN, interval="5minute", master_df=master_df)
+        st.session_state["opt_intraday_df"] = intraday_df
+        # Persist ohlcv_df so flow/factor weight functions can access it without a parameter chain
+        st.session_state["opt_ohlcv_df"] = ohlcv_df if not ohlcv_df.empty else None
+
+        # ── Outcome resolution: compute real forward returns for past signals ──
+        # This is the core feedback loop. Pending snapshots whose horizon has
+        # elapsed are resolved against the current spot price, producing real
+        # (signal, return) pairs that calibrate the model on actual market outcomes.
+        _resolved = _resolve_outcomes(sym_sel, spot, ohlcv_df if not ohlcv_df.empty else None)
+        if _resolved:
+            _ingest_resolved_outcomes(sym_sel, _resolved)
+
+        # Run calibration cycle — uses real outcomes first, OHLCV fallback
+        _run_calibration_cycle(
+            ohlcv_df if not ohlcv_df.empty else None,
+            symbol=sym_sel,
+            horizon=4
+        )
+
+        # 3. Direction — pass chain_df for positioning factors
+        bias_res = directional_bias(ohlcv_df, spot,
+                                    chain_df=st.session_state.opt_chain_data
+                                    if not st.session_state.opt_chain_data.empty else None)
 
         # 4. Option chain
         chain_raw = fetch_option_chain(ACCESS_TOKEN, ikey, expiry_sel) if ikey and expiry_sel else []
         chain_df  = parse_chain(chain_raw, spot, step_val)
 
-        # 5. ATM IV
-        atm_iv = None
+        # 4b. Compute intraday signals from live 5-min candles + OI change data
+        _intra_sigs = compute_intraday_signals(intraday_df, chain_df, spot)
+        st.session_state["opt_intraday_signals"] = _intra_sigs
+
+        # 5. T — trading-day fraction using np.busday_count (weekdays only, NOT calendar/365)
+        hv_ref = hv20 if hv20 and hv20 > 0.01 else CFG["hv_fallback"]
+        if expiry_sel:
+            actual_dte_td = max(int(np.busday_count(
+                datetime.now().date().isoformat(), expiry_sel)), 1)
+            T_val = actual_dte_td / CFG["ann_days"]
+        elif dte_sidebar and dte_sidebar > 0:
+            actual_dte_td = dte_sidebar
+            T_val = dte_sidebar / CFG["ann_days"]
+        else:
+            actual_dte_td = 7
+            T_val = 7.0 / CFG["ann_days"]
+            st.warning("⚠️  No expiry date provided; DTE defaulted to 7 trading days. "
+                       "Select an expiry or use the DTE override for accurate results.")
+
+        # 6. ATM IV — PRIMARY: Brenner-Subrahmanyam from ATM straddle midpoint LTP
         atm_k  = atm_strike(spot, step_val)
+        atm_iv = None
+
         if not chain_df.empty:
             row = chain_df.iloc[(chain_df.Strike - spot).abs().argsort()[:1]]
             if not row.empty:
-                ce_iv_r = float(row.CE_IV.values[0])
-                pe_iv_r = float(row.PE_IV.values[0])
-                ce_iv   = ce_iv_r/100 if ce_iv_r > 2 else ce_iv_r
-                pe_iv   = pe_iv_r/100 if pe_iv_r > 2 else pe_iv_r
-                if ce_iv + pe_iv > 0: atm_iv = (ce_iv + pe_iv) / 2
-        if not atm_iv:
-            # Compute T from expiry date first (dte_sidebar may be 0 = auto)
-            _dte_tmp = 7  # safe fallback
-            if expiry_sel:
-                try:
-                    _exp_d  = datetime.strptime(expiry_sel, "%Y-%m-%d").date()
-                    _dte_tmp = max(((_exp_d - datetime.now().date()).days), 1)
-                except: pass
-            elif dte_sidebar and dte_sidebar > 0:
-                _dte_tmp = dte_sidebar
-            T_tmp = _dte_tmp / 365.0
-            if not chain_df.empty:
-                row = chain_df.iloc[(chain_df.Strike - spot).abs().argsort()[:1]]
-                if not row.empty:
-                    strd = float(row.CE_LTP.values[0]) + float(row.PE_LTP.values[0])
-                    if strd > 0 and T_tmp > 0:
-                        # Brenner-Subrahmanyam (1988): ATM straddle ≈ spot × IV × sqrt(2/π) × sqrt(T)
-                        # Rearranged: IV = straddle / (spot × sqrt(T) × sqrt(2/π))
-                        # sqrt(2/π) ≈ 0.79788 — replaces the arbitrary 0.8
-                        _bs_const = math.sqrt(2.0 / math.pi)  # 0.79788...
-                        atm_iv = strd / (_bs_const * spot * math.sqrt(T_tmp)) if spot > 0 else None
-        if not atm_iv:
-            atm_iv = hv20 or 0.20
+                strd = float(row.CE_LTP.values[0]) + float(row.PE_LTP.values[0])
+                if strd > 0 and T_val > 0 and spot > 0:
+                    _bs_const = math.sqrt(2.0 / math.pi)
+                    _iv_bs    = strd / (_bs_const * spot * math.sqrt(T_val))
+                    atm_iv = _sanitise_iv(_iv_bs, None)
 
-        # 6. OI
-        _T_for_oi  = _dte_tmp / 365.0
-        _rfr_for_oi = st.session_state.get("rfr_sidebar", CFG["rfr_default"]) / 100.0
-        oi_d = oi_analysis(chain_df, spot, step_val, T=_T_for_oi, r=_rfr_for_oi, atm_iv=atm_iv or 0.20)
+        if atm_iv is None and not chain_df.empty:
+            # Secondary: average of sanitised per-leg IVs
+            row = chain_df.iloc[(chain_df.Strike - spot).abs().argsort()[:1]]
+            if not row.empty:
+                valid = [v for v in [
+                    _sanitise_iv(float(row.CE_IV.values[0]), None),
+                    _sanitise_iv(float(row.PE_IV.values[0]), None)
+                ] if v is not None]
+                if valid:
+                    atm_iv = sum(valid) / len(valid)
 
-        # 7. DTE from expiry date (auto when dte_sidebar == 0)
-        actual_dte = dte_sidebar if dte_sidebar and dte_sidebar > 0 else 7
-        if expiry_sel:
-            try:
-                exp_d      = datetime.strptime(expiry_sel, "%Y-%m-%d").date()
-                actual_dte = max((exp_d - datetime.now().date()).days, 1)
-            except: pass
+        if atm_iv is None:
+            atm_iv = hv_ref  # final fallback: use HV (better than arbitrary constant)
 
-        # Append current ATM IV to rolling history for this symbol (max 252 trading days = ~1 year)
-        _iv_hist = st.session_state.opt_iv_history
-        _sym_key = sym_sel.upper()
-        if _sym_key not in _iv_hist:
-            _iv_hist[_sym_key] = []
-        _iv_hist[_sym_key].append(atm_iv)
-        if len(_iv_hist[_sym_key]) > 252:
-            _iv_hist[_sym_key] = _iv_hist[_sym_key][-252:]
-        st.session_state.opt_iv_history = _iv_hist
+        # 7. Dividend yield from yfinance info
+        q_yield = 0.0
+        try:
+            _yft  = YF_TICKERS.get(sym_sel.upper(), f"{sym_sel.upper()}.NS")
+            _info = yf.Ticker(_yft).info
+            _dy   = _info.get("dividendYield") or 0.0
+            q_yield = float(_dy) if 0 <= _dy < 0.20 else 0.0
+        except Exception:
+            q_yield = 0.0
+        st.session_state.opt_div_yield[sym_sel.upper()] = q_yield
+
+        # 8. Persist IV to disk-backed rolling history
+        _append_iv(sym_sel, atm_iv)
+
+        # 9. OI analysis — lot size from centralized CFG
+        _lot = CFG["lot_sizes"].get(sym_sel.upper(), CFG["lot_size_fallback"])
+        _rfr_for_oi = float(st.session_state.get("rfr_sidebar", CFG["rfr_default"])) / 100.0
+        oi_d = oi_analysis(chain_df, spot, step_val, T=T_val, r=_rfr_for_oi,
+                           atm_iv=atm_iv, lot_size=_lot)
 
         # Store in session
         st.session_state.opt_chain_data = chain_df
         st.session_state.opt_spot       = spot
         st.session_state.opt_atm_iv     = atm_iv
-        st.session_state.opt_hv20       = hv20 or 0.20
+        st.session_state.opt_hv20       = hv20 or hv_ref
         st.session_state.opt_bias       = bias_res
         st.session_state.opt_oi         = oi_d
         st.session_state.opt_symbol     = sym_sel
         st.session_state.opt_expiry     = expiry_sel
-        st.session_state.opt_dte        = actual_dte
+        st.session_state.opt_dte        = actual_dte_td
         st.session_state.opt_step       = step_val
         st.session_state.opt_atm_k      = atm_k
-        st.session_state.opt_rfr        = st.session_state.get("rfr_sidebar", 6.5) / 100.0
-        st.session_state.opt_hv10       = hv10 or 0.20
+        st.session_state.opt_rfr        = _rfr_for_oi
+        st.session_state.opt_T          = T_val
+        st.session_state.opt_hv10       = hv10 or hv_ref
         st.session_state.opt_ohlcv      = ohlcv_df
         st.session_state.opt_loaded     = True
-        st.session_state.payoff_legs    = []  # reset payoff on new load
+        st.session_state.payoff_legs    = []
+
+        # ── NEW: Institutional metrics ──────────────────────────
+        # IV Percentile
+        _iv_hist_load = st.session_state.opt_iv_history.get(sym_sel, [])
+        if len(_iv_hist_load) >= 3:
+            st.session_state.opt_iv_percentile = iv_percentile(_iv_hist_load)
+        else:
+            st.session_state.opt_iv_percentile = 50.0
+
+        # Market Regime
+        _hv_for_regime = hv20 or hv_ref
+        st.session_state.opt_regime = detect_market_regime(ohlcv_df, atm_iv, _hv_for_regime)
+
+        # Event Detection
+        if expiry_sel:
+            st.session_state.opt_events = detect_events(expiry_sel)
+        else:
+            st.session_state.opt_events = []
+
+        # Liquidity Analysis
+        st.session_state.opt_liquidity = liquidity_analysis(chain_df, spot, step_val, atm_iv, T_val)
+
+        # RS vs Nifty (skip for indices, they're the benchmark)
+        if sym_sel.upper() not in ("NIFTY","BANKNIFTY","FINNIFTY","MIDCPNIFTY","SENSEX"):
+            with st.spinner("Computing RS vs Nifty…"):
+                st.session_state.opt_rs_nifty = relative_strength_vs_nifty(sym_sel, ohlcv_df)
+        else:
+            st.session_state.opt_rs_nifty = None
+
+        # ── Flow conviction threshold: update from rolling magnitude history ──────
+        # Track flow_magnitude across loads; threshold = 70th percentile of history
+        # This makes "high conviction" adaptive — on a quiet day it's lower, on volatile
+        # days it auto-raises so only truly exceptional flow fires the alert
+        _flow_mag_now = bias_res.get("flow", {}).get("flow_magnitude", 0.0)
+        _fmag_hist = st.session_state.get("_flow_mag_hist", [])
+        _fmag_hist.append(float(_flow_mag_now))
+        if len(_fmag_hist) > 50: _fmag_hist = _fmag_hist[-50:]
+        st.session_state["_flow_mag_hist"] = _fmag_hist
+        if len(_fmag_hist) >= 5:
+            # 70th percentile of observed magnitudes = high conviction threshold
+            st.session_state.opt_flow_conv_threshold = float(np.percentile(_fmag_hist, 70))
+        # else: keep seed value from session init
+
+        # ── Forward signal log — append this load's signal ───────────────────────
+        # Computed after prob_score is available; store for forward performance tracking
+        # prob_score is computed in the render section, but we need it at load time.
+        # Solution: store the raw inputs; prob_score gets computed fresh on each render.
+        # We append a minimal snapshot here — full prob_score appended in render section.
+        st.session_state["_pending_signal_log"] = {
+            "symbol":    sym_sel,
+            "atm_iv":    atm_iv,
+            "ivr":       st.session_state.opt_iv_percentile,
+            "bias":      bias_res.get("bias", "NEUTRAL"),
+            "flow_score": _flow_mag_now,
+        }
 
 # ============================================================
-# MAIN RENDER (only if data is loaded)
+# MULTI-EXPIRY LOAD LOGIC
 # ============================================================
+
+if multi_load_btn:
+    _spot_me = st.session_state.opt_spot if st.session_state.opt_loaded else None
+    if not _spot_me:
+        # try to get spot quickly
+        _ikey_me = find_instrument_key(load_fno_master(), sym_sel)
+        _spot_me = fetch_spot_quote(_ikey_me) if _ikey_me else None
+    if not _spot_me or _spot_me <= 0:
+        st.error("Load single expiry first (⚡ LOAD OPTIONS INTEL) to establish spot price, then load Term Structure.")
+    else:
+        _ikey_me   = find_instrument_key(load_fno_master(), sym_sel)
+        _rfr_me    = float(st.session_state.get("rfr_sidebar", CFG["rfr_default"])) / 100.0
+        _step_me   = STRIKE_STEPS.get(sym_sel.upper(), DEFAULT_STEP)
+        _lot_me    = CFG["lot_sizes"].get(sym_sel.upper(), CFG["lot_size_fallback"])
+        _atm_me    = atm_strike(_spot_me, _step_me)
+        _bs_const  = math.sqrt(2.0 / math.pi)
+        _q_me      = st.session_state.opt_div_yield.get(sym_sel.upper(), 0.0)
+        _hv_me     = st.session_state.opt_hv20 if st.session_state.opt_loaded else CFG["hv_fallback"]
+
+        multi_data = []
+        _prog = st.progress(0, text="Loading term structure…")
+        for _idx, _exp in enumerate(ts_expiries):
+            _prog.progress(int((_idx+1)/len(ts_expiries)*100),
+                           text=f"Fetching {_exp}…")
+            try:
+                _dte_td = max(int(np.busday_count(
+                    datetime.now().date().isoformat(), _exp)), 1)
+                _T_me   = _dte_td / CFG["ann_days"]
+
+                _raw    = fetch_option_chain(ACCESS_TOKEN, _ikey_me, _exp) if _ikey_me else []
+                _cdf    = parse_chain(_raw, _spot_me, _step_me) if _raw else pd.DataFrame()
+
+                # ATM IV via straddle midpoint
+                _atm_iv_me = None
+                if not _cdf.empty:
+                    _row = _cdf.iloc[(_cdf.Strike - _spot_me).abs().argsort()[:1]]
+                    if not _row.empty:
+                        _strd = float(_row.CE_LTP.values[0]) + float(_row.PE_LTP.values[0])
+                        if _strd > 0 and _T_me > 0:
+                            _iv_bs = _strd / (_bs_const * _spot_me * math.sqrt(_T_me))
+                            _atm_iv_me = _sanitise_iv(_iv_bs, None)
+                if _atm_iv_me is None:
+                    _atm_iv_me = _hv_me
+
+                # per-strike IVs for smile
+                _smile = []
+                if not _cdf.empty:
+                    for _, _sr in _cdf.iterrows():
+                        _civ = _sanitise_iv(float(_sr.CE_IV), _atm_iv_me)
+                        _piv = _sanitise_iv(float(_sr.PE_IV), _atm_iv_me)
+                        _smile.append({"Strike": float(_sr.Strike),
+                                       "CE_IV": round(_civ*100, 2),
+                                       "PE_IV": round(_piv*100, 2)})
+
+                # straddle & expected move
+                _strd_val = 0.0
+                _exp_move = 0.0
+                if not _cdf.empty:
+                    _ar = _cdf.iloc[(_cdf.Strike - _spot_me).abs().argsort()[:1]]
+                    if not _ar.empty:
+                        _strd_val = float(_ar.CE_LTP.values[0]) + float(_ar.PE_LTP.values[0])
+                        _exp_move = round(_strd_val / _spot_me * 100, 2)
+
+                # OI totals — always use epsilon denominator, never return 0 when CE_OI=0
+                _total_ce = float(_cdf.CE_OI.sum()) if not _cdf.empty else 0
+                _total_pe = float(_cdf.PE_OI.sum()) if not _cdf.empty else 0
+                _pcr      = round(_total_pe / (_total_ce + 1e-9), 3)
+
+                multi_data.append({
+                    "expiry":      _exp,
+                    "dte":         _dte_td,
+                    "T":           round(_T_me, 5),
+                    "atm_iv":      round(_atm_iv_me, 5),
+                    "atm_iv_pct":  round(_atm_iv_me * 100, 2),
+                    "straddle":    round(_strd_val, 2),
+                    "exp_move_pct":_exp_move,
+                    "chain_df":    _cdf,
+                    "smile":       _smile,
+                    "total_ce_oi": int(_total_ce),
+                    "total_pe_oi": int(_total_pe),
+                    "pcr":         _pcr,
+                })
+            except Exception as _e:
+                st.warning(f"Could not load {_exp}: {_e}")
+
+        _prog.empty()
+
+        # Compute forward volatility between consecutive tenors
+        # Forward vol: σ_f(T1,T2) = sqrt( (σ₂²·T2 − σ₁²·T1) / (T2 − T1) )
+        for _i in range(1, len(multi_data)):
+            _prev = multi_data[_i-1]
+            _curr = multi_data[_i]
+            _t1, _t2 = _prev["T"], _curr["T"]
+            _v1, _v2 = _prev["atm_iv"], _curr["atm_iv"]
+            _dt = _t2 - _t1
+            if _dt > 0 and _v2**2 * _t2 >= _v1**2 * _t1:
+                _fv = math.sqrt((_v2**2 * _t2 - _v1**2 * _t1) / _dt)
+            else:
+                _fv = _v2  # fallback if variance curve inverted
+            multi_data[_i]["fwd_vol"] = round(_fv, 5)
+            multi_data[_i]["fwd_vol_pct"] = round(_fv * 100, 2)
+        if multi_data:
+            multi_data[0]["fwd_vol"] = multi_data[0]["atm_iv"]
+            multi_data[0]["fwd_vol_pct"] = multi_data[0]["atm_iv_pct"]
+
+        st.session_state.opt_multi_expiry = multi_data
+        st.session_state.opt_multi_loaded = True
+        st.rerun()
 
 if not st.session_state.opt_loaded:
     st.markdown("""
 <div style="background:#0d0d0d;border:1px solid #2a2a2a;padding:32px 24px;
 font-family:'IBM Plex Mono',monospace;text-align:center;margin-top:20px;">
-  <div style="color:#ff8c00;font-size:.9rem;font-weight:700;letter-spacing:.15em;">
+  <div style="color:#ff8c00;font-size:1.0rem;font-weight:700;letter-spacing:.15em;">
     ⚡ MONARCH OPTIONS INTELLIGENCE
   </div>
-  <div style="color:#444;font-size:.65rem;margin:12px 0 20px;">
+  <div style="color:#444;font-size:0.83rem;margin:12px 0 20px;">
     ──────────────────────────────────────────────────────────
   </div>
-  <div style="color:#888;font-size:.7rem;line-height:2.2;">
+  <div style="color:#888;font-size:0.9rem;line-height:2.2;">
     1. Select <span style="color:#ff8c00;">Underlying</span> from the sidebar<br/>
     2. Choose <span style="color:#ff8c00;">Expiry Date</span> (auto-loaded from Upstox)<br/>
     3. Click <span style="color:#ff8c00;">⚡ LOAD OPTIONS INTEL</span><br/>
   </div>
-  <div style="color:#444;font-size:.62rem;margin-top:20px;line-height:1.8;">
+  <div style="color:#444;font-size:0.79rem;margin-top:20px;line-height:1.8;">
     The engine will compute:<br/>
     <span style="color:#e8e8e8;">
     Directional Bias · IV Regime · Strategy Recommendations<br/>
@@ -1263,32 +4661,133 @@ expiry   = st.session_state.opt_expiry
 dte      = st.session_state.opt_dte
 step     = st.session_state.opt_step
 atm_k    = st.session_state.get("opt_atm_k", atm_strike(spot, step))
-r        = st.session_state.get("opt_rfr", 0.065)
-T        = dte / 365.0
+r        = st.session_state.get("opt_rfr", CFG["rfr_default"] / 100.0)
+# T: use the trading-day fraction stored at load time (NOT recomputed from calendar DTE)
+T        = st.session_state.get("opt_T", dte / CFG["ann_days"])
+q        = st.session_state.opt_div_yield.get(sym.upper(), 0.0)
 ohlcv_df = st.session_state.get("opt_ohlcv", pd.DataFrame())
 
-bias       = bias_res.get("bias", "NEUTRAL")
-bias_score = int(round(bias_res.get("score", 0)))  # always int — tanh scoring returns floats
+# New institutional features from session state
+iv_pct       = st.session_state.get("opt_iv_percentile", 50.0)
+regime_d     = st.session_state.get("opt_regime", {})
+events_list  = st.session_state.get("opt_events", [])
+liquidity_d  = st.session_state.get("opt_liquidity", {})
+rs_nifty     = st.session_state.get("opt_rs_nifty", None)
 
-# IV Rank from real rolling history (accumulated across page refreshes for this symbol)
-# Falls back to HV-relative estimate on first load (before enough history is stored)
+# IV history for current symbol — used in Flow tab and Backtest tab
+_iv_hist_sym_flow = st.session_state.opt_iv_history.get(sym, [])
+
+bias       = bias_res.get("bias", "NEUTRAL")
+bias_score = int(round(bias_res.get("score", 0)))
+
+# IV Rank — from persistent disk-backed history
+# Bootstrap when fewer than 3 observations: IV/HV ratio mapped via tanh.
+# Denominator σ = 0.30 × HV is empirically calibrated:
+#   NSE indices show IV/HV std of ~25-35%; 0.30 × HV gives a 1σ stretch of ≈30%.
+#   At IV = 1.3×HV (one std rich) → IVR ≈ 75 (elevated sell zone). Principled.
 _iv_hist_sym = st.session_state.opt_iv_history.get(sym, [])
 if len(_iv_hist_sym) >= 3:
     ivr = iv_rank(_iv_hist_sym, atm_iv)
 else:
-    # Bootstrap estimate: IV Rank ~50 when IV = HV (fair value), rises above 50 when IV > HV.
-    # Formula: IVR = 50 + 50 × tanh((IV - HV) / (0.5 × HV))
-    # At IV=HV: IVR=50. At IV=1.5×HV: IVR≈81. At IV=0.5×HV: IVR≈19.
-    _hv_ref = hv20 if hv20 and hv20 > 0 else 0.15
-    ivr = float(min(100.0, max(0.0, 50.0 + 50.0 * math.tanh((atm_iv - _hv_ref) / (0.5 * _hv_ref)))))
+    _hv_ref = hv20 if hv20 and hv20 > 0.01 else CFG["hv_fallback"]
+    # Bootstrap: use rolling std of IV history if available, else adaptive estimate
+    _iv_std = float(np.std(_iv_hist_sym)) if len(_iv_hist_sym) >= 2 else (_hv_ref * 0.30)
+    _iv_std = max(_iv_std, _hv_ref * 0.05)   # floor: 5% of HV to prevent div/zero
+    ivr = float(min(100.0, max(0.0,
+        50.0 + 50.0 * math.tanh((atm_iv - _hv_ref) / _iv_std))))
+
 v_lbl, v_act, v_col = vol_regime(ivr)
-strat_recs   = recommend_strategies(bias, v_lbl, dte, spot, atm_k, step, ivr, bias_score)
+
+# BS helpers that close over live T, r, q, atm_iv — used by strategy engine and payoff builder
+def _bs_c(k): return round(bs_price(spot, k, T, r, atm_iv, "call", q), 2)
+def _bs_p(k): return round(bs_price(spot, k, T, r, atm_iv, "put",  q), 2)
+
+# ── PROBABILISTIC DIRECTIONAL SCORE ──────────────────────────────────────
+_lot = CFG["lot_sizes"].get(sym.upper(), CFG["lot_size_fallback"])
+prob_score = compute_probabilistic_score(
+    bias_res=bias_res, chain_df=chain_df, ohlcv_df=ohlcv_df,
+    spot=spot, atm_iv=atm_iv, hv20=hv20,
+    ivr=ivr, oi_d=oi_d, r=r, q=q, T=T, step=step)
+
+# Persist prob_score for downstream access (e.g. IV smile chart range)
+st.session_state["opt_prob_score"] = prob_score
+
+# Record MC and factor direction signals for MC-blend calibration
+_mc_dir_now  = float(prob_score.get("mc_direction", 0.0))
+_fac_dir_now = float(prob_score.get("prob_up", 0.5) - prob_score.get("prob_down", 0.5))
+_record("_calib_mc_dir_hist",  _mc_dir_now)
+_record("_calib_fac_dir_hist", _fac_dir_now)
+
+strat_recs = recommend_strategies(
+    bias, v_lbl, dte, spot, atm_k, step, ivr, bias_score,
+    bs_call_fn=_bs_c, bs_put_fn=_bs_p,
+    front_iv=st.session_state.opt_multi_expiry[0]["atm_iv"] if len(st.session_state.opt_multi_expiry) >= 1 else None,
+    back_iv =st.session_state.opt_multi_expiry[1]["atm_iv"] if len(st.session_state.opt_multi_expiry) >= 2 else None,
+    expected_move=oi_d.get("atm_straddle", None),
+    prob_score=prob_score,
+    chain_df=chain_df, ohlcv_df=ohlcv_df,
+    T=T, r=r, q=q, atm_iv=atm_iv, lot_size=_lot,
+)
+
+# ── Record signal snapshot for future outcome resolution ──────────────────────
+# Stored with current spot; resolved on next load of same symbol ≥4 sessions later.
+# _resolve_outcomes() computes log(new_spot / old_spot) as the real outcome.
+# This closes the loop: model signals → real market return → weight calibration.
+_fs         = prob_score.get("feature_scores", {})
+_top_s_snap = strat_recs[0] if strat_recs else {}
+_record_outcome(sym, {
+    "spot":               spot,
+    "raw_score":          prob_score.get("raw_score",    0.0),
+    "flow_score":         _fs.get("flow_score",          0.0),
+    "mc_direction":       _mc_dir_now,
+    "factor_direction":   _fac_dir_now,
+    "ev_score":           float(_top_s_snap.get("ev_score",  0.0)),
+    "dir_align":          float(_top_s_snap.get("dir_align", 0.5)),
+    "safety_ratio":       float(_top_s_snap.get("safety_ratio", 2.0)),
+    "ts_slope":           float(_top_s_snap.get("term_slope",   0.0) or 0.0),
+    "pcr_level_z":        _fs.get("pcr_level_z",         0.0),
+    "oi_skew_z":          _fs.get("oi_skew_z",            0.0),
+    "mp_z":               _fs.get("mp_z",                 0.0),
+    "vol_regime_z":       _fs.get("vol_regime_z",         0.0),
+    "term_slope_z":       _fs.get("term_slope_z",         0.0),
+    "rs_z":               _fs.get("rs_z",                 0.0),
+    "rs_slope_z":         0.0,
+    "ema_score":          _fs.get("trend_z",              0.0),
+    "adx_score":          float(prob_score.get("iv_hv_pct", 0.5)),
+    "rsi_z":              _fs.get("rsi_v",                50.0),
+    "iv_pillar":          float(prob_score.get("iv_hv_pct", 0.5)) * 2 - 1,
+    "adx_pillar":         _fs.get("trend_z",              0.0),
+    "hv_accel_pillar":    0.0,
+    "gex_pillar":         0.0,
+}, horizon_days=max(4, dte // 2))
 
 BIAS_COLORS = {
     "STRONGLY BULLISH":"#00d084","BULLISH":"#7dca84","NEUTRAL":"#ffb347",
     "BEARISH":"#ff7777","STRONGLY BEARISH":"#ff3b3b"
 }
 bc = BIAS_COLORS.get(bias, "#888")
+
+# ── Forward signal log: append now that prob_score and strat_recs are available ──
+_pending = st.session_state.get("_pending_signal_log", {})
+if _pending and _pending.get("symbol") == sym:
+    _top_s = strat_recs[0] if strat_recs else {}
+    _append_signal(
+        symbol        = sym,
+        prob_up       = prob_score["prob_up"],
+        prob_down     = prob_score["prob_down"],
+        flow_score    = prob_score["feature_scores"].get("flow_score", 0),
+        flow_magnitude= prob_score.get("flow_magnitude", 0),
+        raw_score     = prob_score["raw_score"],
+        top_strategy  = _top_s.get("Strategy", "—"),
+        strategy_ev   = _top_s.get("ev", 0),
+        strategy_pop  = _top_s.get("pop", 0.5),
+        strategy_kelly= _top_s.get("kelly", 0),
+        expected_move = prob_score["expected_move"],
+        atm_iv        = atm_iv,
+        ivr           = ivr,
+        bias          = bias,
+    )
+    st.session_state["_pending_signal_log"] = {}  # clear pending flag
 
 # ── TOP HEADER BAR ──
 iv_vs_hv = (atm_iv - hv20)*100
@@ -1300,7 +4799,7 @@ if len(_iv_hist_sym2) >= 5:
     _iv_ma5 = float(np.mean(_iv_hist_sym2[-5:]))
     iv_momentum = (atm_iv - _iv_ma5) * 100
     iv_mom_sign = "+" if iv_momentum >= 0 else ""
-    iv_mom_str  = f"IV Δ(5): {iv_mom_sign}{iv_momentum:.1f}%"
+    iv_mom_str  = f"IV Δ(5): {iv_mom_sign}{iv_momentum:.1f}pp"   # pp = percentage points, not %
     iv_mom_c    = "#ff3b3b" if iv_momentum > 0.5 else ("#1e90ff" if iv_momentum < -0.5 else "#888")
 else:
     iv_mom_str = "IV Δ: —"
@@ -1310,28 +4809,48 @@ st.markdown(f"""
 <div style="background:#0d0d0d;border:1px solid #2a2a2a;border-left:4px solid {bc};
 padding:10px 16px;margin-bottom:6px;font-family:'IBM Plex Mono',monospace;">
   <div style="display:flex;gap:28px;align-items:center;flex-wrap:wrap;">
-    <span style="color:#ff8c00;font-size:.65rem;font-weight:700;letter-spacing:.15em;">⚡ {sym}</span>
+    <span style="color:#ff8c00;font-size:0.83rem;font-weight:700;letter-spacing:.15em;">⚡ {sym}</span>
     <span style="font-size:1.15rem;color:#e8e8e8;font-weight:700;">₹{spot:,.2f}</span>
-    <span style="color:#888;font-size:.65rem;">ATM {atm_k} · Step {step} · {expiry}</span>
-    <span style="color:{bc};font-size:.82rem;font-weight:700;">{bias} ({bias_score:+d})</span>
-    <span style="color:{v_col};font-size:.72rem;font-weight:600;">VOL: {v_lbl}</span>
-    <span style="color:#888;font-size:.62rem;">ATM IV {atm_iv*100:.1f}% · HV20 {hv20*100:.1f}% · IV−HV {iv_sign}{iv_vs_hv:.1f}%</span>
-    <span style="color:{iv_mom_c};font-size:.6rem;">{iv_mom_str}</span>
-    <span style="color:#555;font-size:.6rem;">DTE: {dte}</span>
+    <span style="color:#888;font-size:0.83rem;">ATM {atm_k} · Step {step} · {expiry}</span>
+    <span style="color:{bc};font-size:1.0rem;font-weight:700;">{bias} ({bias_score:+d})</span>
+    <span style="color:#00d084;font-size:0.92rem;font-weight:700;">P(↑) {prob_score['prob_up']*100:.1f}%</span>
+    <span style="color:#ff3b3b;font-size:0.92rem;font-weight:700;">P(↓) {prob_score['prob_down']*100:.1f}%</span>
+    <span style="color:{v_col};font-size:0.88rem;font-weight:600;">EM ₹{prob_score['expected_move']:.0f}</span>
+    <span style="color:#888;font-size:0.79rem;">ATM IV {atm_iv*100:.1f}% · HV20 {hv20*100:.1f}%</span>
+    <span style="color:{iv_mom_c};font-size:0.77rem;">{iv_mom_str}</span>
+    <span style="color:#555;font-size:0.77rem;">DTE: {dte}</span>
   </div>
 </div>
 """, unsafe_allow_html=True)
 
-# ── TABS ──
-t_ov, t_dir, t_strat, t_chain, t_greeks, t_oi, t_payoff = st.tabs([
-    "📊 Overview",
-    "🧭 Direction",
-    "🎯 Strategies",
-    "📋 Chain",
-    "🔢 Greeks",
-    "📌 OI Analysis",
-    "💹 Payoff",
+# ── TABS — 5 focused tabs matching the trader's decision workflow ──
+# ⚡ Signal    — What is the market doing? (prob_up, flow, positioning, vol regime)
+# 🎯 Trade    — What should I do? (EV strategies + position size + trade plan)
+# 📋 Chain    — Raw data (option chain + OI + Greeks + payoff)
+# 📅 Structure — Context (term structure + regime + forward signal log)
+# 📐 Reference — Reference (maths + documentation)
+t_signal, t_trade, t_chain, t_structure, t_reference = st.tabs([
+    "⚡ Signal",
+    "🎯 Trade",
+    "📋 Chain & Data",
+    "📅 Structure",
+    "📐 Reference",
 ])
+
+# Alias old tab names to new tabs so all existing rendering code works unchanged
+t_ov       = t_signal    # Overview → Signal
+t_dir      = t_signal    # Direction → Signal
+t_strat    = t_trade     # Strategies → Trade
+t_trade_plan = t_trade   # Trade Plan → Trade  (internal alias, used below)
+t_chain_tab= t_chain     # Chain → Chain
+t_greeks   = t_chain     # Greeks → Chain
+t_oi       = t_chain     # OI Analysis → Chain
+t_payoff   = t_chain     # Payoff → Chain
+t_ts       = t_structure # Term Structure → Structure
+t_flow     = t_structure # Flow & Skew → Structure
+t_regime   = t_structure # Regime → Structure
+t_backtest = t_structure # Signal Log (was Backtest) → Structure
+t_math     = t_reference # Maths → Reference
 
 # ══════════════════════════════════════════════════════════════
 # TAB 1 — OVERVIEW
@@ -1339,16 +4858,314 @@ t_ov, t_dir, t_strat, t_chain, t_greeks, t_oi, t_payoff = st.tabs([
 with t_ov:
     st.markdown("### ◼ Options Intelligence Summary")
 
-    k1,k2,k3,k4,k5,k6,k7 = st.columns(7)
-    k1.metric("Spot",      f"₹{spot:,.1f}")
-    k2.metric("ATM",       str(atm_k))
-    k3.metric("DTE",       str(dte))
-    k4.metric("ATM IV",    f"{atm_iv*100:.1f}%")
-    k5.metric("HV(20)",    f"{hv20*100:.1f}%")
-    k6.metric("IV−HV",     f"{iv_vs_hv:+.1f}%")
-    k7.metric("Bias",      bias, delta=f"{bias_score:+d} pts")
+    # ── Probabilistic core outputs ─────────────────────────────────────────
+    _pu  = prob_score["prob_up"]
+    _pd  = prob_score["prob_down"]
+    _em  = prob_score["expected_move"]
+    _emp = prob_score["expected_move_pct"]
+    _rs  = prob_score["raw_score"]
+    _pu_col  = "#00d084" if _pu > 0.55 else ("#ff3b3b" if _pu < 0.45 else "#ffb347")
+    _pd_col  = "#ff3b3b" if _pd > 0.55 else ("#00d084" if _pd < 0.45 else "#ffb347")
+
+    p1, p2, p3, p4, p5, p6, p7 = st.columns(7)
+    p1.metric("Spot",        f"₹{spot:,.1f}")
+    p2.metric("Prob Up ↑",   f"{_pu*100:.1f}%",  delta=f"score {_rs:+.3f}", delta_color="normal")
+    p3.metric("Prob Down ↓", f"{_pd*100:.1f}%")
+    p4.metric("Exp Move",    f"₹{_em:.0f}",       delta=f"±{_emp:.1f}%")
+    p5.metric("ATM IV",      f"{atm_iv*100:.1f}%", delta=f"HV {hv20*100:.1f}%")
+    p6.metric("IV Rank",     f"{ivr:.0f}",          delta=f"Pctile {iv_pct:.0f}")
+    p7.metric("DTE",         str(dte))
+
+    # ── Probability bar ───────────────────────────────────────────────────
+    _bar_up   = int(_pu * 100)
+    _bar_down = 100 - _bar_up
+    st.markdown(f"""
+<div style="font-family:'IBM Plex Mono',monospace;margin:8px 0 4px;">
+  <div style="display:flex;height:22px;border-radius:0;overflow:hidden;border:1px solid #2a2a2a;">
+    <div style="width:{_bar_up}%;background:{_pu_col};display:flex;align-items:center;
+                justify-content:center;font-size:0.74rem;font-weight:700;color:#000;
+                min-width:30px;">↑{_bar_up}%</div>
+    <div style="width:{_bar_down}%;background:{_pd_col};display:flex;align-items:center;
+                justify-content:center;font-size:0.74rem;font-weight:700;color:#000;
+                min-width:30px;">↓{_bar_down}%</div>
+  </div>
+  <div style="display:flex;justify-content:space-between;color:#555;font-size:0.72rem;margin-top:2px;">
+    <span>Probability of upside move by expiry</span>
+    <span>logistic(raw_score={_rs:+.3f})</span>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+    # Events + Liquidity + Regime banner
+    if events_list or liquidity_d or regime_d:
+        ev_cols = st.columns(3)
+        with ev_cols[0]:
+            _reg_color = regime_d.get("color", "#888")
+            _reg_lbl   = regime_d.get("regime", "—")
+            _adx       = regime_d.get("adx", 0)
+            st.markdown(f"""<div style="background:#0d0d0d;border:1px solid #2a2a2a;
+border-left:4px solid {_reg_color};padding:10px 14px;font-family:'IBM Plex Mono',monospace;">
+  <div style="color:#555;font-size:0.76rem;letter-spacing:.08em;">MARKET REGIME</div>
+  <div style="color:{_reg_color};font-size:0.96rem;font-weight:700;">{_reg_lbl}</div>
+  <div style="color:#888;font-size:0.78rem;">ADX {_adx:.1f} · {regime_d.get('trend','—')} · {regime_d.get('vol','—')}</div>
+</div>""", unsafe_allow_html=True)
+        with ev_cols[1]:
+            _liq_col   = liquidity_d.get("color", "#888")
+            _liq_score = liquidity_d.get("liquid_score", 0)
+            _liq_spr   = liquidity_d.get("atm_spread_pct", 0)
+            st.markdown(f"""<div style="background:#0d0d0d;border:1px solid #2a2a2a;
+border-left:4px solid {_liq_col};padding:10px 14px;font-family:'IBM Plex Mono',monospace;">
+  <div style="color:#555;font-size:0.76rem;letter-spacing:.08em;">LIQUIDITY</div>
+  <div style="color:{_liq_col};font-size:0.96rem;font-weight:700;">Score {_liq_score}/100</div>
+  <div style="color:#888;font-size:0.78rem;">ATM spread {_liq_spr:.1f}% · {liquidity_d.get('verdict','—')[:30]}</div>
+</div>""", unsafe_allow_html=True)
+        with ev_cols[2]:
+            _ev_count  = len([e for e in events_list if e.get("days_away", 99) <= 14])
+            _ev_col    = "#ff3b3b" if _ev_count > 0 else "#555"
+            _ev_txt    = events_list[0]["event"] if events_list else "None detected"
+            st.markdown(f"""<div style="background:#0d0d0d;border:1px solid #2a2a2a;
+border-left:4px solid {_ev_col};padding:10px 14px;font-family:'IBM Plex Mono',monospace;">
+  <div style="color:#555;font-size:0.76rem;letter-spacing:.08em;">EVENTS IN WINDOW</div>
+  <div style="color:{_ev_col};font-size:0.96rem;font-weight:700;">{_ev_count} within 14 days</div>
+  <div style="color:#888;font-size:0.78rem;">{_ev_txt[:40]}</div>
+</div>""", unsafe_allow_html=True)
 
     st.divider()
+
+    # ── Adaptive Engine Calibration Status ───────────────────────────────────
+    _calib_now   = _get_calib(sym)
+    _n_params    = len(_calib_now)
+    _sym_store   = st.session_state.get(_CALIB_STORE_KEY, {})
+    _n_symbols   = len([k for k in _sym_store if not k.startswith("_")])
+    _total_obs   = sum(len(v) for k, v in st.session_state.items()
+                       if k.startswith(f"{sym.upper()}:_calib_") and isinstance(v, list))
+    _real_ret_h  = _get_hist("_calib_realised_ret_hist", sym)
+    _n_real      = len(_real_ret_h)
+    _pending_n   = len(st.session_state.get(f"_outcome_pending_{sym.upper()}", []))
+    _fw_live     = prob_score.get("factor_weights", CFG["factor_weights"])
+    _mc_blend_live = round(_calib("mc_blend") * 100)
+    _sharp_live    = round(_calib("logistic_sharpness"), 2)
+    _calib_color   = "#00d084" if _n_real >= _CALIB_MIN_OBS else ("#ffb347" if _n_params >= 1 else "#555")
+    _calib_status  = (f"LIVE — {_n_real} real outcomes · {_pending_n} pending"
+                      if _n_real >= _CALIB_MIN_OBS
+                      else f"WARMING UP — {_n_real}/{_CALIB_MIN_OBS} real outcomes needed")
+
+    with st.expander("⚙ Adaptive Engine — Live Calibration State", expanded=False):
+        cc1, cc2, cc3, cc4 = st.columns(4)
+        cc1.metric("Real Outcomes",     str(_n_real),        help="Resolved signal→return pairs from actual market moves")
+        cc2.metric("Pending Snapshots", str(_pending_n),     help="Signals recorded, awaiting horizon to elapse")
+        cc3.metric("MC Blend Weight",   f"{_mc_blend_live}%",help="MC direction weight in final prob blend (learned)")
+        cc4.metric("Logistic Sharpness",str(_sharp_live),    help="Calibrated raw_score scaling for prob_up (learned)")
+
+        st.markdown(
+            f"""<div style="font-family:'IBM Plex Mono',monospace;font-size:0.78rem;
+color:#555;padding:6px 0 2px;">
+<span style="color:#888;">SYMBOL:</span> <span style="color:#ff8c00;font-weight:700;">{sym}</span>
+&nbsp;·&nbsp;
+<span style="color:#888;">STATUS:</span> <span style="color:{_calib_color};font-weight:700;">{_calib_status}</span>
+&nbsp;·&nbsp;
+<span style="color:#555;">{_n_symbols} symbol(s) in calibration store · disk: {_CALIB_FILE}</span>
+</div>""", unsafe_allow_html=True)
+
+        # Calibration quality bar — fraction of parameters with real data vs priors
+        _pct_calibrated = min(100, int(_n_real / max(_CALIB_MIN_OBS, 1) * 100))
+        _bar_col = "#00d084" if _pct_calibrated >= 100 else ("#ffb347" if _pct_calibrated >= 50 else "#ff3b3b")
+        st.markdown(f"""
+<div style="font-family:'IBM Plex Mono',monospace;margin:6px 0 4px;">
+  <div style="display:flex;height:16px;border:1px solid #2a2a2a;overflow:hidden;">
+    <div style="width:{_pct_calibrated}%;background:{_bar_col};"></div>
+    <div style="width:{100-_pct_calibrated}%;background:#1a1a1a;"></div>
+  </div>
+  <div style="color:#555;font-size:0.72rem;margin-top:2px;">
+    Learning progress: {_pct_calibrated}% · {_n_real} real outcomes / {_CALIB_MIN_OBS} needed per parameter
+  </div>
+</div>""", unsafe_allow_html=True)
+
+        # Live factor weights table
+        _fw_rows = "".join(
+            f"<tr><td style='color:#ff8c00;padding:3px 10px;'>{k.upper()}</td>"
+            f"<td style='color:#e8e8e8;padding:3px 10px;text-align:right;'>"
+            f"{v*100:.1f}%</td>"
+            f"<td style='color:#555;padding:3px 10px;font-size:0.74rem;'>"
+            f"prior={CFG['factor_weights'].get(k,0)*100:.0f}%</td></tr>"
+            for k, v in sorted(_fw_live.items(), key=lambda x: -x[1])
+        )
+        st.markdown(f"""
+<table style="font-family:'IBM Plex Mono',monospace;font-size:0.82rem;border-collapse:collapse;
+width:100%;background:#0d0d0d;border:1px solid #2a2a2a;margin-top:6px;">
+  <thead><tr>
+    <th style="color:#ff8c00;padding:4px 10px;text-align:left;border-bottom:1px solid #2a2a2a;">FACTOR</th>
+    <th style="color:#ff8c00;padding:4px 10px;text-align:right;border-bottom:1px solid #2a2a2a;">LIVE WEIGHT</th>
+    <th style="color:#555;padding:4px 10px;text-align:left;border-bottom:1px solid #2a2a2a;">COLD-START PRIOR</th>
+  </tr></thead>
+  <tbody>{_fw_rows}</tbody>
+</table>""", unsafe_allow_html=True)
+
+        # Sub-model parameters
+        _sub_w = {
+            "EMA vs ADX (trend)":         f"{_calib('trend_ema_vs_adx')*100:.1f}% EMA",
+            "ADX vs RSI (trend residual)": f"{_calib('adx_vs_rsi_within_trend')*100:.1f}% ADX",
+            "Positioning: PCR:OI:MP":      " : ".join(f"{w*100:.0f}%" for w in _calib_vec("positioning_pcr_vs_oi_vs_mp")),
+            "RS: level vs slope":          f"{_calib('rs_level_vs_slope')*100:.1f}% level",
+            "Vol-regime damp":             f"{_calib('vol_regime_damp'):.3f}",
+            "Safety sigmoid sharpness":    f"{_calib('safety_sigmoid_sharpness'):.3f}",
+            "EV vs dir_align":             f"{_calib('ev_score_vs_dir_align')*100:.1f}% EV",
+            "ADX weak-trend fraction":     f"{_calib('adx_weak_frac'):.3f}",
+            "Term-structure tanh scale":   f"{_calib('ts_tanh_scale'):.1f}",
+            "EV tanh scale":               f"{_calib('ev_tanh_scale'):.3f}",
+            "HV accel stretch":            f"{_calib('hv_accel_stretch'):.3f}",
+            "Max-pain gravity":            f"{_calib('mp_gravity'):.3f}",
+            "Liq: spread:OI:vol":          " : ".join([
+                f"{_calib('liq_spread_w')*100:.0f}%",
+                f"{_calib('liq_oi_w')*100:.0f}%",
+                f"{_calib('liq_vol_w')*100:.0f}%",
+            ]),
+        }
+        _sw_rows = "".join(
+            f"<tr><td style='color:#888;padding:2px 10px;'>{k}</td>"
+            f"<td style='color:#e8e8e8;padding:2px 10px;text-align:right;'>{v}</td></tr>"
+            for k, v in _sub_w.items()
+        )
+        st.markdown(f"""
+<table style="font-family:'IBM Plex Mono',monospace;font-size:0.79rem;border-collapse:collapse;
+width:100%;background:#0d0d0d;border:1px solid #2a2a2a;margin-top:8px;">
+  <thead><tr>
+    <th style="color:#ff8c00;padding:4px 10px;text-align:left;border-bottom:1px solid #2a2a2a;">SUB-MODEL PARAMETER</th>
+    <th style="color:#ff8c00;padding:4px 10px;text-align:right;border-bottom:1px solid #2a2a2a;">CALIBRATED VALUE</th>
+  </tr></thead>
+  <tbody>{_sw_rows}</tbody>
+</table>""", unsafe_allow_html=True)
+
+        # Regime pillar confidence
+        st.caption(
+            f"Regime pillars: IV {_calib('regime_conf_iv'):.2f} · "
+            f"ADX {_calib('regime_conf_adx'):.2f} · "
+            f"HV-accel {_calib('regime_conf_hv'):.2f} · "
+            f"GEX {_calib('regime_conf_gex'):.2f} · "
+            f"Confidence: {regime_d.get('regime_confidence', 0):.2f}"
+        )
+
+        # Real outcome performance summary
+        if _n_real >= 5:
+            _ret_arr = np.array(_real_ret_h, dtype=float)
+            _win_r   = float((_ret_arr > 0).mean() * 100)
+            _avg_ret = float(_ret_arr.mean() * 100)
+            _sharpe  = float(_ret_arr.mean() / (_ret_arr.std() + 1e-9) * np.sqrt(252 / 4))
+            st.markdown(f"""
+<div style="background:#0d0d0d;border:1px solid #2a2a2a;padding:10px 14px;
+font-family:'IBM Plex Mono',monospace;font-size:0.80rem;margin-top:8px;">
+  <div style="color:#ff8c00;font-weight:700;margin-bottom:6px;">REAL OUTCOME SUMMARY — {sym}</div>
+  <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;">
+    <div><div style="color:#555;font-size:0.72rem;">WIN RATE</div>
+         <div style="color:{'#00d084' if _win_r>50 else '#ff3b3b'};font-weight:700;">{_win_r:.1f}%</div></div>
+    <div><div style="color:#555;font-size:0.72rem;">AVG 4-DAY RETURN</div>
+         <div style="color:{'#00d084' if _avg_ret>0 else '#ff3b3b'};font-weight:700;">{_avg_ret:+.2f}%</div></div>
+    <div><div style="color:#555;font-size:0.72rem;">ANNUALISED SHARPE</div>
+         <div style="color:{'#00d084' if _sharpe>0.5 else '#ffb347'};font-weight:700;">{_sharpe:.2f}</div></div>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+    # ── Intraday Signal Panel ─────────────────────────────────────────────────
+    _intra = st.session_state.get("opt_intraday_signals", {})
+    if _intra.get("intraday_available"):
+        _i_score  = float(_intra.get("intraday_score", 0.0))
+        _i_vwap   = float(_intra.get("vwap", spot))
+        _i_shi    = float(_intra.get("session_high", spot))
+        _i_slo    = float(_intra.get("session_low", spot))
+        _i_candles= int(_intra.get("candles_so_far", 0))
+        _i_range  = float(_intra.get("intraday_range_pct", 0.0))
+        _i_vol_acc= float(_intra.get("volume_acceleration", 0.0))
+        _i_oi_dir = float(_intra.get("oi_build_direction", 0.0))
+        _i_open_m = float(_intra.get("opening_momentum", 0.0))
+        _i_vwap_p = float(_intra.get("vwap_position", 0.0))
+        _i_lunch  = float(_intra.get("lunch_reversal", 0.0))
+        _i_blend  = round(_calib("intra_blend_weight") * 100)
+
+        # ── Adaptive display thresholds — derived from rolling signal histories ──
+        # "Meaningful" signal = above the 70th percentile of its own history.
+        # This makes the colour coding adaptive to each instrument's intraday vol.
+        def _adaptive_col(val: float, hist_key: str,
+                           bull_col="#00d084", bear_col="#ff3b3b", neutral_col="#888") -> str:
+            hist = _get_hist(hist_key, sym)
+            if len(hist) >= 5:
+                p70 = float(np.percentile(np.abs(hist), 70))
+            else:
+                # Cold-start: treat any non-trivial signal (>10% of range) as meaningful
+                p70 = 0.10
+            return bull_col if val > p70 else (bear_col if val < -p70 else neutral_col)
+
+        _score_col = _adaptive_col(_i_score,   "_calib_intraday_score_hist")
+        _vwap_col  = "#00d084" if spot > _i_vwap else "#ff3b3b"
+        _vol_col   = _adaptive_col(_i_vol_acc, "_calib_intra_volume_acceleration_hist")
+        _oi_col    = _adaptive_col(_i_oi_dir,  "_calib_intra_oi_build_hist")
+
+        # Minimum signal magnitude to show as "active" (50th pctile of abs signal history)
+        def _min_active(hist_key: str) -> float:
+            hist = _get_hist(hist_key, sym)
+            return float(np.percentile(np.abs(hist), 50)) if len(hist) >= 5 else 0.01
+
+        def _bar(val: float, hist_key: str, width: int = 80) -> str:
+            """Render a mini horizontal bar. Colour is adaptive to signal history."""
+            pct = int((val + 1) / 2 * 100)
+            col = _adaptive_col(val, hist_key)
+            return (f'<div style="width:{width}px;height:8px;background:#1a1a1a;border-radius:2px;display:inline-block;vertical-align:middle;">'
+                    f'<div style="width:{pct}%;height:100%;background:{col};border-radius:2px;"></div></div>')
+
+        with st.expander(f"📊 Intraday Live Signals — {sym}  [{_i_candles} × 5-min candles]  "
+                         f"Score: {_i_score:+.2f}", expanded=True):
+            ic1, ic2, ic3, ic4 = st.columns(4)
+            ic1.metric("Intraday Score",   f"{_i_score:+.3f}",   help=f"Blended into final prob at {_i_blend}% weight")
+            ic2.metric("VWAP",             f"₹{_i_vwap:,.1f}",   delta=f"{'above' if spot > _i_vwap else 'below'} ₹{abs(spot - _i_vwap):.1f}", delta_color="normal")
+            ic3.metric("Session Range",    f"{_i_range:.2f}%",   help=f"High ₹{_i_shi:,.1f} · Low ₹{_i_slo:,.1f}")
+            ic4.metric("Vol Acceleration", f"{_i_vol_acc:+.2f}", help=f"Last {CFG['intra_recent_candles']} candles vs session avg. +ve = surge")
+
+            _ps_val = float(_intra.get("price_structure", 0.0))
+            st.markdown(f"""
+<div style="background:#0d0d0d;border:1px solid #2a2a2a;padding:12px 16px;
+font-family:'IBM Plex Mono',monospace;font-size:0.80rem;margin-top:8px;">
+  <div style="color:#ff8c00;font-weight:700;margin-bottom:10px;font-size:0.84rem;">
+    INTRADAY SIGNAL BREAKDOWN  ·  blend weight {_i_blend}%  ·  {_i_candles} candles
+  </div>
+  <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;">
+    <div>
+      <div style="color:#555;font-size:0.72rem;margin-bottom:3px;">OPENING MOMENTUM</div>
+      <div style="color:{_adaptive_col(_i_open_m, "_calib_intra_opening_momentum_hist")};font-weight:700;">{_i_open_m:+.3f}</div>
+      {_bar(_i_open_m, "_calib_intra_opening_momentum_hist")}
+      <div style="color:#444;font-size:0.68rem;margin-top:2px;">First {CFG["intra_opening_candles"]} candles thrust</div>
+    </div>
+    <div>
+      <div style="color:#555;font-size:0.72rem;margin-bottom:3px;">VWAP POSITION</div>
+      <div style="color:{_vwap_col};font-weight:700;">{_i_vwap_p:+.3f}</div>
+      {_bar(_i_vwap_p, "_calib_intra_vwap_position_hist")}
+      <div style="color:#444;font-size:0.68rem;margin-top:2px;">Spot vs VWAP · {'ABOVE' if _i_vwap_p>0 else 'BELOW'}</div>
+    </div>
+    <div>
+      <div style="color:#555;font-size:0.72rem;margin-bottom:3px;">VOLUME ACCELERATION</div>
+      <div style="color:{_vol_col};font-weight:700;">{_i_vol_acc:+.3f}</div>
+      {_bar(_i_vol_acc, "_calib_intra_volume_acceleration_hist")}
+      <div style="color:#444;font-size:0.68rem;margin-top:2px;">Last {CFG["intra_recent_candles"]} candles vs avg</div>
+    </div>
+    <div>
+      <div style="color:#555;font-size:0.72rem;margin-bottom:3px;">OI BUILD DIRECTION</div>
+      <div style="color:{_oi_col};font-weight:700;">{_i_oi_dir:+.3f}</div>
+      {_bar(_i_oi_dir, "_calib_intra_oi_build_hist")}
+      <div style="color:#444;font-size:0.68rem;margin-top:2px;">PE OI change − CE OI change</div>
+    </div>
+    <div>
+      <div style="color:#555;font-size:0.72rem;margin-bottom:3px;">PRICE STRUCTURE</div>
+      <div style="color:{_adaptive_col(_ps_val, "_calib_intra_price_structure_hist")};font-weight:700;">{_ps_val:+.3f}</div>
+      {_bar(_ps_val, "_calib_intra_price_structure_hist")}
+      <div style="color:#444;font-size:0.68rem;margin-top:2px;">HH/LL ({CFG["intra_structure_candles"]} candles)</div>
+    </div>
+    <div>
+      <div style="color:#555;font-size:0.72rem;margin-bottom:3px;">LUNCH REVERSAL</div>
+      <div style="color:{_adaptive_col(_i_lunch, "_calib_intra_lunch_reversal_hist", bull_col="#ff8c00", bear_col="#ff8c00")};font-weight:700;">{_i_lunch:+.3f}</div>
+      {_bar(_i_lunch, "_calib_intra_lunch_reversal_hist")}
+      <div style="color:#444;font-size:0.68rem;margin-top:2px;">Post-candle-{CFG["intra_lunch_candle_start"]} shift</div>
+    </div>
+  </div>
+</div>""", unsafe_allow_html=True)
+    else:
+        st.caption("📊 Intraday signals: not available (pre-market, after-hours, or Upstox API unavailable)")
 
     ov1, ov2 = st.columns(2)
     with ov1:
@@ -1356,15 +5173,15 @@ with t_ov:
         st.markdown(f"""
 <div style="background:#0d0d0d;border:1px solid {v_col};padding:12px 16px;
 font-family:'IBM Plex Mono',monospace;height:100%;">
-  <div style="color:{v_col};font-size:.7rem;font-weight:700;letter-spacing:.1em;margin-bottom:6px;">
+  <div style="color:{v_col};font-size:0.9rem;font-weight:700;letter-spacing:.1em;margin-bottom:6px;">
     VOL REGIME: {v_lbl}
   </div>
-  <div style="color:#e8e8e8;font-size:.68rem;line-height:1.7;">{v_act}</div>
-  <div style="margin-top:8px;color:#555;font-size:.6rem;">
+  <div style="color:#e8e8e8;font-size:0.87rem;line-height:1.7;">{v_act}</div>
+  <div style="margin-top:8px;color:#555;font-size:0.77rem;">
     ATM Straddle: ₹{oi_d.get('atm_straddle',0):.1f} &nbsp;·&nbsp;
     Exp Move ±1σ: ±{oi_d.get('exp_move_pct',0):.1f}% &nbsp;·&nbsp;
     ±2σ: ±{oi_d.get('exp_move_2sd_pct', oi_d.get('exp_move_pct',0)*2):.1f}% &nbsp;·&nbsp;
-    IV Rank: {ivr:.0f}
+    IV Rank: {ivr:.0f} &nbsp;·&nbsp; IV Pctile: {iv_pct:.0f}
   </div>
 </div>""", unsafe_allow_html=True)
 
@@ -1382,23 +5199,23 @@ font-family:'IBM Plex Mono',monospace;height:100%;">
             st.markdown(f"""
 <div style="background:#0d0d0d;border:1px solid #2a2a2a;padding:12px 16px;
 font-family:'IBM Plex Mono',monospace;">
-  <div style="color:#ff8c00;font-size:.65rem;font-weight:700;letter-spacing:.1em;margin-bottom:8px;">OI SNAPSHOT</div>
+  <div style="color:#ff8c00;font-size:0.83rem;font-weight:700;letter-spacing:.1em;margin-bottom:8px;">OI SNAPSHOT</div>
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
-    <div><div style="color:#555;font-size:.58rem;">MAX PAIN</div>
-         <div style="color:#ff8c00;font-size:.9rem;font-weight:700;">₹{oi_d.get('max_pain',0):,.0f}</div></div>
-    <div><div style="color:#555;font-size:.58rem;">PCR (OI)</div>
-         <div style="color:{pcr_c};font-size:.9rem;font-weight:700;">{oi_d.get('pcr_oi',0):.3f}</div></div>
-    <div><div style="color:#555;font-size:.58rem;">CALL WALL</div>
-         <div style="color:#ff3b3b;font-size:.82rem;font-weight:600;">₹{oi_d.get('call_wall',0):,.0f}</div></div>
-    <div><div style="color:#555;font-size:.58rem;">PUT WALL</div>
-         <div style="color:#00d084;font-size:.82rem;font-weight:600;">₹{oi_d.get('put_wall',0):,.0f}</div></div>
-    <div><div style="color:#555;font-size:.58rem;">GEX REGIME</div>
-         <div style="color:{_gex_c};font-size:.78rem;font-weight:600;">{_gex_lbl} ({_gex_net:+,.0f})</div></div>
-    <div><div style="color:#555;font-size:.58rem;">IV SKEW (±1 strike)</div>
-         <div style="color:{_skew_c};font-size:.78rem;font-weight:600;">{_skew_str}</div></div>
+    <div><div style="color:#555;font-size:0.74rem;">MAX PAIN</div>
+         <div style="color:#ff8c00;font-size:1.0rem;font-weight:700;">₹{oi_d.get('max_pain',0):,.0f}</div></div>
+    <div><div style="color:#555;font-size:0.74rem;">PCR (OI)</div>
+         <div style="color:{pcr_c};font-size:1.0rem;font-weight:700;">{oi_d.get('pcr_oi',0):.3f}</div></div>
+    <div><div style="color:#555;font-size:0.74rem;">CALL WALL</div>
+         <div style="color:#ff3b3b;font-size:1.0rem;font-weight:600;">₹{oi_d.get('call_wall',0):,.0f}</div></div>
+    <div><div style="color:#555;font-size:0.74rem;">PUT WALL</div>
+         <div style="color:#00d084;font-size:1.0rem;font-weight:600;">₹{oi_d.get('put_wall',0):,.0f}</div></div>
+    <div><div style="color:#555;font-size:0.74rem;">GEX REGIME</div>
+         <div style="color:{_gex_c};font-size:1.0rem;font-weight:600;">{_gex_lbl} ({_gex_net:+,.0f})</div></div>
+    <div><div style="color:#555;font-size:0.74rem;">IV SKEW (±1 strike)</div>
+         <div style="color:{_skew_c};font-size:1.0rem;font-weight:600;">{_skew_str}</div></div>
   </div>
-  <div style="margin-top:8px;color:{pcr_c};font-size:.62rem;">{oi_d.get('pcr_signal','—')}</div>
-  <div style="margin-top:4px;color:#555;font-size:.58rem;">Gamma Flip: ₹{oi_d.get('gamma_flip',spot):,.0f}</div>
+  <div style="margin-top:8px;color:{pcr_c};font-size:0.79rem;">{oi_d.get('pcr_signal','—')}</div>
+  <div style="margin-top:4px;color:#555;font-size:0.74rem;">Gamma Flip: ₹{oi_d.get('gamma_flip',spot):,.0f}</div>
 </div>""", unsafe_allow_html=True)
 
     # Best strategy card
@@ -1408,15 +5225,15 @@ font-family:'IBM Plex Mono',monospace;">
         st.markdown(f"""
 <div style="background:#0d1a00;border:1px solid #ff8c00;border-top:3px solid #ff8c00;
 padding:14px 18px;font-family:'IBM Plex Mono',monospace;">
-  <div style="color:#ff8c00;font-size:.6rem;letter-spacing:.12em;font-weight:700;">⭐ TOP RECOMMENDED STRATEGY</div>
-  <div style="color:#e8e8e8;font-size:.95rem;font-weight:700;margin:8px 0 4px;">{best['Strategy']}</div>
-  <div style="color:#7ec8e3;font-size:.72rem;margin-bottom:6px;">LEGS: {best['Legs']}</div>
-  <div style="color:#aaa;font-size:.64rem;line-height:1.6;">{best['Rationale']}</div>
+  <div style="color:#ff8c00;font-size:0.77rem;letter-spacing:.12em;font-weight:700;">⭐ TOP RECOMMENDED STRATEGY</div>
+  <div style="color:#e8e8e8;font-size:1.0rem;font-weight:700;margin:8px 0 4px;">{best['Strategy']}</div>
+  <div style="color:#7ec8e3;font-size:0.92rem;margin-bottom:6px;">LEGS: {best['Legs']}</div>
+  <div style="color:#aaa;font-size:0.82rem;line-height:1.6;">{best['Rationale']}</div>
   <div style="display:flex;gap:24px;margin-top:10px;flex-wrap:wrap;">
-    <span style="color:#ff3b3b;font-size:.62rem;">⬇ Risk: {best['Max Risk']}</span>
-    <span style="color:#00d084;font-size:.62rem;">⬆ Reward: {best['Max Reward']}</span>
-    <span style="color:#888;font-size:.62rem;">TYPE: {best['Type']}</span>
-    <span style="color:#666;font-size:.62rem;">DTE: {best['Ideal DTE']}</span>
+    <span style="color:#ff3b3b;font-size:0.79rem;">⬇ Risk: {best['Max Risk']}</span>
+    <span style="color:#00d084;font-size:0.79rem;">⬆ Reward: {best['Max Reward']}</span>
+    <span style="color:#888;font-size:0.79rem;">TYPE: {best['Type']}</span>
+    <span style="color:#666;font-size:0.79rem;">DTE: {best['Ideal DTE']}</span>
   </div>
 </div>""", unsafe_allow_html=True)
 
@@ -1426,14 +5243,84 @@ padding:14px 18px;font-family:'IBM Plex Mono',monospace;">
 with t_dir:
     st.markdown("### 🧭 Directional Signal Stack")
 
-    s_norm  = max(-80, min(80, bias_score))
-    gauge_w = int((s_norm + 80) / 160 * 100)
-    gc_     = "#00d084" if bias_score>0 else "#ff3b3b" if bias_score<0 else "#ffb347"
+    # ── Probabilistic summary ─────────────────────────────────────────────
+    _pu_d  = prob_score["prob_up"]
+    _pd_d  = prob_score["prob_down"]
+    _rs_d  = prob_score["raw_score"]
+    _pu_dc = "#00d084" if _pu_d > 0.55 else ("#ff3b3b" if _pu_d < 0.45 else "#ffb347")
+    _pd_dc = "#ff3b3b" if _pd_d > 0.55 else ("#00d084" if _pd_d < 0.45 else "#ffb347")
+
+    pc1, pc2, pc3, pc4 = st.columns(4)
+    pc1.metric("P(↑) Prob Up",   f"{_pu_d*100:.2f}%", help="logistic(raw_score × 3)")
+    pc2.metric("P(↓) Prob Down", f"{_pd_d*100:.2f}%")
+    pc3.metric("Raw Score",      f"{_rs_d:+.4f}", help="Weighted z-score sum ∈ [-1,+1]")
+    pc4.metric("Expected Move",  f"₹{prob_score['expected_move']:.0f}  ±{prob_score['expected_move_pct']:.1f}%")
+
+    # Probability bar
+    _bar_u = int(_pu_d * 100)
+    st.markdown(f"""
+<div style="font-family:'IBM Plex Mono',monospace;margin:6px 0 10px;">
+  <div style="display:flex;height:20px;border:1px solid #2a2a2a;overflow:hidden;">
+    <div style="width:{_bar_u}%;background:{_pu_dc};display:flex;align-items:center;
+                justify-content:center;font-size:0.72rem;font-weight:700;color:#000;min-width:28px;">
+                ↑{_bar_u}%</div>
+    <div style="width:{100-_bar_u}%;background:{_pd_dc};display:flex;align-items:center;
+                justify-content:center;font-size:0.72rem;font-weight:700;color:#000;min-width:28px;">
+                ↓{100-_bar_u}%</div>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+    # Feature scores table — leading indicators first
+    _fs = prob_score.get("feature_scores", {})
+    if _fs:
+        _fs_rows = [
+            # ── LEADING ──────────────────────────────────────────────────
+            {"Factor": "① FLOW — ΔPCR",        "Score": _fs.get("dPCR", 0),           "Weight": "30%↑", "Type": "LEADING"},
+            {"Factor": "① FLOW — ΔSkew",        "Score": _fs.get("dSkew", 0),          "Weight": "30%↑", "Type": "LEADING"},
+            {"Factor": "① FLOW — ΔIV",          "Score": _fs.get("dIV", 0),            "Weight": "30%↑", "Type": "LEADING"},
+            {"Factor": "① FLOW — ΔOI",          "Score": _fs.get("dOI", 0),            "Weight": "30%↑", "Type": "LEADING"},
+            {"Factor": "① FLOW — ΔGEX",         "Score": _fs.get("dGEX", 0),           "Weight": "30%↑", "Type": "LEADING"},
+            {"Factor": "② POSITIONING — PCR Lvl","Score": _fs.get("pcr_level_z", 0),   "Weight": "25%↑", "Type": "LEADING"},
+            {"Factor": "② POSITIONING — OI Skew","Score": _fs.get("oi_skew_z", 0),    "Weight": "25%↑", "Type": "LEADING"},
+            {"Factor": "② POSITIONING — Max Pain","Score": _fs.get("mp_z", 0),         "Weight": "25%↑", "Type": "LEADING"},
+            {"Factor": "③ VOL REGIME — IV/HV",  "Score": _fs.get("vol_regime_z", 0),  "Weight": "20%↑", "Type": "CONCURRENT"},
+            {"Factor": "③ VOL REGIME — TS Slope","Score": _fs.get("term_slope_z", 0), "Weight": "20%↑", "Type": "CONCURRENT"},
+            # ── CONFIRMING ───────────────────────────────────────────────
+            {"Factor": "④ REL STRENGTH",        "Score": _fs.get("rs_score", 0),       "Weight": "15%↓", "Type": "CONFIRMING"},
+            {"Factor": "⑤ TREND (EMA+ADX+RSI)", "Score": _fs.get("trend_z", 0),       "Weight": "10%↓", "Type": "CONFIRMING"},
+        ]
+        _fdf = pd.DataFrame(_fs_rows)
+        _fdf["Signal"] = _fdf["Score"].apply(
+            lambda v: "🟢 BULL" if v > 0.05 else ("🔴 BEAR" if v < -0.05 else "⚪ NEUT"))
+        def _zscore_style(v):
+            if isinstance(v, float):
+                if v > 0.05: return "color:#00d084;font-weight:700"
+                if v < -0.05: return "color:#ff3b3b;font-weight:700"
+            return "color:#888"
+        st.dataframe(_fdf.style.applymap(_zscore_style, subset=["Score"]),
+                     use_container_width=True, hide_index=True)
+
+        # Flow conviction bar
+        _fm = prob_score.get("flow_magnitude", 0)
+        _fc_col = "#00d084" if _fs.get("flow_score", 0) > 0 else "#ff3b3b"
+        st.markdown(
+            f"<div style='font-family:IBM Plex Mono,monospace;font-size:0.78rem;color:#555;"
+            f"padding:4px 0;'>FLOW CONVICTION: "
+            f"<span style='color:{_fc_col};font-weight:700;'>{_fm*100:.0f}%</span>"
+            f" &nbsp;·&nbsp; Composite flow score: "
+            f"<span style='color:{_fc_col};'>{_fs.get('flow_score',0):+.3f}</span></div>",
+            unsafe_allow_html=True)
+
+    st.divider()
+
+    s_norm  = max(-100, min(100, bias_score))
+    gauge_w = int((s_norm + 100) / 200 * 100)
+    gc_     = "#00d084" if bias_score > 0 else "#ff3b3b" if bias_score < 0 else "#ffb347"
 
     st.markdown(f"""
 <div style="background:#0d0d0d;border:1px solid #2a2a2a;padding:10px 16px;
 font-family:'IBM Plex Mono',monospace;margin-bottom:10px;">
-  <div style="color:#555;font-size:.58rem;letter-spacing:.1em;margin-bottom:4px;">
+  <div style="color:#555;font-size:0.74rem;letter-spacing:.1em;margin-bottom:4px;">
     BEARISH ◄──────────────────── 0 ────────────────────► BULLISH
   </div>
   <div style="background:#1a1a1a;height:14px;position:relative;overflow:hidden;">
@@ -1482,7 +5369,7 @@ font-family:'IBM Plex Mono',monospace;margin-bottom:10px;">
     impl_c = bc
     st.markdown(f"""
 <div style="border-left:3px solid {impl_c};padding:8px 12px;
-font-family:'IBM Plex Mono',monospace;font-size:.7rem;color:{impl_c};margin-top:8px;">
+font-family:'IBM Plex Mono',monospace;font-size:0.9rem;color:{impl_c};margin-top:8px;">
   OPTIONS IMPLICATION: {impl}
 </div>""", unsafe_allow_html=True)
 
@@ -1523,65 +5410,199 @@ font-family:'IBM Plex Mono',monospace;font-size:.7rem;color:{impl_c};margin-top:
 # TAB 3 — STRATEGIES
 # ══════════════════════════════════════════════════════════════
 with t_strat:
-    st.markdown("### 🎯 Strategy Recommendations")
+    st.markdown("### 🎯 Strategy Recommendations — EV-Ranked")
+
+    # ── Capital shortcut — editable inline if not set in sidebar ─────────────
+    _capital = st.session_state.opt_capital
+    _kelly_frac = CFG["kelly_fraction"]
+    _kelly_cap  = CFG["kelly_cap_pct"]
+
+    # ── Probabilistic summary bar ─────────────────────────────────────────
+    _pu_s  = prob_score["prob_up"]
+    _pd_s  = prob_score["prob_down"]
+    _em_s  = prob_score["expected_move"]
+    _rs_s  = prob_score["raw_score"]
+    _pu_c  = "#00d084" if _pu_s > 0.55 else ("#ff3b3b" if _pu_s < 0.45 else "#ffb347")
+
+    # IVR bootstrap label — tells user if IVR is real or estimated
+    _ivr_sessions = len(st.session_state.opt_iv_history.get(sym, []))
+    _ivr_label = f"IVR {ivr:.0f}" if _ivr_sessions >= 3 else f"IVR ~{ivr:.0f} (est. {_ivr_sessions} sess)"
+    _ivr_warn  = " ⚠" if _ivr_sessions < 3 else ""
+
     st.markdown(f"""
 <div style="background:#0a0a0a;border:1px solid #2a2a2a;padding:7px 14px;
-font-family:'IBM Plex Mono',monospace;font-size:.65rem;color:#666;margin-bottom:10px;">
-  Bias: <span style="color:{bc};">{bias}</span> &nbsp;·&nbsp;
-  Vol: <span style="color:{v_col};">{v_lbl}</span> &nbsp;·&nbsp;
-  IV Rank: {ivr:.0f} &nbsp;·&nbsp;
-  DTE: {dte} &nbsp;·&nbsp;
-  ATM: {atm_k} &nbsp;·&nbsp;
-  Step: {step}
+font-family:'IBM Plex Mono',monospace;font-size:0.83rem;margin-bottom:4px;">
+  <span style="color:{_pu_c};font-weight:700;">P(↑) {_pu_s*100:.1f}%</span>
+  &nbsp;·&nbsp;
+  <span style="color:#ff3b3b;font-weight:700;">P(↓) {_pd_s*100:.1f}%</span>
+  &nbsp;·&nbsp; EM ₹{_em_s:.0f} &nbsp;·&nbsp; Score {_rs_s:+.3f}
+  &nbsp;·&nbsp; {_ivr_label}{_ivr_warn}
+  &nbsp;·&nbsp; DTE {dte} &nbsp;·&nbsp; Capital ₹{_capital:,.0f}
 </div>""", unsafe_allow_html=True)
 
-    for i, s in enumerate(strat_recs[:8]):
-        rank_c  = "#ff8c00" if i==0 else "#444"
-        score_c = "#00d084" if s["Score"]>=90 else "#ffb347" if s["Score"]>=75 else "#666"
-        top_border = "border-top:3px solid #ff8c00;" if i==0 else ""
+    # ── Flow Alert Banner — fires only when flow magnitude exceeds adaptive threshold ──
+    _flow_mag_now   = prob_score.get("flow_magnitude", 0.0)
+    _flow_threshold = st.session_state.get("opt_flow_conv_threshold", CFG["flow_conviction_seed"])
+    _fs_now         = prob_score.get("feature_scores", {})
+    _flow_dir       = prob_score["feature_scores"].get("flow_score", 0)
+
+    if _flow_mag_now >= _flow_threshold and _flow_threshold > 0:
+        _fb_col  = "#00d084" if _flow_dir > 0 else "#ff3b3b"
+        _fb_dir  = "BULLISH" if _flow_dir > 0 else "BEARISH"
+        _dpcr_v  = _fs_now.get("dPCR",  0); _dpcr_s = f"{'+' if _dpcr_v>=0 else ''}{_dpcr_v:.3f}"
+        _dsk_v   = _fs_now.get("dSkew", 0); _dsk_s  = f"{'+' if _dsk_v>=0 else ''}{_dsk_v:.3f}"
+        _div_v   = _fs_now.get("dIV",   0); _div_s  = f"{'+' if _div_v>=0 else ''}{_div_v:.3f}"
+        _conv_pct = round(_flow_mag_now / (_flow_threshold + 1e-9) * 100 - 100, 0)
         st.markdown(f"""
+<div style="background:#0a0e0a;border:1px solid {_fb_col};border-left:5px solid {_fb_col};
+padding:8px 14px;margin-bottom:8px;font-family:'IBM Plex Mono',monospace;">
+  <span style="color:{_fb_col};font-weight:700;font-size:0.86rem;">
+    ⚡ HIGH-CONVICTION FLOW SIGNAL — {_fb_dir}
+  </span>
+  &nbsp;&nbsp;
+  <span style="color:#888;font-size:0.80rem;">
+    ΔPCR {_dpcr_s} &nbsp;·&nbsp; ΔSkew {_dsk_s} &nbsp;·&nbsp; ΔIV {_div_s}
+    &nbsp;·&nbsp; Conviction {_flow_mag_now:.3f} ({_conv_pct:+.0f}% above threshold)
+  </span>
+</div>""", unsafe_allow_html=True)
+
+    if strat_recs:
+        # ── Feature score breakdown ──────────────────────────────────────
+        with st.expander("◼ FEATURE SCORES (inputs to P(↑)/P(↓))"):
+            fs = prob_score.get("feature_scores", {})
+            _fc = st.columns(4)
+            def _fscore_bar(label, val, col_idx, weight_label=""):
+                color = "#00d084" if val > 0.05 else ("#ff3b3b" if val < -0.05 else "#888")
+                dir_  = "▶" if val >= 0 else "◀"
+                wt_c  = "#ff8c00" if "LEADING" in weight_label else "#555"
+                _fc[col_idx % 4].markdown(
+                    f"<div style='font-family:IBM Plex Mono,monospace;font-size:0.76rem;"
+                    f"padding:3px 0;border-bottom:1px solid #1a1a1a;'>"
+                    f"<span style='color:{wt_c};font-size:0.68rem;'>{weight_label}</span><br/>"
+                    f"<span style='color:#555;'>{label}</span><br/>"
+                    f"<span style='color:{color};font-weight:700;'>{dir_} {val:+.3f}</span></div>",
+                    unsafe_allow_html=True)
+            _scores = [
+                ("ΔPCR flow",      fs.get("dPCR", 0),          "LEADING①"),
+                ("ΔSkew flow",     fs.get("dSkew", 0),         "LEADING①"),
+                ("ΔIV flow",       fs.get("dIV", 0),           "LEADING①"),
+                ("ΔOI flow",       fs.get("dOI", 0),           "LEADING①"),
+                ("PCR level",      fs.get("pcr_level_z", 0),   "LEADING②"),
+                ("OI skew",        fs.get("oi_skew_z", 0),     "LEADING②"),
+                ("Max pain",       fs.get("mp_z", 0),          "LEADING②"),
+                ("Vol regime",     fs.get("vol_regime_z", 0),  "CONCURRENT③"),
+                ("Term structure", fs.get("term_slope_z", 0),  "CONCURRENT③"),
+                ("Rel Strength",   fs.get("rs_score", 0),      "confirming④"),
+                ("Trend (EMA+ADX)",fs.get("trend_z", 0),       "confirming⑤"),
+            ]
+            for _ci, (_lbl, _val, _wt) in enumerate(_scores):
+                _fscore_bar(_lbl, _val, _ci, _wt)
+
+        # ── Strategy cards with Kelly in ₹ and dynamic rationale ────────
+        for i, s in enumerate(strat_recs[:8]):
+            rank_c     = "#ff8c00" if i == 0 else "#444"
+            top_border = "border-top:3px solid #ff8c00;" if i == 0 else ""
+            ev_raw     = s.get("ev", 0)
+            ev_col     = "#00d084" if ev_raw >= 0 else "#ff3b3b"
+            pop_val    = s.get("pop", 0.5)
+            pop_col    = "#00d084" if pop_val >= 0.6 else ("#ffb347" if pop_val >= 0.45 else "#ff3b3b")
+            sc         = s.get("Score", 50)
+            sc_col     = "#00d084" if sc >= 70 else ("#ffb347" if sc >= 50 else "#666")
+            sr         = s.get("safety_ratio", 2.0)
+            sr_col     = "#00d084" if sr >= CFG["safety_ratio_safe"] else (
+                         "#ffb347" if sr >= CFG["safety_ratio_moderate"] else "#ff3b3b")
+
+            # Kelly position size in ₹ from live capital
+            _kelly_raw_s = s.get("kelly_raw", 0)
+            _kelly_cap_s = max(0.0, min(_kelly_cap, _kelly_raw_s))
+            _kelly_f_s   = _kelly_cap_s * _kelly_frac
+            _pos_size_rs = round(_kelly_f_s * _capital)
+            _kelly_pct_s = _kelly_f_s * 100
+            _k_col = "#00d084" if _kelly_f_s > 0 else "#555"
+
+            # Theta daily decay (for credit strategies, compute days to 50% profit)
+            _max_reward_raw = s.get("max_reward", 0)
+            _theta_day_est  = 0.0
+            _days_to_target = None
+            if _max_reward_raw > 0 and _max_reward_raw < 1e5:
+                # Approximate theta using BS at current params for ATM
+                _theta_day_est = abs(bs_greeks(spot, atm_k, T, r, atm_iv, "call", q).get("theta", 0)) * 2
+                if _theta_day_est > 0 and "credit" in s.get("type", "").lower():
+                    _days_to_target = round(_max_reward_raw * 0.5 / (_theta_day_est + 1e-9))
+
+            # Dynamic rationale — built from actual feature scores, not generic text
+            _dom_factors = []
+            if abs(_flow_dir) > 0.15:
+                _dom_factors.append(f"flow {'bullish' if _flow_dir>0 else 'bearish'} ({_flow_dir:+.2f})")
+            _pcr_lz = fs.get("pcr_level_z", 0)
+            if abs(_pcr_lz) > 0.15:
+                _dom_factors.append(f"PCR {'support' if _pcr_lz>0 else 'resistance'} ({_pcr_lz:+.2f})")
+            _vr = fs.get("vol_regime_z", 0)
+            if abs(_vr) > 0.10:
+                _dom_factors.append(f"vol {'cheap' if _vr<0 else 'rich'} ({ivr:.0f} IVR)")
+            _dte_a = s.get("dte_align", 1.0)
+            _dir_a = s.get("dir_align", 0.5)
+            if not _dom_factors:
+                _dom_factors.append("balanced signals")
+            _dynamic_rationale = (
+                f"Ranked #{i+1} by EV · Drivers: {', '.join(_dom_factors)} · "
+                f"Dir-fit {_dir_a*100:.0f}% · DTE-align {_dte_a:.2f}"
+                + (f" · ~{_days_to_target}d to 50% profit" if _days_to_target else "")
+            )
+
+            st.markdown(f"""
 <div style="background:#0d0d0d;border:1px solid #2a2a2a;{top_border}
 padding:12px 16px;margin-bottom:7px;font-family:'IBM Plex Mono',monospace;">
   <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
     <div>
-      <span style="color:{rank_c};font-size:.58rem;font-weight:700;">{'⭐ BEST FIT' if i==0 else f'#{i+1}'}</span>
-      <span style="color:#e8e8e8;font-size:.9rem;font-weight:700;margin-left:8px;">{s['Strategy']}</span>
-      <span style="background:#1a1a1a;color:#777;font-size:.56rem;padding:2px 7px;margin-left:8px;
+      <span style="color:{rank_c};font-size:0.74rem;font-weight:700;">{'⭐ BEST EV' if i==0 else f'#{i+1}'}</span>
+      <span style="color:#e8e8e8;font-size:1.0rem;font-weight:700;margin-left:8px;">{s['Strategy']}</span>
+      <span style="background:#1a1a1a;color:#777;font-size:0.72rem;padding:2px 7px;margin-left:8px;
                    display:inline-block;">{s['Type']}</span>
     </div>
-    <span style="color:{score_c};font-size:.72rem;font-weight:700;">FIT SCORE {s['Score']}</span>
+    <span style="color:{sc_col};font-size:0.92rem;font-weight:700;">EV SCORE {sc}</span>
   </div>
-  <div style="color:#7ec8e3;font-size:.7rem;margin:6px 0 4px;">
-    LEGS: <b>{s['Legs']}</b>
+  <div style="color:#7ec8e3;font-size:0.9rem;margin:6px 0 4px;">LEGS: <b>{s['Legs']}</b></div>
+  <div style="display:flex;gap:12px;margin-top:8px;flex-wrap:wrap;align-items:center;">
+    <span style="color:{ev_col};font-size:0.82rem;font-weight:700;">EV {'+' if ev_raw>=0 else ''}₹{ev_raw:,.0f}</span>
+    <span style="color:{pop_col};font-size:0.82rem;">POP {pop_val*100:.1f}%</span>
+    <span style="color:#ffb347;font-size:0.77rem;">⬇ Risk: {s['Max Risk']}</span>
+    <span style="color:#00d084;font-size:0.77rem;">⬆ Reward: {s['Max Reward']}</span>
+    <span style="color:{sr_col};font-size:0.77rem;">🛡 {sr:.2f}× EM</span>
+    <span style="color:{_k_col};font-size:0.82rem;font-weight:700;">
+      {'₹' + f'{_pos_size_rs:,.0f}' if _pos_size_rs > 0 else '—'} ({_kelly_pct_s:.1f}% Kelly)
+    </span>
+    <span style="color:#555;font-size:0.77rem;">DTE {s['Ideal DTE']}</span>
   </div>
-  <div style="color:#999;font-size:.64rem;line-height:1.55;">{s['Rationale']}</div>
-  <div style="display:flex;gap:18px;margin-top:8px;flex-wrap:wrap;">
-    <span style="color:#ff3b3b;font-size:.6rem;">⬇ Max Risk: {s['Max Risk']}</span>
-    <span style="color:#00d084;font-size:.6rem;">⬆ Max Reward: {s['Max Reward']}</span>
-    <span style="color:#ffb347;font-size:.6rem;">⏱ Ideal DTE: {s['Ideal DTE']}</span>
-  </div>
+  <div style="color:#555;font-size:0.77rem;margin-top:5px;line-height:1.5;">{_dynamic_rationale}</div>
 </div>""", unsafe_allow_html=True)
 
-    with st.expander("◼ STRATEGY SELECTION LOGIC"):
+    else:
+        st.info("Load options intel to generate EV-ranked strategy recommendations.")
+
+
+    with st.expander("◼ HOW EV RANKING WORKS"):
         st.markdown(f"""
-**How the engine picks strategies:**
+**Selection criterion: highest EV adjusted for risk — no if/then rules.**
 
-The engine cross-references **Directional Bias × Volatility Regime × DTE**:
+Every strategy in the universe (14 structures) is evaluated simultaneously:
 
-| IV Rank | What to do | Best Structures |
-|---------|-----------|-----------------|
-| < 35 (Low IV) | **BUY vol** — options are cheap | Long calls/puts, straddles, strangles, calendars |
-| 35–60 (Normal) | Use **spreads** both ways | Bull/bear spreads, condors, butterflies |
-| > 60 (High IV) | **SELL vol** — premium is fat | Iron condors, short strangles, credit spreads |
+| Component | Method |
+|-----------|---------|
+| POP & EV | Monte Carlo {CFG['pop_simulations']:,} paths · vol surface skew-aware · real-world drift |
+| Directional alignment | `prob_up` / `prob_down` from logistic(raw_score) |
+| DTE alignment | Continuous exponential decay (no binary in/out window) |
+| Safety ratio | `distance_to_short / expected_move` via smooth sigmoid |
+| EV score | `tanh(EV/MaxRisk) × POP × dte_align × safety × ts_factor` |
+| Composite | 60% EV score + 40% directional alignment |
 
-**Current inputs:**
-- Bias: **{bias}** (score {bias_score:+d})
-- Vol Regime: **{v_lbl}** (IV Rank ~{ivr:.0f})
-- DTE: **{dte}**
-- Action: *{v_act}*
+**Current P(↑) = {_pu_s*100:.1f}%** → raw_score = {_rs_s:+.4f} → logistic({_rs_s*3:+.3f})
 
-**Key rule:** *Never buy expensive options (high IV) and never sell cheap options (low IV).*
+Strategy selection requires **no thresholds**, no `if bullish → bull spread`.
+The Iron Condor can rank #1 even when P(↑)=60% if its EV after skew-aware MC
+is higher than a directional trade. The model picks the highest-EV outcome.
 """)
+
 
 # ══════════════════════════════════════════════════════════════
 # TAB 4 — OPTION CHAIN
@@ -1593,41 +5614,55 @@ with t_chain:
         st.warning("No live chain data from Upstox. Showing Black-Scholes synthetic chain.")
         syn_rows = []
         for k in strikes_around(spot, step, 6):
-            ce_p = bs_price(spot, k, T, r, atm_iv, "call")
-            pe_p = bs_price(spot, k, T, r, atm_iv, "put")
-            cg   = bs_greeks(spot, k, T, r, atm_iv, "call")
-            pg   = bs_greeks(spot, k, T, r, atm_iv, "put")
-            mm   = "ATM" if abs(k-spot) <= 0.5*step else ("ITM-C" if k<spot else "OTM-C")
+            ce_p = bs_price(spot, k, T, r, atm_iv, "call", q)
+            pe_p = bs_price(spot, k, T, r, atm_iv, "put",  q)
+            cg   = bs_greeks(spot, k, T, r, atm_iv, "call", q)
+            pg   = bs_greeks(spot, k, T, r, atm_iv, "put",  q)
+            mm   = "ATM" if abs(k-spot) <= 0.5*step else ("ITM" if k<spot else "OTM")
             syn_rows.append({
                 "Strike":k,"Moneyness":mm,
                 "CE Price":round(ce_p,2),"CE IV%":round(atm_iv*100,1),
-                "CE Δ":cg["delta"],"CE θ":round(cg["theta"],3),"CE ν":round(cg["vega"],3),
+                "CE Δ":cg["delta"],"CE θ/d":round(cg["theta"],3),"CE ν/1%":round(cg["vega"],3),
                 "PE Price":round(pe_p,2),"PE IV%":round(atm_iv*100,1),
-                "PE Δ":pg["delta"],"PE θ":round(pg["theta"],3),"PE ν":round(pg["vega"],3),
+                "PE Δ":pg["delta"],"PE θ/d":round(pg["theta"],3),"PE ν/1%":round(pg["vega"],3),
             })
         st.dataframe(pd.DataFrame(syn_rows), use_container_width=True, hide_index=True)
     else:
-        # Show ±8 strikes around ATM (not an arbitrary % band)
-        _chain_lo = atm_k - 8 * step
-        _chain_hi = atm_k + 8 * step
+        _chain_lo = atm_k - CFG["chain_strikes"] * step
+        _chain_hi = atm_k + CFG["chain_strikes"] * step
         disp_c = chain_df[(chain_df.Strike >= _chain_lo) & (chain_df.Strike <= _chain_hi)].copy()
 
         # Add directional + IV edge signal per row
+        # IV edge: percentile-based. Collect all chain IV/HV ratios, classify by percentile.
+        hv_ref = hv20 if hv20 and hv20 > 0.01 else atm_iv
+        _all_iv_ratios = []
+        for _, _cr in disp_c.iterrows():
+            _ce_iv = _sanitise_iv(float(_cr.CE_IV), None)
+            _pe_iv = _sanitise_iv(float(_cr.PE_IV), None)
+            if _ce_iv: _all_iv_ratios.append(_ce_iv / hv_ref)
+            if _pe_iv: _all_iv_ratios.append(_pe_iv / hv_ref)
+        # Sell threshold = CFG iv_hv_pct_sell-th percentile of this chain's IV/HV ratios
+        if len(_all_iv_ratios) >= 4:
+            _rich_thresh  = float(np.percentile(_all_iv_ratios, CFG["iv_hv_pct_sell"]))
+            _cheap_thresh = float(np.percentile(_all_iv_ratios, CFG["iv_hv_pct_buy"]))
+        else:
+            # Absolute fallback when chain is tiny
+            _rich_thresh  = CFG["iv_rich_ratio"]
+            _cheap_thresh = CFG["iv_cheap_ratio"]
+
         def row_signal(row):
-            ce_iv_r = float(row.CE_IV); pe_iv_r = float(row.PE_IV)
-            ce_iv   = ce_iv_r/100 if ce_iv_r>2 else (ce_iv_r or atm_iv)
-            pe_iv   = pe_iv_r/100 if pe_iv_r>2 else (pe_iv_r or atm_iv)
-            # IV edge: relative to HV — scale-invariant
-            # >1.20× HV = 20% overpriced → sell signal
-            # <0.85× HV = 15% underpriced → buy signal
-            hv_ref  = hv20 if hv20 and hv20 > 0 else atm_iv
-            ce_ratio = ce_iv / hv_ref if hv_ref > 0 else 1.0
-            pe_ratio = pe_iv / hv_ref if hv_ref > 0 else 1.0
-            ce_dir  = "BUY" if bias_score >= 12 else "SELL" if bias_score <= -12 else "—"
-            pe_dir  = "BUY" if bias_score <= -12 else "SELL" if bias_score >= 12 else "—"
-            ce_vol  = "SELL (rich)" if ce_ratio > 1.20 else "BUY (cheap)" if ce_ratio < 0.85 else "—"
-            pe_vol  = "SELL (rich)" if pe_ratio > 1.20 else "BUY (cheap)" if pe_ratio < 0.85 else "—"
-            return pd.Series({"CE_Dir":ce_dir,"CE_Vol_Sig":ce_vol,"PE_Dir":pe_dir,"PE_Vol_Sig":pe_vol})
+            ce_iv = _sanitise_iv(float(row.CE_IV), atm_iv)
+            pe_iv = _sanitise_iv(float(row.PE_IV), atm_iv)
+            ce_ratio = ce_iv / (hv_ref + 1e-9)
+            pe_ratio = pe_iv / (hv_ref + 1e-9)
+            ce_dir   = "BUY" if bias_score >= 12 else "SELL" if bias_score <= -12 else "—"
+            pe_dir   = "BUY" if bias_score <= -12 else "SELL" if bias_score >= 12 else "—"
+            ce_vol   = f"SELL (rich ×{ce_ratio:.2f})"  if ce_ratio >= _rich_thresh  else \
+                       f"BUY (cheap ×{ce_ratio:.2f})" if ce_ratio <= _cheap_thresh else "—"
+            pe_vol   = f"SELL (rich ×{pe_ratio:.2f})"  if pe_ratio >= _rich_thresh  else \
+                       f"BUY (cheap ×{pe_ratio:.2f})" if pe_ratio <= _cheap_thresh else "—"
+            return pd.Series({"CE_Dir": ce_dir, "CE_Vol_Sig": ce_vol,
+                               "PE_Dir": pe_dir, "PE_Vol_Sig": pe_vol})
 
         sigs = disp_c.apply(row_signal, axis=1)
         disp_c = pd.concat([disp_c, sigs], axis=1)
@@ -1667,36 +5702,50 @@ with t_chain:
 # ══════════════════════════════════════════════════════════════
 with t_greeks:
     st.markdown("### 🔢 Greeks Dashboard")
+    if q > 0:
+        st.caption(f"Dividend yield q = {q*100:.2f}% applied (Merton form). Theta uses {CFG['theta_days']} trading-day convention.")
+    else:
+        st.caption(f"Theta uses {CFG['theta_days']} trading-day convention (not calendar days).")
 
     g_rows = []
     for k in strikes_around(spot, step, 5):
-        # Use API IV if available
         ce_iv_use = pe_iv_use = atm_iv
         if not chain_df.empty:
             closest = chain_df.iloc[(chain_df.Strike - k).abs().argsort()[:1]]
             if not closest.empty:
-                ce_r = float(closest.CE_IV.values[0])
-                pe_r = float(closest.PE_IV.values[0])
-                ce_iv_use = (ce_r/100 if ce_r>2 else ce_r) or atm_iv
-                pe_iv_use = (pe_r/100 if pe_r>2 else pe_r) or atm_iv
+                ce_iv_use = _sanitise_iv(float(closest.CE_IV.values[0]), atm_iv)
+                pe_iv_use = _sanitise_iv(float(closest.PE_IV.values[0]), atm_iv)
 
-        cg  = bs_greeks(spot, k, T, r, ce_iv_use, "call")
-        pg  = bs_greeks(spot, k, T, r, pe_iv_use, "put")
-        cp  = bs_price (spot, k, T, r, ce_iv_use, "call")
-        pp  = bs_price (spot, k, T, r, pe_iv_use, "put")
-        mm  = "ATM" if abs(k-spot) <= 0.5*step else ("ITM" if k<spot else "OTM")
-        ce_itm = bs_itm_prob(spot, k, T, r, ce_iv_use, "call")
-        pe_itm = bs_itm_prob(spot, k, T, r, pe_iv_use, "put")
+        cg    = bs_greeks(spot, k, T, r, ce_iv_use, "call", q)
+        pg    = bs_greeks(spot, k, T, r, pe_iv_use, "put",  q)
+        cp    = bs_price (spot, k, T, r, ce_iv_use, "call", q)
+        pp    = bs_price (spot, k, T, r, pe_iv_use, "put",  q)
+        mm    = "ATM" if abs(k-spot) <= 0.5*step else ("ITM" if k<spot else "OTM")
+        ce_itm   = bs_itm_prob(spot, k, T, r, ce_iv_use, "call", q)
+        pe_itm   = bs_itm_prob(spot, k, T, r, pe_iv_use, "put",  q)
+        # New: Prob of Touch (barrier probability)
+        ce_touch = bs_prob_touch(spot, k, T, r, ce_iv_use, "call", q)
+        pe_touch = bs_prob_touch(spot, k, T, r, pe_iv_use, "put",  q)
+        # New: Charm (delta decay per day)
+        ce_charm = bs_charm(spot, k, T, r, ce_iv_use, "call", q)
+        pe_charm = bs_charm(spot, k, T, r, pe_iv_use, "put",  q)
+        # New: Vanna (dDelta/dIV)
+        ce_vanna = bs_vanna(spot, k, T, r, ce_iv_use, "call", q)
+        pe_vanna = bs_vanna(spot, k, T, r, pe_iv_use, "put",  q)
         g_rows.append({
             "Strike":k, "Moneyness":mm,
             "CE Price":round(cp,2), "CE IV%":round(ce_iv_use*100,1),
             "CE Δ":cg["delta"], "CE Γ":cg["gamma"],
             "CE θ/d":round(cg["theta"],3), "CE ν/1%":round(cg["vega"],3),
+            "CE Charm":ce_charm, "CE Vanna":ce_vanna,
             "CE P(ITM)":f"{ce_itm*100:.0f}%",
+            "CE P(Touch)":f"{ce_touch*100:.0f}%",
             "PE Price":round(pp,2), "PE IV%":round(pe_iv_use*100,1),
             "PE Δ":pg["delta"], "PE Γ":pg["gamma"],
             "PE θ/d":round(pg["theta"],3), "PE ν/1%":round(pg["vega"],3),
+            "PE Charm":pe_charm, "PE Vanna":pe_vanna,
             "PE P(ITM)":f"{pe_itm*100:.0f}%",
+            "PE P(Touch)":f"{pe_touch*100:.0f}%",
         })
 
     g_df = pd.DataFrame(g_rows)
@@ -1718,8 +5767,49 @@ with t_greeks:
     )
     st.plotly_chart(fig_g, use_container_width=True)
 
-    st.divider()
-    st.markdown("##### Greeks Quick Reference")
+    # ── Dealer Gamma by Strike (GEX chart with proper dealer sign convention) ──
+    if oi_d and not oi_d.get("gex_df", pd.DataFrame()).empty:
+        st.divider()
+        st.markdown("##### Dealer Gamma Exposure (GEX) by Strike")
+        st.caption("GEX > 0 (green) = dealers long gamma → they buy dips & sell rallies (stabilising). "
+                   "GEX < 0 (red) = dealers short gamma → they chase price (destabilising).")
+        _gex_df_chart = oi_d["gex_df"].copy()
+        _gex_df_chart = _gex_df_chart[
+            (_gex_df_chart.Strike >= atm_k - 8 * step) &
+            (_gex_df_chart.Strike <= atm_k + 8 * step)
+        ]
+        fig_gex = go.Figure()
+        _bar_cols = ["#00d084" if v >= 0 else "#ff3b3b" for v in _gex_df_chart.NET_GEX]
+        # Auto-scale: choose unit that keeps values readable (not 0.00)
+        _gex_max_abs = max(abs(_gex_df_chart.NET_GEX.max()), abs(_gex_df_chart.NET_GEX.min()), 1)
+        if _gex_max_abs >= 1e9:
+            _gex_scale, _gex_unit = 1e7, "₹Cr"
+        elif _gex_max_abs >= 1e6:
+            _gex_scale, _gex_unit = 1e5, "₹Lakh"
+        else:
+            _gex_scale, _gex_unit = 1e3, "₹K"
+        fig_gex.add_trace(go.Bar(
+            x=_gex_df_chart.Strike,
+            y=_gex_df_chart.NET_GEX / _gex_scale,
+            marker_color=_bar_cols,
+            name="Net GEX",
+        ))
+        fig_gex.add_vline(x=spot, line=dict(color="#ffb347", dash="dot", width=1.5),
+                          annotation_text=f"Spot {spot:.0f}")
+        _gflip = oi_d.get("gamma_flip", spot)
+        fig_gex.add_vline(x=_gflip, line=dict(color="#9c27b0", dash="dash", width=1.5),
+                          annotation_text=f"Γ Flip {_gflip:.0f}")
+        fig_gex.add_hline(y=0, line=dict(color="#444", width=1))
+        fig_gex.update_layout(
+            title=f"Dealer Gamma Exposure (GEX) by Strike — {_gex_unit} Notional",
+            height=280, plot_bgcolor="#000", paper_bgcolor="#000",
+            font=dict(color="#e8e8e8", family="IBM Plex Mono", size=9),
+            xaxis=dict(title="Strike", gridcolor="#111"),
+            yaxis=dict(title=f"GEX ({_gex_unit})", gridcolor="#111", zeroline=True, zerolinecolor="#2a2a2a"),
+            margin=dict(t=40, b=10),
+        )
+        st.plotly_chart(fig_gex, use_container_width=True)
+
     gc1,gc2,gc3,gc4 = st.columns(4)
     with gc1:
         st.markdown("""**Δ Delta**
@@ -1770,7 +5860,7 @@ with t_oi:
 
         st.markdown(f"""
 <div style="border-left:3px solid {pcr_c};padding:7px 12px;margin:8px 0;
-font-family:'IBM Plex Mono',monospace;font-size:.7rem;color:{pcr_c};">
+font-family:'IBM Plex Mono',monospace;font-size:0.9rem;color:{pcr_c};">
   PCR SIGNAL: {oi_d['pcr_signal']}
 </div>""", unsafe_allow_html=True)
 
@@ -1884,7 +5974,7 @@ font-family:'IBM Plex Mono',monospace;font-size:.7rem;color:{pcr_c};">
             gex_flip_rel = "ABOVE spot" if oi_d["gamma_flip"] > spot else "BELOW spot"
             st.markdown(f"""
 <div style="background:#0d0d0d;border:1px solid #2a2a2a;border-left:3px solid {gex_rc};
-padding:9px 14px;font-family:'IBM Plex Mono',monospace;font-size:.65rem;">
+padding:9px 14px;font-family:'IBM Plex Mono',monospace;font-size:0.83rem;">
   <span style="color:{gex_rc};font-weight:700;">GEX: {oi_d.get('gex_regime','—')}</span><br/>
   <span style="color:#888;">Gamma Flip: ₹{oi_d['gamma_flip']:,.0f} ({gex_flip_rel}) &nbsp;·&nbsp;
   Net GEX: {gex_net:+,.0f}</span>
@@ -1939,7 +6029,7 @@ padding:9px 14px;font-family:'IBM Plex Mono',monospace;font-size:.65rem;">
                     skew_c    = "#ff3b3b" if skew_pp > 2 else ("#1e90ff" if skew_pp < -1 else "#888")
                     st.markdown(f"""
 <div style="border-left:3px solid {skew_c};padding:6px 12px;
-font-family:'IBM Plex Mono',monospace;font-size:.66rem;color:{skew_c};margin:4px 0;">
+font-family:'IBM Plex Mono',monospace;font-size:0.84rem;color:{skew_c};margin:4px 0;">
   SKEW: {oi_d['skew_label']}
 </div>""", unsafe_allow_html=True)
 
@@ -1977,57 +6067,76 @@ with t_payoff:
     st.markdown("### 💹 Strategy Payoff Builder")
     st.caption("Build multi-leg strategies. Quick-load buttons fill theoretical prices automatically.")
 
-    # Correct NSE F&O lot sizes (as of 2024 SEBI revision)
-    # Nifty: 75 (revised from 50 in Nov 2024), BankNifty: 15, FinNifty: 40, MidcapNifty: 75
-    _LOT_SIZES = {
-        "NIFTY": 75, "BANKNIFTY": 15, "FINNIFTY": 40, "MIDCPNIFTY": 75,
-        "RELIANCE": 250, "HDFCBANK": 550, "ICICIBANK": 700, "INFY": 400,
-        "TCS": 150, "LT": 150, "SBIN": 1500, "AXISBANK": 625,
-        "KOTAKBANK": 400, "BHARTIARTL": 500, "ITC": 3200,
-        "BAJFINANCE": 125, "WIPRO": 1500, "HCLTECH": 350,
-        "TATAMOTORS": 1425, "MARUTI": 100,
-    }
-    LOT_SIZE = _LOT_SIZES.get(sym.upper(), 500)  # default 500 for unlisted stocks
+    LOT_SIZE = CFG["lot_sizes"].get(sym.upper(), CFG["lot_size_fallback"])
 
-    # ── Quick load buttons ──
-    ql1,ql2,ql3,ql4,ql5,ql6 = st.columns(6)
+    # ── EV context line ──────────────────────────────────────────────────
+    if strat_recs:
+        _top = strat_recs[0]
+        _top_ev  = _top.get("ev", 0)
+        _top_pop = _top.get("pop", 0.5)
+        _top_evc = "#00d084" if _top_ev >= 0 else "#ff3b3b"
+        st.markdown(
+            f"<span style='font-family:IBM Plex Mono,monospace;font-size:0.80rem;color:#555;'>"
+            f"Top EV strategy: <span style='color:#ff8c00;font-weight:700;'>{_top['Strategy']}</span>"
+            f" · EV <span style='color:{_top_evc};'>{'+' if _top_ev>=0 else ''}₹{_top_ev:,.0f}</span>"
+            f" · POP {_top_pop*100:.1f}%"
+            f" · Score {_top['Score']}/100</span>",
+            unsafe_allow_html=True)
+
+    # ── Quick load buttons — use _bs_c/_bs_p which close over T, r, q, atm_iv ──
+    ql0,ql1,ql2,ql3,ql4,ql5,ql6 = st.columns(7)
     sv = float(step)
 
-    def bs_c(k): return round(bs_price(spot, k, T, r, atm_iv, "call"), 2)
-    def bs_p(k): return round(bs_price(spot, k, T, r, atm_iv, "put"),  2)
+    # Top EV pick from the probabilistic engine
+    if ql0.button("⭐ Top EV Pick", key="ql_top_ev"):
+        if strat_recs:
+            _top_s = strat_recs[0]
+            _top_legs = _top_s.get("legs", [])  # MC legs from universe
+            if _top_legs:
+                _new_legs = []
+                for _lg in _top_legs:
+                    _new_legs.append({
+                        "Opt":     _lg["opt"],
+                        "Strike":  float(_lg["strike"]),
+                        "Premium": float(_lg["premium"]),
+                        "Qty":     int(_lg.get("qty", 1)),
+                        "Action":  _lg["action"].title(),
+                    })
+                st.session_state.payoff_legs = _new_legs
+                st.rerun()
 
     if ql1.button("Bull Call Spread",  key="ql_bcs"):
         st.session_state.payoff_legs = [
-            {"Opt":"CE","Strike":atm_k,     "Premium":bs_c(atm_k),     "Qty":1,"Action":"Buy"},
-            {"Opt":"CE","Strike":atm_k+sv,  "Premium":bs_c(atm_k+sv),  "Qty":1,"Action":"Sell"},
+            {"Opt":"CE","Strike":atm_k,     "Premium":_bs_c(atm_k),     "Qty":1,"Action":"Buy"},
+            {"Opt":"CE","Strike":atm_k+sv,  "Premium":_bs_c(atm_k+sv),  "Qty":1,"Action":"Sell"},
         ]; st.rerun()
     if ql2.button("Bear Put Spread",   key="ql_bps"):
         st.session_state.payoff_legs = [
-            {"Opt":"PE","Strike":atm_k,     "Premium":bs_p(atm_k),     "Qty":1,"Action":"Buy"},
-            {"Opt":"PE","Strike":atm_k-sv,  "Premium":bs_p(atm_k-sv),  "Qty":1,"Action":"Sell"},
+            {"Opt":"PE","Strike":atm_k,     "Premium":_bs_p(atm_k),     "Qty":1,"Action":"Buy"},
+            {"Opt":"PE","Strike":atm_k-sv,  "Premium":_bs_p(atm_k-sv),  "Qty":1,"Action":"Sell"},
         ]; st.rerun()
     if ql3.button("Long Straddle",     key="ql_str"):
         st.session_state.payoff_legs = [
-            {"Opt":"CE","Strike":atm_k,"Premium":bs_c(atm_k),"Qty":1,"Action":"Buy"},
-            {"Opt":"PE","Strike":atm_k,"Premium":bs_p(atm_k),"Qty":1,"Action":"Buy"},
+            {"Opt":"CE","Strike":atm_k,"Premium":_bs_c(atm_k),"Qty":1,"Action":"Buy"},
+            {"Opt":"PE","Strike":atm_k,"Premium":_bs_p(atm_k),"Qty":1,"Action":"Buy"},
         ]; st.rerun()
     if ql4.button("Iron Condor",       key="ql_ic"):
         st.session_state.payoff_legs = [
-            {"Opt":"PE","Strike":atm_k-sv,   "Premium":bs_p(atm_k-sv),   "Qty":1,"Action":"Sell"},
-            {"Opt":"PE","Strike":atm_k-2*sv, "Premium":bs_p(atm_k-2*sv), "Qty":1,"Action":"Buy"},
-            {"Opt":"CE","Strike":atm_k+sv,   "Premium":bs_c(atm_k+sv),   "Qty":1,"Action":"Sell"},
-            {"Opt":"CE","Strike":atm_k+2*sv, "Premium":bs_c(atm_k+2*sv), "Qty":1,"Action":"Buy"},
+            {"Opt":"PE","Strike":atm_k-sv,   "Premium":_bs_p(atm_k-sv),   "Qty":1,"Action":"Sell"},
+            {"Opt":"PE","Strike":atm_k-2*sv, "Premium":_bs_p(atm_k-2*sv), "Qty":1,"Action":"Buy"},
+            {"Opt":"CE","Strike":atm_k+sv,   "Premium":_bs_c(atm_k+sv),   "Qty":1,"Action":"Sell"},
+            {"Opt":"CE","Strike":atm_k+2*sv, "Premium":_bs_c(atm_k+2*sv), "Qty":1,"Action":"Buy"},
         ]; st.rerun()
     if ql5.button("Butterfly",         key="ql_bf"):
         st.session_state.payoff_legs = [
-            {"Opt":"CE","Strike":atm_k-sv,  "Premium":bs_c(atm_k-sv),  "Qty":1,"Action":"Buy"},
-            {"Opt":"CE","Strike":atm_k,     "Premium":bs_c(atm_k),     "Qty":2,"Action":"Sell"},
-            {"Opt":"CE","Strike":atm_k+sv,  "Premium":bs_c(atm_k+sv),  "Qty":1,"Action":"Buy"},
+            {"Opt":"CE","Strike":atm_k-sv,  "Premium":_bs_c(atm_k-sv),  "Qty":1,"Action":"Buy"},
+            {"Opt":"CE","Strike":atm_k,     "Premium":_bs_c(atm_k),     "Qty":2,"Action":"Sell"},
+            {"Opt":"CE","Strike":atm_k+sv,  "Premium":_bs_c(atm_k+sv),  "Qty":1,"Action":"Buy"},
         ]; st.rerun()
     if ql6.button("Short Strangle",    key="ql_ss"):
         st.session_state.payoff_legs = [
-            {"Opt":"PE","Strike":atm_k-sv,  "Premium":bs_p(atm_k-sv),  "Qty":1,"Action":"Sell"},
-            {"Opt":"CE","Strike":atm_k+sv,  "Premium":bs_c(atm_k+sv),  "Qty":1,"Action":"Sell"},
+            {"Opt":"PE","Strike":atm_k-sv,  "Premium":_bs_p(atm_k-sv),  "Qty":1,"Action":"Sell"},
+            {"Opt":"CE","Strike":atm_k+sv,  "Premium":_bs_c(atm_k+sv),  "Qty":1,"Action":"Sell"},
         ]; st.rerun()
 
     st.divider()
@@ -2041,7 +6150,7 @@ with t_payoff:
         with ac4: l_qty    = st.number_input("Lots", value=1, min_value=1, key="nl_qty")
         with ac5: l_act    = st.selectbox("Buy/Sell", ["Buy","Sell"], key="nl_act")
         if st.button("Add Leg ➕", key="add_leg_btn2"):
-            prem = l_prem if l_prem > 0 else (bs_c(l_strike) if l_opt=="CE" else bs_p(l_strike))
+            prem = l_prem if l_prem > 0 else (_bs_c(l_strike) if l_opt=="CE" else _bs_p(l_strike))
             st.session_state.payoff_legs.append({
                 "Opt":l_opt,"Strike":l_strike,"Premium":round(prem,2),"Qty":l_qty,"Action":l_act
             })
@@ -2059,13 +6168,14 @@ with t_payoff:
         with pc_lot:
             lot_inp = st.number_input("Lot Size", min_value=1, value=LOT_SIZE, key="lot_size_inp")
 
-        # Chart range = ±3σ based on expected move from straddle
-        # exp_move_pct is ±1σ; ×3 gives the 99.7% probability range
+        # Chart range = ±3σ using trading-day T (consistent with all other BS calcs)
         _exp_move_frac = oi_d.get("exp_move_pct", 0) / 100.0 if oi_d else 0
         if _exp_move_frac <= 0:
-            # Fallback: derive from IV and T (no OI data)
-            _exp_move_frac = atm_iv * math.sqrt(2.0 / math.pi) * math.sqrt(T) if T > 0 else 0.05
-        _range_frac  = max(3 * _exp_move_frac, 0.05)  # at least ±5% for very short DTE
+            # Fallback from BS: E[|move|] = σ × sqrt(T) × sqrt(2/π)
+            _bs_const = math.sqrt(2.0 / math.pi)
+            _exp_move_frac = atm_iv * _bs_const * math.sqrt(T) if T > 0 else atm_iv * 0.05
+        # ±3σ covers 99.7% of probability mass; floor at ±3% for very short DTE
+        _range_frac  = max(3 * _exp_move_frac, 0.03)
         px_range     = np.linspace(spot * (1 - _range_frac), spot * (1 + _range_frac), 400)
         payoff_total = np.zeros(len(px_range))
         total_cost   = 0.0
@@ -2088,6 +6198,18 @@ with t_payoff:
 
         max_profit = payoff_total.max()
         max_loss   = payoff_total.min()
+
+        # Check if any leg is uncapped short (naked short CE or PE)
+        _has_naked_short = any(
+            l["Action"] == "Sell" and not any(
+                l2["Action"] == "Buy" and l2["Opt"] == l["Opt"] and
+                (float(l2["Strike"]) > float(l["Strike"]) if l["Opt"]=="CE"
+                 else float(l2["Strike"]) < float(l["Strike"]))
+                for l2 in st.session_state.payoff_legs
+            )
+            for l in st.session_state.payoff_legs
+        )
+        _loss_label = f"₹{max_loss:,.0f} (within ±3σ)" if _has_naked_short else f"₹{max_loss:,.0f}"
 
         # Payoff chart
         fig_pay = go.Figure()
@@ -2126,7 +6248,7 @@ with t_payoff:
         # Stats row
         s1,s2,s3,s4,s5,s6 = st.columns(6)
         s1.metric("Max Profit",  f"₹{max_profit:,.0f}")
-        s2.metric("Max Loss",    f"₹{max_loss:,.0f}")
+        s2.metric("Max Loss",    _loss_label)
         cost_lbl = "Debit" if total_cost > 0 else "Credit"
         s3.metric("Net Cost",    f"₹{abs(total_cost):,.0f}", delta=cost_lbl)
         s4.metric("Breakevens",  ", ".join([f"₹{b:.0f}" for b in bes]) or "None")
@@ -2134,6 +6256,2234 @@ with t_payoff:
         s5.metric("Reward:Risk", f"{rr:.2f}×" if rr != float("inf") else "∞")
         s6.metric("Legs",        str(len(st.session_state.payoff_legs)))
 
+        # ── Probability of Profit + Expected Value (Monte Carlo) ──
+        _mc_legs = []
+        for _lmc in st.session_state.payoff_legs:
+            _mc_legs.append({
+                "opt":     _lmc["Opt"],
+                "strike":  float(_lmc["Strike"]),
+                "premium": float(_lmc["Premium"]),
+                "action":  _lmc["Action"],
+                "qty":     int(_lmc["Qty"]) * int(lot_inp),
+            })
+        _pop, _ev = strategy_prob_profit(_mc_legs, spot, T, r, atm_iv, q,
+                                         chain_df=chain_df,
+                                         ohlcv_df=st.session_state.get("opt_ohlcv", pd.DataFrame()))
+        _pop_col  = "#00d084" if _pop >= 0.6 else ("#ffb347" if _pop >= 0.45 else "#ff3b3b")
+        _ev_col   = "#00d084" if _ev >= 0 else "#ff3b3b"
+        pp1, pp2, pp3 = st.columns(3)
+        pp1.markdown(f"""<div style="background:#0d0d0d;border:1px solid #2a2a2a;
+border-left:4px solid {_pop_col};padding:10px 14px;font-family:'IBM Plex Mono',monospace;">
+  <div style="color:#555;font-size:0.76rem;letter-spacing:.08em;">PROB OF PROFIT (MC 5K sims)</div>
+  <div style="color:{_pop_col};font-size:1.3rem;font-weight:700;">{_pop*100:.1f}%</div>
+  <div style="color:#888;font-size:0.78rem;">Real-world drift · Vol surface skew-aware</div>
+</div>""", unsafe_allow_html=True)
+        pp2.markdown(f"""<div style="background:#0d0d0d;border:1px solid #2a2a2a;
+border-left:4px solid {_ev_col};padding:10px 14px;font-family:'IBM Plex Mono',monospace;">
+  <div style="color:#555;font-size:0.76rem;letter-spacing:.08em;">EXPECTED VALUE (₹/unit)</div>
+  <div style="color:{_ev_col};font-size:1.3rem;font-weight:700;">{'+' if _ev>=0 else ''}₹{_ev:,.0f}</div>
+  <div style="color:#888;font-size:0.78rem;">Avg P&L across simulated paths</div>
+</div>""", unsafe_allow_html=True)
+        # Prob of Touch for each leg
+        _touch_info = []
+        for _lmc in st.session_state.payoff_legs:
+            _k_t  = float(_lmc["Strike"])
+            _ot   = "call" if _lmc["Opt"] == "CE" else "put"
+            _iv_t = atm_iv
+            if not chain_df.empty:
+                _closest_t = chain_df.iloc[(chain_df.Strike - _k_t).abs().argsort()[:1]]
+                if not _closest_t.empty:
+                    _col_t = "CE_IV" if _ot == "call" else "PE_IV"
+                    _iv_t  = _sanitise_iv(float(_closest_t[_col_t].values[0]), atm_iv)
+            _pt   = bs_prob_touch(spot, _k_t, T, r, _iv_t, _ot, q)
+            _touch_info.append(f"{_lmc['Opt']} {_k_t:.0f}: {_pt*100:.0f}%")
+        pp3.markdown(f"""<div style="background:#0d0d0d;border:1px solid #2a2a2a;
+border-left:4px solid #9c27b0;padding:10px 14px;font-family:'IBM Plex Mono',monospace;">
+  <div style="color:#555;font-size:0.76rem;letter-spacing:.08em;">PROB OF TOUCH (per leg)</div>
+  <div style="color:#9c27b0;font-size:0.86rem;font-weight:700;">{"  ·  ".join(_touch_info[:4])}</div>
+  <div style="color:#888;font-size:0.78rem;">Barrier prob · real-world drift adjusted</div>
+</div>""", unsafe_allow_html=True)
+
+        st.divider()
+
+        # ── Portfolio Greeks ────────────────────────────────────────────────
+        st.markdown("#### ◼ Portfolio Greeks (Net Exposure)")
+        _pg_legs = []
+        for _lmc in st.session_state.payoff_legs:
+            _pg_legs.append({
+                "opt":     _lmc["Opt"],
+                "strike":  float(_lmc["Strike"]),
+                "premium": float(_lmc["Premium"]),
+                "action":  _lmc["Action"],
+                "qty":     int(_lmc["Qty"]) * int(lot_inp),
+            })
+        _pg = compute_portfolio_greeks(
+            _pg_legs, spot, T, r, atm_iv, q,
+            chain_df=chain_df, lot_size=1)
+        pg1, pg2, pg3, pg4, pg5, pg6 = st.columns(6)
+        def _greek_color(v, is_gamma=False):
+            if is_gamma: return "#00d084" if v > 0 else "#ff3b3b"
+            return "#00d084" if v > 0 else ("#ff3b3b" if v < 0 else "#888")
+        pg1.metric("Net Δ Delta",  f"{_pg['delta']:+.4f}",  help="P&L per ₹1 spot move")
+        pg2.metric("Net Γ Gamma",  f"{_pg['gamma']:+.6f}",  help="Delta change per ₹1 move")
+        pg3.metric("Net V Vega",   f"₹{_pg['vega']:+.2f}",  help="P&L per 1% IV change")
+        pg4.metric("Net Θ Theta",  f"₹{_pg['theta']:+.2f}", help="Daily time decay ₹/day")
+
+        # Theta/Premium ratio — most actionable metric for credit strategies
+        # How many days to collect 50% of max credit (exit target)
+        _total_credit = sum(
+            (-1 if str(l.get("action","buy")).lower()=="sell" else 1)
+            * float(l.get("premium", 0)) * int(l.get("qty",1))
+            for l in _pg_legs
+        )
+        _theta_day = abs(_pg["theta"]) if _pg["theta"] != 0 else 1e-9
+        if _total_credit < 0 and _theta_day > 0:
+            # Credit strategy: theta is working for you
+            _days_50pct = abs(_total_credit) * 0.5 / _theta_day
+            pg5.metric("Days → 50% profit",
+                       f"~{_days_50pct:.0f}d",
+                       help="Estimated days for theta to collect 50% of credit (exit target)")
+        else:
+            _theta_pct = abs(_pg["theta"]) / max(abs(_total_credit), 1) * 100
+            pg5.metric("Θ/Premium %",
+                       f"{_theta_pct:.1f}%/day",
+                       help="Daily theta as % of premium paid (debit) or credit received")
+
+        # Delta notional as a cleaner risk measure than vanna
+        _delta_notional = _pg["delta"] * spot
+        pg6.metric("Delta ₹ Notional",
+                   f"₹{_delta_notional:,.0f}",
+                   help="Effective ₹ exposure per ₹1 move in spot")
+
+        # Delta notional
+        _theta_annual   = _pg["theta"] * CFG["ann_days"]
+        st.caption(f"Delta notional: ₹{_delta_notional:,.0f} · "
+                   f"Annualised theta: ₹{_theta_annual:,.0f} · "
+                   f"Vega/Theta: {abs(_pg['vega'] / (_pg['theta'] + 1e-9)):.1f}× "
+                   f"({'vol-long' if _pg['vega'] > 0 else 'vol-short'})")
+
+        st.divider()
+
+        # ── Kelly Position Sizing ───────────────────────────────────────────
+        st.markdown("#### ◼ Kelly Position Sizing")
+        st.caption(f"Fractional Kelly ({CFG['kelly_fraction']:.0%}) applied. Capped at {CFG['kelly_cap_pct']:.0%}. Capital defaults to sidebar.")
+        _ks_cols = st.columns([1, 1, 1, 2])
+        with _ks_cols[0]:
+            _ks_capital = st.number_input("Capital (₹)", min_value=10000, max_value=100_000_000,
+                                          value=st.session_state.opt_capital,
+                                          step=10_000, key="kelly_capital_inp")
+        with _ks_cols[1]:
+            _ks_win_pct = st.number_input("Avg Win (%)", min_value=1.0, max_value=500.0,
+                                           value=float(max(1.0, round(abs(_pop * 100), 1))),
+                                           step=0.5, key="kelly_win_inp",
+                                           help="Expected avg winning trade as % of capital at risk")
+        with _ks_cols[2]:
+            _ks_loss_pct = st.number_input("Avg Loss (%)", min_value=1.0, max_value=500.0,
+                                            value=float(max(1.0, round((1 - _pop) * 100, 1))),
+                                            step=0.5, key="kelly_loss_inp",
+                                            help="Expected avg losing trade as % of capital at risk")
+        _kelly_res = kelly_position_size(
+            _pop, _ks_win_pct / 100.0, _ks_loss_pct / 100.0, _ks_capital)
+        with _ks_cols[3]:
+            _kc1, _kc2, _kc3 = st.columns(3)
+            _kc1.metric("Kelly Raw",     f"{_kelly_res['kelly_raw']*100:.1f}%")
+            _kc2.metric("Kelly (capped)",f"{_kelly_res['kelly_capped']*100:.1f}%")
+            _kc3.metric("Position Size", f"₹{_kelly_res['position_size']:,.0f}",
+                        delta=f"{_kelly_res['kelly_f']*100:.1f}% of capital")
+        _kremark_col = "#00d084" if _kelly_res["kelly_raw"] > 0 else "#ff3b3b"
+        st.markdown(f"<span style='color:{_kremark_col};font-size:0.83rem;font-family:IBM Plex Mono,monospace;'>"
+                    f"◆ {_kelly_res['remark']}</span>", unsafe_allow_html=True)
+
     else:
         st.info("Click a Quick Load button above, or add legs manually to build a payoff diagram.")
         st.caption("Premiums auto-fill from Black-Scholes at current ATM IV if you don't enter them.")
+
+# ══════════════════════════════════════════════════════════════
+# TAB 8 — TRADE PLAN
+# ══════════════════════════════════════════════════════════════
+with t_trade:
+    st.markdown("### 🚦 Trade Plan — Step-by-Step Actionable Brief")
+    st.caption("Everything synthesised into one page. Read top to bottom. Each section answers one question.")
+
+    # ── Helper styles ────────────────────────────────────────
+    def _card(title, value, sub, border_col, bg="#0d0d0d"):
+        return f"""<div style="background:{bg};border:1px solid #2a2a2a;border-left:4px solid {border_col};
+padding:12px 16px;font-family:'IBM Plex Mono',monospace;height:100%;">
+  <div style="color:#555;font-size:0.78rem;letter-spacing:.08em;text-transform:uppercase;">{title}</div>
+  <div style="color:{border_col};font-size:1.05rem;font-weight:700;margin:3px 0;">{value}</div>
+  <div style="color:#888;font-size:0.80rem;line-height:1.6;">{sub}</div>
+</div>"""
+
+    def _section(num, title, col="#ff8c00"):
+        st.markdown(f"""<div style="border-left:4px solid {col};padding:6px 14px;margin:18px 0 8px;
+font-family:'IBM Plex Mono',monospace;">
+  <span style="color:#555;font-size:0.78rem;">STEP {num}</span>
+  <span style="color:{col};font-size:0.96rem;font-weight:700;margin-left:10px;">{title}</span>
+</div>""", unsafe_allow_html=True)
+
+    def _rule(label, status, detail, ok_col="#00d084", fail_col="#ff3b3b", warn_col="#ffb347"):
+        col = ok_col if status == "GO" else (fail_col if status == "NO" else warn_col)
+        icon = "▶" if status == "GO" else ("✖" if status == "NO" else "◆")
+        st.markdown(f"""<div style="display:flex;align-items:flex-start;gap:12px;padding:7px 0;
+border-bottom:1px solid #1a1a1a;font-family:'IBM Plex Mono',monospace;">
+  <span style="color:{col};font-size:1.0rem;min-width:18px;">{icon}</span>
+  <div style="flex:1;">
+    <span style="color:#e8e8e8;font-size:0.86rem;font-weight:600;">{label}</span>
+    <span style="background:{col}22;color:{col};font-size:0.76rem;padding:1px 7px;
+    margin-left:8px;border:1px solid {col}44;">{status}</span>
+    <div style="color:#888;font-size:0.82rem;margin-top:2px;line-height:1.55;">{detail}</div>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+    # ═══════════════════════════════════════════════════════
+    # STEP 1 — MARKET CONDITION SNAPSHOT
+    # ═══════════════════════════════════════════════════════
+    _section(1, "WHAT IS THE MARKET DOING RIGHT NOW?")
+    _c1, _c2, _c3, _c4 = st.columns(4)
+    _pu_tp  = prob_score["prob_up"]
+    _pd_tp  = prob_score["prob_down"]
+    _pu_tpc = "#00d084" if _pu_tp > 0.55 else ("#ff3b3b" if _pu_tp < 0.45 else "#ffb347")
+    _c1.markdown(_card("Probability",
+                        f"P(↑) {_pu_tp*100:.1f}%  P(↓) {_pd_tp*100:.1f}%",
+                        f"logistic score {prob_score['raw_score']:+.3f} · {bias} ({bias_score:+d})",
+                        _pu_tpc), unsafe_allow_html=True)
+    _c2.markdown(_card("Expected Move", f"₹{prob_score['expected_move']:.0f}  ±{prob_score['expected_move_pct']:.1f}%",
+                        f"ATM straddle · IV {atm_iv*100:.1f}% · DTE {dte}", v_col), unsafe_allow_html=True)
+
+    _iv_hv_ratio = atm_iv / hv20 if hv20 and hv20 > 0.01 else 1.0
+    _iv_hv_pct_now = prob_score.get("iv_hv_pct", 0.5)
+    _vol_edge_lbl = (f"RICH — sell premium (IVR {ivr:.0f})" if ivr >= CFG["iv_hv_pct_sell"]
+                     else f"CHEAP — buy premium (IVR {ivr:.0f})" if ivr < CFG["iv_hv_pct_buy"]
+                     else f"FAIR — spread strategies (IVR {ivr:.0f})")
+    _vol_edge_col = ("#ff3b3b" if ivr >= CFG["iv_hv_pct_sell"]
+                     else "#1e90ff" if ivr < CFG["iv_hv_pct_buy"] else "#ffb347")
+    _c3.markdown(_card("IV Regime", _vol_edge_lbl,
+                        f"IV/HV={_iv_hv_ratio:.2f}× · {_iv_hv_pct_now*100:.0f}th pct of history",
+                        _vol_edge_col), unsafe_allow_html=True)
+
+    _mp = oi_d.get("max_pain", spot) if oi_d else spot
+    _mp_dist    = spot - _mp
+    _em_price   = prob_score.get("expected_move", step) or step
+    _mp_dist_em = abs(_mp_dist) / (_em_price + 1e-9)
+    _mp_dir     = f"{abs(_mp_dist):.0f}pts {'above' if _mp_dist>0 else 'below'} pain · {_mp_dist_em:.2f}× EM"
+    _mp_pull_thr = CFG["safety_ratio_moderate"]   # distance > 1× EM = meaningful pull
+    _mp_pull    = ("Downward pull to max pain" if _mp_dist > _em_price * _mp_pull_thr
+                   else "Upward pull to max pain" if _mp_dist < -_em_price * _mp_pull_thr
+                   else "Near max pain — pinning likely")
+    _c4.markdown(_card("Max Pain", f"₹{_mp:,.0f}", _mp_dir, "#9c27b0"), unsafe_allow_html=True)
+
+    # ═══════════════════════════════════════════════════════
+    # STEP 2 — GO / NO-GO CHECKLIST
+    # All rules driven by computed signal scores — no raw threshold re-derivation
+    # ═══════════════════════════════════════════════════════
+    _section(2, "IS IT SAFE TO TRADE TODAY?", "#1e90ff")
+    st.caption("Rules derived from computed signal scores. All checks GO = proceed. CAUTION = reduce size. NO = wait.")
+
+    _fs_tp       = prob_score.get("feature_scores", {})
+    _flow_s      = _fs_tp.get("flow_score", 0.0)
+    _flow_m      = prob_score.get("flow_magnitude", 0.0)
+    _pos_s       = _fs_tp.get("positioning_score", 0.0)
+    _vol_rs      = _fs_tp.get("vol_regime_score", 0.0)
+    _iv_hv_pct_g = prob_score.get("iv_hv_pct", 0.5)
+    _pu_conv     = prob_score["prob_up"]
+    _dir_edge    = abs(_pu_conv - 0.5)
+    _flow_thr    = st.session_state.get("opt_flow_conv_threshold", CFG["flow_conviction_seed"])
+
+    # ── CHECK 1: FLOW SIGNAL ─────────────────────────────────────────────
+    # Leading signal — if flow strongly contradicts direction, wait
+    _flow_dir_ok = (_flow_s >= 0 and _pu_conv > 0.5) or (_flow_s <= 0 and _pu_conv < 0.5) or abs(_flow_s) < 0.1
+    _dpcr_g  = _fs_tp.get("dPCR", 0); _dsk_g = _fs_tp.get("dSkew", 0); _div_g = _fs_tp.get("dIV", 0)
+    if _flow_m >= _flow_thr and not _flow_dir_ok:
+        _rule("Flow signal direction", "CAUTION",
+              f"High-conviction flow ({_flow_m:.3f}) but AGAINST directional lean. "
+              f"ΔPCR {_dpcr_g:+.3f} · ΔSkew {_dsk_g:+.3f} · ΔIV {_div_g:+.3f}. "
+              "Flow leads price — consider non-directional or wait for alignment.")
+    elif _flow_m >= _flow_thr:
+        _flow_dir_lbl = "bullish" if _flow_s > 0 else "bearish"
+        _rule("Flow signal", "GO",
+              f"High-conviction {_flow_dir_lbl} flow ({_flow_m:.3f} ≥ threshold {_flow_thr:.3f}). "
+              f"ΔPCR {_dpcr_g:+.3f} · ΔSkew {_dsk_g:+.3f} · ΔIV {_div_g:+.3f}.")
+    else:
+        _rule("Flow signal", "GO",
+              f"Normal flow activity ({_flow_m:.3f} < threshold {_flow_thr:.3f}). "
+              f"Flow score {_flow_s:+.3f} — no extreme positioning change detected.")
+
+    # ── CHECK 2: POSITIONING ─────────────────────────────────────────────
+    _pcr_lz_g = _fs_tp.get("pcr_level_z", 0)
+    _oi_sk_g  = _fs_tp.get("oi_skew_z", 0)
+    _pos_conflict = (abs(_pos_s) > 0.3 and
+                     ((_pos_s > 0 and _pu_conv < 0.45) or (_pos_s < 0 and _pu_conv > 0.55)))
+    if _pos_conflict:
+        _rule("Positioning vs direction", "CAUTION",
+              f"OI positioning ({_pos_s:+.3f}) conflicts with P(↑)={_pu_conv*100:.1f}%. "
+              f"PCR level {_pcr_lz_g:+.3f} · OI skew {_oi_sk_g:+.3f}. "
+              "Structural OI argues against the directional lean — use defined-risk only.")
+    else:
+        _rule("Positioning aligned", "GO",
+              f"Positioning score {_pos_s:+.3f} consistent with P(↑)={_pu_conv*100:.1f}%. "
+              f"PCR level {_pcr_lz_g:+.3f} · OI skew {_oi_sk_g:+.3f}.")
+
+    # ── CHECK 3: VOLATILITY REGIME ───────────────────────────────────────
+    # Extreme IV percentiles = dangerous for both buyers and sellers
+    if _iv_hv_pct_g > 0.92:
+        _rule("Vol regime", "CAUTION",
+              f"IV/HV at {_iv_hv_pct_g*100:.0f}th pct — extreme vol. Vol regime score {_vol_rs:+.3f}. "
+              "Mean-reversion of IV likely. Size down credit strategies; avoid naked long vega.")
+    elif _iv_hv_pct_g < 0.08:
+        _rule("Vol regime", "CAUTION",
+              f"IV/HV at {_iv_hv_pct_g*100:.0f}th pct — vol compressed. Vol regime score {_vol_rs:+.3f}. "
+              "Options very cheap but breakout risk elevated. Prefer debit strategies.")
+    else:
+        _rule("Vol regime", "GO",
+              f"IV/HV at {_iv_hv_pct_g*100:.0f}th pct · regime score {_vol_rs:+.3f} — tradeable range.")
+
+    # ── CHECK 4: STRUCTURAL RISK (DTE + Gamma Flip + Events) ────────────
+    _struct_issues = []
+    _gflip_d_g = float('inf')   # safe default: infinitely far from gamma flip
+    _liq_score = liquidity_d.get("liquid_score", 75)
+    if dte < 2:
+        _struct_issues.append(f"DTE={dte} (expiry day — avoid new positions)")
+    elif dte < 5:
+        _struct_issues.append(f"DTE={dte} (near expiry — gamma risk elevated)")
+    if oi_d:
+        _gflip_g   = oi_d.get("gamma_flip", spot)
+        _gflip_d_g = abs(spot - _gflip_g) / (prob_score.get("expected_move", step) + 1e-9)
+        if _gflip_d_g < 0.25:
+            _struct_issues.append(f"Gamma flip at {_gflip_d_g:.2f}× EM (very close — vol expansion risk)")
+    _near_events = [e for e in events_list if e.get("days_away", 99) <= dte]
+    if _near_events:
+        _struct_issues.append(f"{len(_near_events)} event(s) within expiry window")
+    _liq_score = liquidity_d.get("liquid_score", 75)
+    if _liq_score < 50:
+        _struct_issues.append(f"Liquidity score {_liq_score}/100 — wide spreads")
+
+    if any("expiry day" in s for s in _struct_issues):
+        _rule("Structural risk", "NO",
+              " | ".join(_struct_issues))
+    elif _struct_issues:
+        _rule("Structural risk", "CAUTION",
+              " | ".join(_struct_issues))
+    else:
+        _rule("Structural risk", "GO",
+              f"DTE {dte} · Gamma flip {_gflip_d_g:.2f}× EM away · Liquidity {_liq_score}/100 · No events in window."
+              if oi_d else f"DTE {dte} · No structural issues detected.")
+
+    # ═══════════════════════════════════════════════════════
+    # STEP 3 — WHICH STRATEGY TO USE
+    # ═══════════════════════════════════════════════════════
+    _section(3, "WHICH STRATEGY TO USE?", "#00d084")
+
+    if strat_recs:
+        _best = strat_recs[0]
+        _ev_b   = _best.get("ev", 0)
+        _pop_b  = _best.get("pop", 0.5)
+        _kelly_b = _best.get("kelly", 0) * 100
+        _score_col = "#00d084" if _best["Score"] >= 70 else "#ffb347" if _best["Score"] >= 50 else "#ff3b3b"
+        _ev_col    = "#00d084" if _ev_b >= 0 else "#ff3b3b"
+        st.markdown(f"""
+<div style="background:#0d1a00;border:1px solid #ff8c00;border-top:4px solid #ff8c00;
+padding:16px 20px;font-family:'IBM Plex Mono',monospace;margin-bottom:12px;">
+  <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+    <div>
+      <div style="color:#555;font-size:0.78rem;letter-spacing:.1em;">TOP STRATEGY BY EV  ·  {_best['Ideal DTE']}</div>
+      <div style="color:#e8e8e8;font-size:1.1rem;font-weight:700;">{_best['Strategy']}</div>
+      <div style="color:#7ec8e3;font-size:0.84rem;margin-top:4px;">{_best['Type']}</div>
+      <div style="color:#888;font-size:0.82rem;margin-top:6px;line-height:1.6;">{_best['Rationale']}</div>
+    </div>
+    <div style="text-align:right;min-width:100px;">
+      <div style="color:#555;font-size:0.78rem;">EV SCORE</div>
+      <div style="color:{_score_col};font-size:1.8rem;font-weight:700;">{min(100,_best['Score'])}</div>
+      <div style="color:{_ev_col};font-size:0.82rem;font-weight:600;">EV {'+' if _ev_b>=0 else ''}₹{_ev_b:,.0f}</div>
+      <div style="color:#888;font-size:0.78rem;">POP {_pop_b*100:.1f}% · Kelly {_kelly_b:.1f}%</div>
+    </div>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+        if len(strat_recs) > 1:
+            _alt_cols = st.columns(min(3, len(strat_recs)-1))
+            for _ai, _alt in enumerate(strat_recs[1:4]):
+                _ev_a = _alt.get("ev", 0)
+                _ac   = "#ffb347" if _alt["Score"] >= 60 else "#555"
+                _ev_ac = "#00d084" if _ev_a >= 0 else "#ff3b3b"
+                _alt_cols[_ai].markdown(f"""
+<div style="background:#0d0d0d;border:1px solid #2a2a2a;padding:10px 12px;
+font-family:'IBM Plex Mono',monospace;height:100%;">
+  <div style="color:#555;font-size:0.76rem;">ALT #{_ai+2}</div>
+  <div style="color:#e8e8e8;font-size:0.88rem;font-weight:600;">{_alt['Strategy']}</div>
+  <div style="color:{_ac};font-size:0.80rem;margin-top:3px;">Score {min(100,_alt['Score'])}/100</div>
+  <div style="color:{_ev_ac};font-size:0.78rem;">EV {'+' if _ev_a>=0 else ''}₹{_ev_a:,.0f} · POP {_alt.get('pop',0.5)*100:.0f}%</div>
+  <div style="color:#555;font-size:0.78rem;margin-top:4px;">{_alt['Type']}</div>
+</div>""", unsafe_allow_html=True)
+
+    # ═══════════════════════════════════════════════════════
+    # STEP 4 — TRADE TICKET: EXACT ORDERS TO PLACE
+    # ═══════════════════════════════════════════════════════
+    _section(4, "TRADE TICKET — EXACT ORDERS TO PLACE", "#ff8c00")
+
+    # Initialise _leg_def here so Step 7's stop-loss logic always has it in scope,
+    # even if the strategy name doesn't match any template below.
+    _leg_def = []
+
+    if strat_recs:
+        _best  = strat_recs[0]
+        _sv    = float(step)
+        _strat = _best["Strategy"]
+        _lot_d = CFG["lot_sizes"].get(sym.upper(), CFG["lot_size_fallback"])
+
+        # ── Central leg definition lookup ──────────────────────
+        # Each entry: (action, option_type, strike, qty_multiplier, role_description)
+        # qty_multiplier = 1 normally, 2 for the body of a butterfly
+        _leg_def = []
+
+        if "Near-Expiry Straddle Sell" in _strat or ("Short Straddle" in _strat and "Near" in _strat):
+            _leg_def = [
+                ("SELL", "CE", atm_k,        _bs_c(atm_k),        1, "Sell ATM call — collect full premium"),
+                ("SELL", "PE", atm_k,        _bs_p(atm_k),        1, "Sell ATM put  — collect full premium"),
+            ]
+        elif "Short Straddle" in _strat:
+            _leg_def = [
+                ("SELL", "CE", atm_k,        _bs_c(atm_k),        1, "Sell ATM call — profit if spot stays near ATM"),
+                ("SELL", "PE", atm_k,        _bs_p(atm_k),        1, "Sell ATM put  — profit if spot stays near ATM"),
+            ]
+        elif "Short Strangle" in _strat:
+            _leg_def = [
+                ("SELL", "PE", atm_k - _sv,  _bs_p(atm_k-_sv),   1, f"Sell {atm_k-_sv:.0f} PE — OTM put, collect credit below spot"),
+                ("SELL", "CE", atm_k + _sv,  _bs_c(atm_k+_sv),   1, f"Sell {atm_k+_sv:.0f} CE — OTM call, collect credit above spot"),
+            ]
+        elif "Bull Call Spread" in _strat:
+            _leg_def = [
+                ("BUY",  "CE", atm_k,        _bs_c(atm_k),        1, f"Buy  {atm_k:.0f} CE — long call, profits above breakeven"),
+                ("SELL", "CE", atm_k + _sv,  _bs_c(atm_k+_sv),   1, f"Sell {atm_k+_sv:.0f} CE — caps upside, reduces net cost"),
+            ]
+        elif "Bear Put Spread" in _strat:
+            _leg_def = [
+                ("BUY",  "PE", atm_k,        _bs_p(atm_k),        1, f"Buy  {atm_k:.0f} PE — long put, profits below breakeven"),
+                ("SELL", "PE", atm_k - _sv,  _bs_p(atm_k-_sv),   1, f"Sell {atm_k-_sv:.0f} PE — caps downside gain, reduces cost"),
+            ]
+        elif "Bull Put Spread" in _strat:
+            _leg_def = [
+                ("SELL", "PE", atm_k,        _bs_p(atm_k),        1, f"Sell {atm_k:.0f} PE — short put, collect premium, stay above this"),
+                ("BUY",  "PE", atm_k - _sv,  _bs_p(atm_k-_sv),   1, f"Buy  {atm_k-_sv:.0f} PE — wing protection, max loss capped here"),
+            ]
+        elif "Bear Call Spread" in _strat:
+            _leg_def = [
+                ("SELL", "CE", atm_k,        _bs_c(atm_k),        1, f"Sell {atm_k:.0f} CE — short call, collect premium, stay below this"),
+                ("BUY",  "CE", atm_k + _sv,  _bs_c(atm_k+_sv),   1, f"Buy  {atm_k+_sv:.0f} CE — wing protection, max loss capped here"),
+            ]
+        elif "Iron Condor" in _strat:
+            _leg_def = [
+                ("SELL", "PE", atm_k - _sv,   _bs_p(atm_k-_sv),   1, f"Sell {atm_k-_sv:.0f} PE — short put, profit zone starts here"),
+                ("BUY",  "PE", atm_k - 2*_sv, _bs_p(atm_k-2*_sv), 1, f"Buy  {atm_k-2*_sv:.0f} PE — defines max loss on downside"),
+                ("SELL", "CE", atm_k + _sv,   _bs_c(atm_k+_sv),   1, f"Sell {atm_k+_sv:.0f} CE — short call, profit zone ends here"),
+                ("BUY",  "CE", atm_k + 2*_sv, _bs_c(atm_k+2*_sv), 1, f"Buy  {atm_k+2*_sv:.0f} CE — defines max loss on upside"),
+            ]
+        elif "Iron Butterfly" in _strat:
+            _leg_def = [
+                ("SELL", "CE", atm_k,        _bs_c(atm_k),        1, f"Sell {atm_k:.0f} CE — short ATM call, max profit if spot pins here"),
+                ("SELL", "PE", atm_k,        _bs_p(atm_k),        1, f"Sell {atm_k:.0f} PE — short ATM put, max profit if spot pins here"),
+                ("BUY",  "CE", atm_k + _sv,  _bs_c(atm_k+_sv),   1, f"Buy  {atm_k+_sv:.0f} CE — upper wing, caps upside loss"),
+                ("BUY",  "PE", atm_k - _sv,  _bs_p(atm_k-_sv),   1, f"Buy  {atm_k-_sv:.0f} PE — lower wing, caps downside loss"),
+            ]
+        elif "Long Straddle" in _strat:
+            _leg_def = [
+                ("BUY", "CE", atm_k, _bs_c(atm_k), 1, f"Buy  {atm_k:.0f} CE — profits if spot rallies beyond upper breakeven"),
+                ("BUY", "PE", atm_k, _bs_p(atm_k), 1, f"Buy  {atm_k:.0f} PE — profits if spot falls below lower breakeven"),
+            ]
+        elif "Long Strangle" in _strat:
+            _leg_def = [
+                ("BUY", "CE", atm_k + _sv, _bs_c(atm_k+_sv), 1, f"Buy  {atm_k+_sv:.0f} CE — OTM call, needs strong rally to profit"),
+                ("BUY", "PE", atm_k - _sv, _bs_p(atm_k-_sv), 1, f"Buy  {atm_k-_sv:.0f} PE — OTM put, needs strong sell-off to profit"),
+            ]
+        elif "Long ATM Call" in _strat or ("Long OTM Call" in _strat):
+            _k_c = atm_k + _sv if "OTM" in _strat else atm_k
+            _leg_def = [("BUY", "CE", _k_c, _bs_c(_k_c), 1, f"Buy  {_k_c:.0f} CE — directional long, profits above breakeven")]
+        elif "Long ATM Put" in _strat:
+            _leg_def = [("BUY", "PE", atm_k, _bs_p(atm_k), 1, f"Buy  {atm_k:.0f} PE — directional short, profits below breakeven")]
+        elif "Short Put" in _strat:
+            _leg_def = [("SELL", "PE", atm_k - _sv, _bs_p(atm_k-_sv), 1, f"Sell {atm_k-_sv:.0f} PE — naked short put, keep premium if spot stays above")]
+        elif "Short Call" in _strat:
+            _leg_def = [("SELL", "CE", atm_k + _sv, _bs_c(atm_k+_sv), 1, f"Sell {atm_k+_sv:.0f} CE — naked short call, keep premium if spot stays below")]
+        elif "Jade Lizard" in _strat:
+            _leg_def = [
+                ("SELL", "PE", atm_k,        _bs_p(atm_k),        1, f"Sell {atm_k:.0f} PE — short put, bullish anchor"),
+                ("SELL", "CE", atm_k + _sv,  _bs_c(atm_k+_sv),   1, f"Sell {atm_k+_sv:.0f} CE — short call, upside premium"),
+                ("BUY",  "CE", atm_k + 2*_sv,_bs_c(atm_k+2*_sv), 1, f"Buy  {atm_k+2*_sv:.0f} CE — call wing, caps upside loss"),
+            ]
+        elif "Call Ratio Backspread" in _strat:
+            _leg_def = [
+                ("SELL", "CE", atm_k - _sv,  _bs_c(atm_k-_sv),   1, f"Sell 1× {atm_k-_sv:.0f} CE — short lower call (×1 lot), enter for credit"),
+                ("BUY",  "CE", atm_k,        _bs_c(atm_k),        2, f"Buy  2× {atm_k:.0f} CE — long ATM calls (×2 lots), profits from big move up"),
+            ]
+        elif "Calendar" in _strat:
+            # Near month premium is known; back month is unknown without loading that expiry.
+            # Estimate: back month ≈ near month × sqrt(T_far/T_near) from B-S scaling.
+            # For a typical near:far = 10d:35d ratio, scale ≈ sqrt(35/10) ≈ 1.87.
+            # We use sqrt(T_far_est/T_near) with T_far_est = T*3.5 as a rough estimate.
+            _near_prem = _bs_c(atm_k)
+            _far_est   = round(_near_prem * math.sqrt(3.5), 2)  # sqrt(3.5) ≈ far/near T ratio
+            _leg_def = [
+                ("SELL", "CE", atm_k, _near_prem, 1, f"Sell {atm_k:.0f} CE near expiry — sell theta-rich front month"),
+                ("BUY",  "CE", atm_k, _far_est,   1, f"Buy  {atm_k:.0f} CE far expiry  — est. ₹{_far_est:.2f} (√(T_far/T_near) scaling)"),
+            ]
+        elif "Butterfly" in _strat:
+            _leg_def = [
+                ("BUY",  "CE", atm_k - _sv,  _bs_c(atm_k-_sv),  1, f"Buy  {atm_k-_sv:.0f} CE — left wing (lower strike)"),
+                ("SELL", "CE", atm_k,         _bs_c(atm_k),       2, f"Sell 2× {atm_k:.0f} CE — body (×2 lots), short the middle"),
+                ("BUY",  "CE", atm_k + _sv,  _bs_c(atm_k+_sv),  1, f"Buy  {atm_k+_sv:.0f} CE — right wing (upper strike)"),
+            ]
+
+        if _leg_def:
+            # ── Trade Ticket Card ───────────────────────────────
+            _net_cost  = 0.0
+            _ticket_rows = []
+            for _act, _opt, _k, _pr, _qty_m, _desc in _leg_def:
+                _sign        = 1 if _act == "BUY" else -1
+                _net_cost   += _sign * _pr * _qty_m
+                _per_lot     = _pr * _lot_d * _qty_m
+                _ticket_rows.append({
+                    "ORDER":      _act,
+                    "QTY":        f"{_qty_m} lot{'s' if _qty_m>1 else ''} = {_qty_m*_lot_d:,} shares",
+                    "TYPE":       _opt,
+                    "STRIKE":     f"₹{_k:,.0f}",
+                    "EXPIRY":     expiry,
+                    "PREM/SHARE": f"₹{_pr:.2f}",
+                    "TOTAL/LOT":  f"₹{_per_lot:,.0f}",
+                    "ROLE":       _desc,
+                })
+
+            _tdf = pd.DataFrame(_ticket_rows)
+            def _order_style(v):
+                if v == "BUY":  return "background:#0a2200;color:#00d084;font-weight:700;font-size:0.88rem"
+                if v == "SELL": return "background:#220000;color:#ff3b3b;font-weight:700;font-size:0.88rem"
+                return ""
+            def _type_style(v):
+                if v == "CE": return "color:#1e90ff;font-weight:600"
+                if v == "PE": return "color:#ff8c00;font-weight:600"
+                return ""
+            st.dataframe(
+                _tdf.style
+                    .applymap(_order_style, subset=["ORDER"])
+                    .applymap(_type_style,  subset=["TYPE"]),
+                use_container_width=True, hide_index=True
+            )
+
+            # ── Net cost + breakevens ───────────────────────────
+            _cost_lbl = "NET DEBIT — you PAY this upfront" if _net_cost > 0 else "NET CREDIT — you RECEIVE this upfront"
+            _cost_col = "#ff3b3b" if _net_cost > 0 else "#00d084"
+            _net_abs  = abs(_net_cost)
+            _net_lot  = _net_abs * _lot_d
+
+            # ── Breakeven computation — verified against P&L=0 at expiry ──
+            # Rule: BE is the price where total payoff (intrinsic - premium paid + premium received) = 0
+            # For DEBIT strategies:  BE = long_strike ± net_debit
+            # For CREDIT strategies: BE = short_strike ± net_credit  (NOT long_strike)
+            # Short strangle: BEs = short_put_strike - credit  AND  short_call_strike + credit
+            _bes = []
+            if "Long ATM Call" in _strat or "Long OTM Call" in _strat:
+                # Single long call: BE = strike + premium
+                _k0 = _leg_def[0][2]; _pr0 = _leg_def[0][3]
+                _bes = [f"₹{_k0 + _pr0:,.0f}  (strike {_k0:.0f} + premium {_pr0:.2f})"]
+
+            elif "Long ATM Put" in _strat:
+                _k0 = _leg_def[0][2]; _pr0 = _leg_def[0][3]
+                _bes = [f"₹{_k0 - _pr0:,.0f}  (strike {_k0:.0f} − premium {_pr0:.2f})"]
+
+            elif "Bull Call Spread" in _strat or "Bear Put Spread" in _strat:
+                # Debit spreads: BE = long_strike ± net_debit
+                _long_l  = [l for l in _leg_def if l[0]=="BUY"][0]
+                if _long_l[1] == "CE":
+                    _bes = [f"₹{_long_l[2] + _net_abs:,.0f}  (long call {_long_l[2]:.0f} + debit {_net_abs:.2f})"]
+                else:
+                    _bes = [f"₹{_long_l[2] - _net_abs:,.0f}  (long put {_long_l[2]:.0f} − debit {_net_abs:.2f})"]
+
+            elif "Bull Put Spread" in _strat:
+                # Credit spread: BE = short_put_strike - net_credit
+                _short_l = [l for l in _leg_def if l[0]=="SELL" and l[1]=="PE"][0]
+                _bes = [f"₹{_short_l[2] - _net_abs:,.0f}  (short put {_short_l[2]:.0f} − credit {_net_abs:.2f})"]
+
+            elif "Bear Call Spread" in _strat:
+                # Credit spread: BE = short_call_strike + net_credit
+                _short_l = [l for l in _leg_def if l[0]=="SELL" and l[1]=="CE"][0]
+                _bes = [f"₹{_short_l[2] + _net_abs:,.0f}  (short call {_short_l[2]:.0f} + credit {_net_abs:.2f})"]
+
+            elif "Short Straddle" in _strat or "Near-Expiry Straddle" in _strat:
+                # Both shorts at ATM: BEs = ATM ± total_credit
+                _tot_cr = sum(l[3] for l in _leg_def)
+                _bes = [f"₹{atm_k - _tot_cr:,.0f}  (ATM {atm_k:.0f} − credit {_tot_cr:.2f})",
+                        f"₹{atm_k + _tot_cr:,.0f}  (ATM {atm_k:.0f} + credit {_tot_cr:.2f})"]
+
+            elif "Short Strangle" in _strat:
+                # Short put at atm-sv, short call at atm+sv: DIFFERENT strikes
+                _short_pe = [l for l in _leg_def if l[0]=="SELL" and l[1]=="PE"][0]
+                _short_ce = [l for l in _leg_def if l[0]=="SELL" and l[1]=="CE"][0]
+                _tot_cr = _short_pe[3] + _short_ce[3]
+                _bes = [f"₹{_short_pe[2] - _tot_cr:,.0f}  (put strike {_short_pe[2]:.0f} − credit {_tot_cr:.2f})",
+                        f"₹{_short_ce[2] + _tot_cr:,.0f}  (call strike {_short_ce[2]:.0f} + credit {_tot_cr:.2f})"]
+
+            elif "Long Straddle" in _strat:
+                _bes = [f"₹{atm_k - _net_abs:,.0f}  (ATM {atm_k:.0f} − debit {_net_abs:.2f})",
+                        f"₹{atm_k + _net_abs:,.0f}  (ATM {atm_k:.0f} + debit {_net_abs:.2f})"]
+
+            elif "Long Strangle" in _strat:
+                _long_pe = [l for l in _leg_def if l[1]=="PE"][0]
+                _long_ce = [l for l in _leg_def if l[1]=="CE"][0]
+                _bes = [f"₹{_long_pe[2] - _net_abs:,.0f}  (put strike {_long_pe[2]:.0f} − total debit {_net_abs:.2f})",
+                        f"₹{_long_ce[2] + _net_abs:,.0f}  (call strike {_long_ce[2]:.0f} + total debit {_net_abs:.2f})"]
+
+            elif "Iron Condor" in _strat or "Iron Butterfly" in _strat:
+                _sells_ce = [l for l in _leg_def if l[0]=="SELL" and l[1]=="CE"]
+                _sells_pe = [l for l in _leg_def if l[0]=="SELL" and l[1]=="PE"]
+                if _sells_ce and _sells_pe:
+                    _net_cr = sum(l[3] for l in _leg_def if l[0]=="SELL") - sum(l[3] for l in _leg_def if l[0]=="BUY")
+                    _bes = [f"₹{_sells_pe[0][2] - _net_cr:,.0f}  (short put {_sells_pe[0][2]:.0f} − credit {_net_cr:.2f})",
+                            f"₹{_sells_ce[0][2] + _net_cr:,.0f}  (short call {_sells_ce[0][2]:.0f} + credit {_net_cr:.2f})"]
+
+            elif "Calendar" in _strat:
+                # Cannot compute BE without knowing back-month price at near expiry
+                _bes = ["Cannot compute at entry — depends on back-month IV at near-expiry date"]
+
+            st.markdown(f"""
+<div style="background:#0d0d0d;border:1px solid #ff8c00;padding:14px 20px;margin-top:6px;
+font-family:'IBM Plex Mono',monospace;">
+  <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:12px;">
+    <div>
+      <div style="color:#555;font-size:0.78rem;letter-spacing:.08em;">NET COST / CREDIT</div>
+      <div style="color:{_cost_col};font-size:1.0rem;font-weight:700;">
+        {'−' if _net_cost > 0 else '+'}₹{_net_abs:.2f} per share</div>
+      <div style="color:{_cost_col};font-size:0.88rem;">
+        {'−' if _net_cost > 0 else '+'}₹{_net_lot:,.0f} per lot</div>
+      <div style="color:#888;font-size:0.80rem;margin-top:3px;">{_cost_lbl}</div>
+    </div>
+    <div>
+      <div style="color:#555;font-size:0.78rem;letter-spacing:.08em;">LOT SIZE</div>
+      <div style="color:#e8e8e8;font-size:1.0rem;font-weight:700;">{_lot_d} shares</div>
+      <div style="color:#888;font-size:0.80rem;">{sym} F&O lot size</div>
+    </div>
+    <div>
+      <div style="color:#555;font-size:0.78rem;letter-spacing:.08em;">EXPIRY</div>
+      <div style="color:#ff8c00;font-size:1.0rem;font-weight:700;">{expiry}</div>
+      <div style="color:#888;font-size:0.80rem;">DTE: {dte} trading days</div>
+    </div>
+  </div>
+  {'<div style="border-top:1px solid #2a2a2a;padding-top:10px;"><div style="color:#555;font-size:0.78rem;letter-spacing:.08em;margin-bottom:6px;">BREAKEVEN PRICES AT EXPIRY</div>' + "".join([f'<div style="color:#ffb347;font-size:0.88rem;margin:2px 0;">📍 {be}</div>' for be in _bes]) + '</div>' if _bes else ''}
+</div>""", unsafe_allow_html=True)
+
+            # ── P&L at key levels table ─────────────────────────
+            st.caption("P&L at expiry across key price levels (1 lot, theoretical):")
+            _exp_move_pct = oi_d.get("exp_move_pct", atm_iv*100*math.sqrt(T)*math.sqrt(2/math.pi)) if oi_d else 5.0
+            _key_prices = sorted(set([
+                round(spot * (1 - _exp_move_pct/100), 0),
+                round(spot * (1 - _exp_move_pct/200), 0),
+                oi_d.get("put_wall", spot - 2*_sv) if oi_d else spot - 2*_sv,
+                atm_k - _sv,
+                atm_k,
+                atm_k + _sv,
+                oi_d.get("call_wall", spot + 2*_sv) if oi_d else spot + 2*_sv,
+                round(spot * (1 + _exp_move_pct/200), 0),
+                round(spot * (1 + _exp_move_pct/100), 0),
+            ]))
+            _pnl_rows = []
+            for _px in _key_prices:
+                _total_pnl = 0.0
+                for _act, _opt, _k, _pr, _qty_m, _ in _leg_def:
+                    _intr = max(_px - _k, 0) if _opt == "CE" else max(_k - _px, 0)
+                    _d    = 1 if _act == "BUY" else -1
+                    _total_pnl += _d * (_intr - _pr) * _qty_m * _lot_d
+                _pnl_rows.append({
+                    "Price at Expiry": f"₹{_px:,.0f}",
+                    # Format: +₹NNN for profit, -₹NNN for loss (minus before ₹ for CSS detection)
+                    "P&L (₹)": f"+₹{_total_pnl:,.0f}" if _total_pnl >= 0 else f"-₹{abs(_total_pnl):,.0f}",
+                    "vs Spot":  f"{'↑' if _px > spot else '↓' if _px < spot else '—'} {abs(_px-spot):.0f}pts",
+                })
+            _pnl_df = pd.DataFrame(_pnl_rows)
+            def _pnl_style(v):
+                if isinstance(v, str) and v.startswith("+₹"): return "color:#00d084;font-weight:600"
+                if isinstance(v, str) and v.startswith("-₹") or (isinstance(v, str) and "−" in v): return "color:#ff3b3b;font-weight:600"
+                return ""
+            st.dataframe(_pnl_df.style.applymap(_pnl_style, subset=["P&L (₹)"]),
+                         use_container_width=True, hide_index=True)
+
+        else:
+            st.info(f"Exact leg breakdown not yet templated for **{_strat}**. "
+                    "Use the Payoff Builder tab to construct it manually — "
+                    f"legs are: {_best['Legs']}")
+
+
+    # ═══════════════════════════════════════════════════════
+    # STEP 5 — KEY LEVELS: WHERE TO ENTER, STOP, TARGET
+    # ═══════════════════════════════════════════════════════
+    _section(5, "KEY PRICE LEVELS", "#ffb347")
+
+    _call_wall = oi_d.get("call_wall", spot+step*3) if oi_d else spot+step*3
+    _put_wall  = oi_d.get("put_wall",  spot-step*3) if oi_d else spot-step*3
+    _exp_move  = oi_d.get("exp_move_pct", atm_iv*100*math.sqrt(T)*math.sqrt(2/math.pi)) if oi_d else 0
+    _exp_r_abs = spot * _exp_move / 100
+    _atr       = bias_res.get("atr", _atr_seed(spot))
+
+    _l1, _l2, _l3 = st.columns(3)
+    with _l1:
+        st.markdown(f"""
+<div style="background:#0d0d0d;border:1px solid #2a2a2a;padding:12px 16px;
+font-family:'IBM Plex Mono',monospace;border-top:3px solid #1e90ff;">
+  <div style="color:#1e90ff;font-size:0.80rem;font-weight:600;letter-spacing:.08em;
+  margin-bottom:8px;">SUPPORT LEVELS</div>
+  <div style="color:#e8e8e8;font-size:0.86rem;line-height:2.0;">
+    Put Wall:  <b style="color:#00d084;">₹{_put_wall:,.0f}</b><br>
+    Max Pain:  <b style="color:#9c27b0;">₹{_mp:,.0f}</b><br>
+    EMA 20:    <b style="color:#1e90ff;">₹{bias_res.get('e20', spot):,.2f}</b><br>
+    −1σ Move:  <b style="color:#888;">₹{spot - _exp_r_abs:,.0f}</b><br>
+    −1 ATR:    <b style="color:#555;">₹{spot - _atr:,.0f}</b>
+  </div>
+</div>""", unsafe_allow_html=True)
+    with _l2:
+        st.markdown(f"""
+<div style="background:#0d0d0d;border:1px solid #2a2a2a;padding:12px 16px;
+font-family:'IBM Plex Mono',monospace;border-top:3px solid #ff8c00;">
+  <div style="color:#ff8c00;font-size:0.80rem;font-weight:600;letter-spacing:.08em;
+  margin-bottom:8px;">CURRENT SPOT</div>
+  <div style="color:#ff8c00;font-size:1.3rem;font-weight:700;margin-bottom:6px;">
+  ₹{spot:,.2f}</div>
+  <div style="color:#888;font-size:0.82rem;line-height:1.9;">
+    ATM Strike: ₹{atm_k:,.0f}<br>
+    Bias: {bias} ({bias_score:+d})<br>
+    ATM IV: {atm_iv*100:.1f}%<br>
+    DTE: {dte} trading days
+  </div>
+</div>""", unsafe_allow_html=True)
+    with _l3:
+        st.markdown(f"""
+<div style="background:#0d0d0d;border:1px solid #2a2a2a;padding:12px 16px;
+font-family:'IBM Plex Mono',monospace;border-top:3px solid #ff3b3b;">
+  <div style="color:#ff3b3b;font-size:0.80rem;font-weight:600;letter-spacing:.08em;
+  margin-bottom:8px;">RESISTANCE LEVELS</div>
+  <div style="color:#e8e8e8;font-size:0.86rem;line-height:2.0;">
+    Call Wall:  <b style="color:#ff3b3b;">₹{_call_wall:,.0f}</b><br>
+    Max Pain:   <b style="color:#9c27b0;">₹{_mp:,.0f}</b><br>
+    EMA 20:     <b style="color:#1e90ff;">₹{bias_res.get('e20', spot):,.2f}</b><br>
+    +1σ Move:   <b style="color:#888;">₹{spot + _exp_r_abs:,.0f}</b><br>
+    +1 ATR:     <b style="color:#555;">₹{spot + _atr:,.0f}</b>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+    # ═══════════════════════════════════════════════════════
+    # STEP 6 — POSITION SIZING
+    # ═══════════════════════════════════════════════════════
+    _section(6, "POSITION SIZING — HOW MANY LOTS?", "#9c27b0")
+    st.caption("Capital from sidebar. Kelly fraction computed by EV engine from POP and max risk.")
+
+    _account_size   = st.session_state.opt_capital
+    _risk_pct_cfg   = CFG["kelly_cap_pct"] * CFG["kelly_fraction"] * 100
+
+    _ps1, _ps2 = st.columns(2)
+    with _ps1:
+        _account_override = st.number_input(
+            "Capital (₹)", min_value=10_000, max_value=100_000_000,
+            value=_account_size, step=10_000, key="ps_account",
+            help="Defaults to sidebar capital.")
+        _risk_pct = st.slider(
+            "Max risk per trade (%)", min_value=0.5,
+            max_value=float(CFG["kelly_cap_pct"] * 100),
+            value=round(_risk_pct_cfg, 1), step=0.5, key="ps_risk_pct")
+    with _ps2:
+        _max_risk_rs   = _account_override * _risk_pct / 100
+        _lot_sz_ps     = CFG["lot_sizes"].get(sym.upper(), CFG["lot_size_fallback"])
+        _is_unlimited_risk = False
+        if strat_recs:
+            _mr     = strat_recs[0]["Max Risk"]
+            _mr_str = str(_mr).strip()
+            _is_unlimited_risk = any(w in _mr_str for w in ["Unlimited","unlimited","Large","large"])
+            try:
+                _risk_per_share = float(_mr_str.replace("₹","").replace(",","").strip())
+                _risk_per_lot   = _risk_per_share * _lot_sz_ps
+            except Exception:
+                _risk_per_lot = 0
+            _safe_lots = max(1, int(_max_risk_rs / _risk_per_lot)) if _risk_per_lot > 0 else 1
+            # EV-based Kelly size
+            _ev_kelly_raw = strat_recs[0].get("kelly_raw", 0)
+            _ev_kelly_cap = max(0.0, min(CFG["kelly_cap_pct"], _ev_kelly_raw))
+            _ev_kelly_f   = _ev_kelly_cap * CFG["kelly_fraction"]
+            _ev_pos_size  = round(_ev_kelly_f * _account_override)
+        else:
+            _safe_lots = 1; _risk_per_lot = 0
+            _ev_kelly_raw = 0; _ev_kelly_f = 0; _ev_pos_size = 0
+
+        if _is_unlimited_risk:
+            st.warning("⚠️ Strategy has **unlimited risk**. Use 1 lot max with a hard stop-loss.")
+
+        st.markdown(f"""
+<div style="background:#0d0d0d;border:1px solid {'#ff3b3b' if _is_unlimited_risk else '#2a2a2a'};
+padding:14px 18px;font-family:'IBM Plex Mono',monospace;">
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+    <div>
+      <div style="color:#555;font-size:0.78rem;">RISK BUDGET</div>
+      <div style="color:#ff8c00;font-size:1.0rem;font-weight:700;">₹{_max_risk_rs:,.0f}</div>
+      <div style="color:#888;font-size:0.80rem;">{_risk_pct:.1f}% of ₹{_account_override:,.0f}</div>
+    </div>
+    <div>
+      <div style="color:#555;font-size:0.78rem;">SAFE LOTS (risk-based)</div>
+      <div style="color:{'#ff3b3b' if _is_unlimited_risk else '#00d084'};font-size:1.0rem;font-weight:700;">
+        {'⚠ 1 lot MAX' if _is_unlimited_risk else f"{_safe_lots} lot{'s' if _safe_lots!=1 else ''}"}</div>
+      <div style="color:#888;font-size:0.80rem;">= {_safe_lots * _lot_sz_ps:,} shares</div>
+    </div>
+    <div>
+      <div style="color:#555;font-size:0.78rem;">KELLY POSITION SIZE</div>
+      <div style="color:#9c27b0;font-size:1.0rem;font-weight:700;">
+        {'₹' + f'{_ev_pos_size:,.0f}' if _ev_pos_size > 0 else '—'}</div>
+      <div style="color:#888;font-size:0.80rem;">{_ev_kelly_f*100:.1f}% Kelly (raw {_ev_kelly_raw*100:.1f}% → cap → ×{CFG['kelly_fraction']:.0%})</div>
+    </div>
+    <div>
+      <div style="color:#555;font-size:0.78rem;">RISK / REWARD PER LOT</div>
+      <div style="color:#e8e8e8;font-size:0.96rem;">
+        {f'₹{_risk_per_lot:,.0f}' if _risk_per_lot > 0 and not _is_unlimited_risk else (strat_recs[0]['Max Risk'] if strat_recs else '—')}
+        &nbsp;/&nbsp; {strat_recs[0]['Max Reward'] if strat_recs else '—'}</div>
+    </div>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+    # ═══════════════════════════════════════════════════════
+    # STEP 7 — ENTRY / EXIT / STOP RULES
+    # ═══════════════════════════════════════════════════════
+    _section(7, "ENTRY, EXIT AND STOP-LOSS RULES", "#ff8c00")
+
+    # Dynamic stop levels based on ATR, gamma flip, and strategy type
+    _is_credit   = strat_recs and "Credit" in strat_recs[0]["Type"] if strat_recs else False
+    _is_neutral  = strat_recs and "Non-Directional" in strat_recs[0]["Type"] if strat_recs else True
+
+    # Entry timing: bias + vol confirmation
+    _entry_conds = []
+    if bias_score >= 12:
+        _entry_conds.append(f"• Bullish bias confirmed — enter on any dip toward EMA20 (₹{bias_res.get('e20',spot):,.0f}) or retrace to ATM")
+    elif bias_score <= -12:
+        _entry_conds.append(f"• Bearish bias confirmed — enter on any bounce toward EMA20 (₹{bias_res.get('e20',spot):,.0f}) or retrace to ATM")
+    else:
+        _entry_conds.append("• Neutral bias — enter when spot is within ±0.5 strike of ATM for optimal non-directional entry")
+
+    _entry_conds.append(f"• Confirm entry: ATM IV should be {'stable or declining (good for sellers)' if _is_credit else 'stable or rising (good for buyers)'}")
+    _entry_conds.append("• Best time: first 30–60 min or last 60 min of session (liquidity is highest, spreads are tighter)")
+    _entry_conds.append("• Use LIMIT orders at mid of bid-ask. Never market-order multi-leg strategies.")
+
+    # Stop logic — derive short strikes directly from leg_def if available,
+    # otherwise fall back to OI walls (never brittle string-parse the leg description)
+    if _is_credit:
+        # Find the short strikes directly from leg_def built in Step 4
+        _short_ce_strikes = [l[2] for l in _leg_def if l[0]=="SELL" and l[1]=="CE"] if _leg_def else []
+        _short_pe_strikes = [l[2] for l in _leg_def if l[0]=="SELL" and l[1]=="PE"] if _leg_def else []
+        if _short_ce_strikes and _short_pe_strikes:
+            _stop_spot_desc = f"if spot breaches ₹{min(_short_pe_strikes):,.0f} (short put) or ₹{max(_short_ce_strikes):,.0f} (short call), begin closing immediately"
+        elif _short_ce_strikes:
+            _stop_spot_desc = f"if spot rallies above ₹{max(_short_ce_strikes):,.0f} (short call strike), begin closing"
+        elif _short_pe_strikes:
+            _stop_spot_desc = f"if spot falls below ₹{min(_short_pe_strikes):,.0f} (short put strike), begin closing"
+        else:
+            _stop_spot_desc = f"if spot breaks above call wall ₹{_call_wall:,.0f} or below put wall ₹{_put_wall:,.0f}, begin closing"
+        _stop_rule   = "• Stop: close if unrealised loss reaches 1.5× to 2× the credit received per lot"
+        _target_rule = "• Target: exit at 50% of maximum profit (50% of credit). Do not hold to expiry — gamma risk increases sharply in final 5 DTE"
+        _stop_spot   = f"• Spot stop: {_stop_spot_desc}"
+    else:
+        _stop_rule   = "• Stop: if the position loses 40–50% of premium paid, exit. Do not average down."
+        _target_rule = "• Target: exit when the position gains 80–100% of premium paid, or when your directional target is reached"
+        _stop_spot   = f"• Spot stop: if spot breaks below EMA50 (₹{bias_res.get('e50',spot):,.0f}) for longs, or above EMA50 for shorts — exit"
+
+    _adjust_rule  = f"• Adjustment trigger: if spot moves more than ±1 ATR (₹{_atr:.0f}) against you, re-evaluate the position"
+
+    for _ec in _entry_conds:
+        st.markdown(f"<div style='color:#e8e8e8;font-size:0.86rem;font-family:IBM Plex Mono,monospace;"
+                    f"padding:3px 0;border-bottom:1px solid #111;'>{_ec}</div>", unsafe_allow_html=True)
+    st.markdown(f"""
+<div style="margin-top:10px;padding:10px 14px;border:1px solid #2a2a2a;background:#0d0d0d;
+font-family:'IBM Plex Mono',monospace;font-size:0.84rem;line-height:2.0;color:#e8e8e8;">
+  <span style="color:#ff3b3b;font-weight:600;">STOP LOSS:</span> {_stop_rule}<br>
+  <span style="color:#00d084;font-weight:600;">TARGET:</span>    {_target_rule}<br>
+  <span style="color:#ffb347;font-weight:600;">SPOT STOP:</span> {_stop_spot}<br>
+  <span style="color:#9c27b0;font-weight:600;">ADJUST:</span>    {_adjust_rule}
+</div>""", unsafe_allow_html=True)
+
+    # ═══════════════════════════════════════════════════════
+    # STEP 8 — WHAT TO WATCH AFTER ENTRY
+    # ═══════════════════════════════════════════════════════
+    _section(8, "WHAT TO MONITOR AFTER ENTRY", "#1e90ff")
+
+    _gex_regime_short = "POSITIVE (range-bound)" if (oi_d and oi_d.get("net_gex",0) >= 0) else "NEGATIVE (trending)"
+
+    st.markdown(f"""
+<div style="background:#0d0d0d;border:1px solid #2a2a2a;padding:14px 18px;
+font-family:'IBM Plex Mono',monospace;font-size:0.84rem;line-height:2.2;color:#e8e8e8;">
+
+  <span style="color:#ffb347;font-weight:600;">IV CHANGE:</span>
+  If IV spikes sharply after entry, {'your sold premium becomes more expensive to buy back — consider closing early if IV rises >20% from entry' if _is_credit else 'your bought options gain value — consider booking partial profits on the IV spike'}.<br>
+
+  <span style="color:#ffb347;font-weight:600;">SPOT vs KEY LEVELS:</span>
+  Watch ₹{_put_wall:,.0f} (Put Wall / support) and ₹{_call_wall:,.0f} (Call Wall / resistance).
+  A break of either wall with volume = trend continuation. A rejection = reversal.<br>
+
+  <span style="color:#ffb347;font-weight:600;">GAMMA FLIP:</span>
+  Current GEX regime is {_gex_regime_short}.
+  If spot crosses Gamma Flip ₹{oi_d.get('gamma_flip', spot):,.0f}, dealer hedging flips direction — vol can expand rapidly.
+  {'Reduce short-gamma exposure before this level.' if _is_credit else 'This level can accelerate your directional move.'}<br>
+
+  <span style="color:#ffb347;font-weight:600;">DTE COUNTDOWN:</span>
+  At DTE ≤ 5, theta decay accelerates dramatically.
+  {'For sellers: theta is working strongly for you — but gamma risk spikes. Consider taking profit early.' if _is_credit else 'For buyers: your options are losing value fastest now. If the move has not happened, exit.'}.<br>
+
+  <span style="color:#ffb347;font-weight:600;">PCR SHIFT:</span>
+  If PCR drops sharply (from >1.2 to <0.8), institutions are unwinding put protection — bullish signal.
+  If PCR spikes sharply, fear is rising — bearish signal. Reload the engine to check.<br>
+
+  <span style="color:#ffb347;font-weight:600;">MAX PAIN DRIFT:</span>
+  Max pain currently ₹{_mp:,.0f}. As expiry approaches, spot tends to drift toward this level.
+  {'If spot is far above max pain and you are short, risk increases.' if spot > _mp + step else
+   'If spot is far below max pain and you are long, upward pull is likely.' if spot < _mp - step else
+   'Spot is near max pain — pinning risk is elevated.'}
+
+</div>""", unsafe_allow_html=True)
+
+    # ═══════════════════════════════════════════════════════
+    # STEP 9 — TRADE SUMMARY CARD (printable)
+    # ═══════════════════════════════════════════════════════
+    _section(9, "TRADE SUMMARY CARD", "#ff8c00")
+    st.caption("Snapshot of the full plan. Reload after market moves to refresh all levels.")
+
+    _best_name   = strat_recs[0]["Strategy"]  if strat_recs else "—"
+    _best_legs   = strat_recs[0]["Legs"]      if strat_recs else "—"
+    _best_risk   = strat_recs[0]["Max Risk"]  if strat_recs else "—"
+    _best_reward = strat_recs[0]["Max Reward"] if strat_recs else "—"
+    _best_dte    = strat_recs[0]["Ideal DTE"] if strat_recs else "—"
+    _best_score  = strat_recs[0]["Score"]     if strat_recs else 0
+    _best_ev     = strat_recs[0].get("ev", 0)     if strat_recs else 0
+    _best_pop    = strat_recs[0].get("pop", 0.5)  if strat_recs else 0.5
+    _best_kelly  = strat_recs[0].get("kelly", 0)  if strat_recs else 0
+
+    st.markdown(f"""
+<div style="background:#0d0d0d;border:2px solid #ff8c00;padding:20px 24px;
+font-family:'IBM Plex Mono',monospace;margin-top:8px;">
+  <div style="color:#ff8c00;font-size:0.78rem;letter-spacing:.15em;font-weight:700;
+  border-bottom:1px solid #ff8c00;padding-bottom:8px;margin-bottom:14px;">
+    ⚡ MONARCH TRADE BRIEF — {sym} — {expiry}
+  </div>
+  <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:14px;">
+    <div>
+      <div style="color:#555;font-size:0.76rem;">STRATEGY</div>
+      <div style="color:#e8e8e8;font-size:0.92rem;font-weight:700;">{_best_name}</div>
+    </div>
+    <div>
+      <div style="color:#555;font-size:0.76rem;">DIRECTION</div>
+      <div style="color:{bc};font-size:0.92rem;font-weight:700;">{bias} ({bias_score:+d})</div>
+    </div>
+    <div>
+      <div style="color:#555;font-size:0.76rem;">VOL REGIME</div>
+      <div style="color:{v_col};font-size:0.92rem;font-weight:700;">{v_lbl}  IVR {ivr:.0f}</div>
+    </div>
+    <div>
+      <div style="color:#555;font-size:0.76rem;">SPOT / ATM</div>
+      <div style="color:#e8e8e8;font-size:0.92rem;">₹{spot:,.0f}  /  ₹{atm_k:,.0f}</div>
+    </div>
+    <div>
+      <div style="color:#555;font-size:0.76rem;">SUPPORT</div>
+      <div style="color:#00d084;font-size:0.92rem;">₹{_put_wall:,.0f}  (put wall)</div>
+    </div>
+    <div>
+      <div style="color:#555;font-size:0.76rem;">RESISTANCE</div>
+      <div style="color:#ff3b3b;font-size:0.92rem;">₹{_call_wall:,.0f}  (call wall)</div>
+    </div>
+  </div>
+  <div style="color:#7ec8e3;font-size:0.84rem;margin-bottom:10px;">
+    LEGS: {_best_legs}
+  </div>
+  <div style="display:flex;gap:24px;flex-wrap:wrap;font-size:0.82rem;">
+    <span style="color:#ff3b3b;">MAX RISK: {_best_risk}</span>
+    <span style="color:#00d084;">MAX REWARD: {_best_reward}</span>
+    <span style="color:#ffb347;">IDEAL DTE: {_best_dte}</span>
+    <span style="color:#00d084;">EV: {'+' if _best_ev>=0 else ''}₹{_best_ev:,.0f}</span>
+    <span style="color:#7ec8e3;">POP: {_best_pop*100:.1f}%</span>
+    <span style="color:#9c27b0;">KELLY: {_best_kelly*100:.1f}%</span>
+    <span style="color:#888;">P(↑): {prob_score['prob_up']*100:.1f}%  P(↓): {prob_score['prob_down']*100:.1f}%</span>
+    <span style="color:#555;">Γ FLIP: ₹{oi_d.get('gamma_flip', spot):,.0f}</span>
+    <span style="color:#555;">MAX PAIN: ₹{_mp:,.0f}</span>
+  </div>
+  <div style="margin-top:12px;color:#ff3b3b;font-size:0.82rem;line-height:1.7;">
+    ⚠ This is a decision-support engine. Always verify premiums with live bid/ask before placing.
+    Past signals do not guarantee future results. Use defined-risk structures until consistently profitable.
+  </div>
+</div>""", unsafe_allow_html=True)
+
+# ══════════════════════════════════════════════════════════════
+# TAB 9 — TERM STRUCTURE
+# ══════════════════════════════════════════════════════════════
+with t_ts:
+    st.markdown("### 📅 Multi-Expiry Term Structure")
+
+    _me = st.session_state.opt_multi_expiry
+
+    if not st.session_state.opt_multi_loaded or not _me:
+        st.info("Use **📅 LOAD TERM STRUCTURE** in the sidebar to fetch multiple expiries.")
+        st.caption("First load single-expiry intel (⚡ LOAD OPTIONS INTEL), then use the Term Structure "
+                   "loader to fetch 2–5 expiries simultaneously for cross-tenor analysis.")
+    else:
+        _spot_ts  = st.session_state.opt_spot
+        _hv_ts    = st.session_state.opt_hv20
+        _sym_ts   = st.session_state.opt_symbol
+        _step_ts  = st.session_state.opt_step
+        _r_ts     = st.session_state.get("opt_rfr", 0.065)
+        _q_ts     = st.session_state.opt_div_yield.get(_sym_ts.upper(), 0.0)
+
+        # ── Metrics Row ─────────────────────────────────────────
+        _mcols = st.columns(len(_me))
+        _colors_ts = ["#ff8c00","#1e90ff","#00d084","#9c27b0","#ff3b3b"]
+        for _ci, _ed in enumerate(_me):
+            _cc = _colors_ts[_ci % len(_colors_ts)]
+            _mcols[_ci].markdown(f"""
+<div style="background:#0d0d0d;border:1px solid #2a2a2a;border-top:3px solid {_cc};
+padding:10px 12px;font-family:'IBM Plex Mono',monospace;">
+  <div style="color:#555;font-size:0.78rem;letter-spacing:.08em;">{_ed['expiry']}</div>
+  <div style="color:{_cc};font-size:1.1rem;font-weight:700;">{_ed['atm_iv_pct']:.1f}%</div>
+  <div style="color:#888;font-size:0.80rem;">DTE {_ed['dte']}  ·  PCR {_ed['pcr']:.2f}</div>
+  <div style="color:#e8e8e8;font-size:0.80rem;">Straddle ₹{_ed['straddle']:.0f}  ±{_ed['exp_move_pct']:.1f}%</div>
+  <div style="color:#555;font-size:0.78rem;">FwdVol {_ed.get('fwd_vol_pct',_ed['atm_iv_pct']):.1f}%</div>
+</div>""", unsafe_allow_html=True)
+
+        st.divider()
+
+        # ── Chart 1: IV Term Structure Curve ────────────────────
+        _ts_dtes  = [d["dte"]         for d in _me]
+        _ts_ivs   = [d["atm_iv_pct"]  for d in _me]
+        _ts_fvs   = [d.get("fwd_vol_pct", d["atm_iv_pct"]) for d in _me]
+        _ts_exps  = [d["expiry"]       for d in _me]
+
+        fig_ts = go.Figure()
+        fig_ts.add_trace(go.Scatter(
+            x=_ts_dtes, y=_ts_ivs,
+            mode="lines+markers+text",
+            name="ATM IV",
+            line=dict(color="#ff8c00", width=2.5),
+            marker=dict(size=9, color="#ff8c00"),
+            text=[f"{v:.1f}%" for v in _ts_ivs],
+            textposition="top center",
+            textfont=dict(size=9, color="#ff8c00"),
+        ))
+        fig_ts.add_trace(go.Scatter(
+            x=_ts_dtes, y=_ts_fvs,
+            mode="lines+markers",
+            name="Forward Vol (between tenors)",
+            line=dict(color="#1e90ff", width=1.5, dash="dash"),
+            marker=dict(size=7, color="#1e90ff", symbol="diamond"),
+        ))
+        if _hv_ts:
+            fig_ts.add_hline(
+                y=_hv_ts * 100,
+                line=dict(color="#00d084", dash="dot", width=1.5),
+                annotation_text=f"HV20 {_hv_ts*100:.1f}%",
+                annotation_font=dict(color="#00d084", size=9)
+            )
+        fig_ts.update_layout(
+            title="IV Term Structure — ATM Implied Vol by Expiry",
+            height=320, plot_bgcolor="#000", paper_bgcolor="#000",
+            font=dict(color="#e8e8e8", family="IBM Plex Mono", size=9),
+            xaxis=dict(title="DTE (trading days)", gridcolor="#111"),
+            yaxis=dict(title="IV %", gridcolor="#111"),
+            legend=dict(orientation="h", y=1.12),
+            margin=dict(t=50, b=10),
+        )
+        st.plotly_chart(fig_ts, use_container_width=True)
+
+        # ── Chart 2: IV Term Structure Shape Annotation ─────────
+        _shape_analysis = ""
+        if len(_me) >= 2:
+            _slope = _me[-1]["atm_iv_pct"] - _me[0]["atm_iv_pct"]
+            if _slope > 1.5:
+                _shape_c = "#00d084"
+                _shape_analysis = (f"CONTANGO (+{_slope:.1f}pp) — Far-month IV > near-month IV. "
+                                   "Normal structure. Selling near-term and buying back-month is adverse carry. "
+                                   "Calendar spread less attractive.")
+            elif _slope < -1.5:
+                _shape_c = "#ff3b3b"
+                _shape_analysis = (f"BACKWARDATION ({_slope:.1f}pp) — Near-month IV > far-month IV. "
+                                   "Inverted structure — often around events (earnings, budget, RBI). "
+                                   "Calendar spread ATTRACTIVE: sell expensive near-term, buy cheap back-month.")
+            else:
+                _shape_c = "#ffb347"
+                _shape_analysis = (f"FLAT ({_slope:+.1f}pp) — Term structure near flat. "
+                                   "No strong carry edge in either direction. Use straddles or condors.")
+            st.markdown(f"""
+<div style="border-left:3px solid {_shape_c};padding:8px 14px;
+font-family:'IBM Plex Mono',monospace;font-size:0.86rem;color:{_shape_c};margin:4px 0 12px;">
+  TERM STRUCTURE: {_shape_analysis}
+</div>""", unsafe_allow_html=True)
+
+        # ── Chart 3: Forward Volatility Table ───────────────────
+        st.divider()
+        st.markdown("#### Forward Volatility Between Tenors")
+        st.caption("σ_fwd(T₁→T₂) = √[(σ₂²·T₂ − σ₁²·T₁) / (T₂ − T₁)]  —  the vol the market implies for the period BETWEEN two expiries.")
+
+        _fwd_rows = []
+        for _i in range(1, len(_me)):
+            _prev, _curr = _me[_i-1], _me[_i]
+            _fv = _curr.get("fwd_vol_pct", _curr["atm_iv_pct"])
+            # Carry = forward_vol - far_spot_vol
+            # carry > 0: forward vol > far spot vol → market prices the FORWARD period richer
+            #            than the far tenor's overall vol → far option is CHEAP → BUY far (calendar)
+            # carry < 0: forward vol < far spot vol → far option is EXPENSIVE → avoid/sell far
+            # The original code had this BACKWARDS ("FWD RICH" mapped to "sell far").
+            _carry = _fv - _curr["atm_iv_pct"]
+            _fwd_rows.append({
+                "Period":      f"{_prev['expiry']}  →  {_curr['expiry']}",
+                "From DTE":    _prev["dte"],
+                "To DTE":      _curr["dte"],
+                "Near IV%":    f"{_prev['atm_iv_pct']:.2f}%",
+                "Far IV%":     f"{_curr['atm_iv_pct']:.2f}%",
+                "Forward Vol%":f"{_fv:.2f}%",
+                "Carry (pp)":  f"{_carry:+.2f}",
+                # carry>0 → fwd>far → far is cheap → BUY far = calendar favoured
+                # carry<0 → fwd<far → far is expensive → avoid calendar / sell far
+                "Signal":      ("BUY FAR — calendar favoured (fwd > far spot)" if _carry > 1.0
+                                else "SELL FAR — reverse calendar (fwd < far spot)" if _carry < -1.0
+                                else "NEUTRAL — no clear edge"),
+            })
+        if _fwd_rows:
+            st.dataframe(pd.DataFrame(_fwd_rows), use_container_width=True, hide_index=True)
+
+        # ── Chart 4: Calendar Spread Opportunities ──────────────
+        st.divider()
+        st.markdown("#### Calendar Spread Opportunities")
+        st.caption("For each adjacent pair of expiries — theoretical debit, theta advantage, and entry condition.")
+
+        _cal_rows = []
+        for _i in range(1, len(_me)):
+            _near  = _me[_i-1]
+            _far   = _me[_i]
+            _T_n   = _near["T"]
+            _T_f   = _far["T"]
+            _iv_n  = _near["atm_iv"]
+            _iv_f  = _far["atm_iv"]
+            _atm_k_ts = atm_strike(_spot_ts, _step_ts)
+
+            # BS price of near and far ATM call
+            _p_near = bs_price(_spot_ts, _atm_k_ts, _T_n, _r_ts, _iv_n, "call", _q_ts)
+            _p_far  = bs_price(_spot_ts, _atm_k_ts, _T_f, _r_ts, _iv_f, "call", _q_ts)
+            # Net cash flow = far - near: positive = debit (normal), negative = credit (backwardation)
+            _net_flow = _p_far - _p_near
+            _debit_str = (f"₹{_net_flow:.2f} debit" if _net_flow >= 0
+                          else f"₹{abs(_net_flow):.2f} CREDIT (backwardation)")
+
+            # Greeks of each leg
+            _g_near = bs_greeks(_spot_ts, _atm_k_ts, _T_n, _r_ts, _iv_n, "call", _q_ts)
+            _g_far  = bs_greeks(_spot_ts, _atm_k_ts, _T_f, _r_ts, _iv_f, "call", _q_ts)
+            _net_theta = _g_far["theta"] - _g_near["theta"]  # net daily decay (want near to decay faster)
+            _net_vega  = _g_far["vega"]  - _g_near["vega"]   # net vega (want to be long back-month vega)
+
+            # Entry condition
+            _entry_ok   = _iv_n > _iv_f   # backwardation = favourable
+            _entry_lbl  = "✓ FAVOURABLE" if _entry_ok else "✗ ADVERSE carry"
+            _entry_c    = "#00d084" if _entry_ok else "#ff3b3b"
+
+            # Breakeven range at near-expiry: spot must stay within ±straddle_near
+            _be_width = _near["straddle"]
+
+            _cal_rows.append({
+                "Calendar":       f"SELL {_near['expiry']}  /  BUY {_far['expiry']}",
+                "Net Cash Flow":  _debit_str,
+                "Near IV%":       f"{_iv_n*100:.2f}%",
+                "Far IV%":        f"{_iv_f*100:.2f}%",
+                "Net θ/day":      f"{_net_theta:.3f}",
+                "Net Vega/1%":    f"{_net_vega:.3f}",
+                "Profit Zone ±":  f"₹{_be_width:.0f}",
+                "Entry":          _entry_lbl,
+            })
+
+        if _cal_rows:
+            _cdf_display = pd.DataFrame(_cal_rows)
+
+            def _cal_style(v):
+                if "FAVOURABLE" in str(v): return "color:#00d084;font-weight:700"
+                if "ADVERSE"    in str(v): return "color:#ff3b3b;font-weight:700"
+                return ""
+
+            st.dataframe(
+                _cdf_display.style.applymap(_cal_style, subset=["Entry"]),
+                use_container_width=True, hide_index=True
+            )
+
+        # ── Chart 5: Volatility Smile Overlay ───────────────────
+        st.divider()
+        st.markdown("#### Volatility Smile Across Expiries")
+        st.caption("IV smile by strike for each loaded expiry — shows skew evolution as tenor increases.")
+
+        fig_smile_ts = go.Figure()
+        _smile_colors = ["#ff8c00","#1e90ff","#00d084","#9c27b0","#ff3b3b"]
+        for _ci, _ed in enumerate(_me):
+            if _ed["smile"]:
+                _sdf = pd.DataFrame(_ed["smile"])
+                # Dynamic chart range: ±3 MC expected moves, floored at ±2× ATR
+                _em_ts    = st.session_state.get("opt_prob_score", {}).get("mc_expected_move", _atr_seed(_spot_ts) * 5)
+                _floor_ts = max(_atr_seed(_spot_ts) * 2, _spot_ts * 0.02)  # 2× ATR or 2% floor
+                _range_ts = max(3.0 * _em_ts, _floor_ts)
+                _sdf = _sdf[(_sdf.Strike >= _spot_ts - _range_ts) & (_sdf.Strike <= _spot_ts + _range_ts)]
+                if not _sdf.empty:
+                    _cc = _smile_colors[_ci % len(_smile_colors)]
+                    fig_smile_ts.add_trace(go.Scatter(
+                        x=_sdf.Strike, y=_sdf.CE_IV,
+                        mode="lines", name=f"CE {_ed['expiry']} (DTE {_ed['dte']})",
+                        line=dict(color=_cc, width=1.8),
+                    ))
+                    fig_smile_ts.add_trace(go.Scatter(
+                        x=_sdf.Strike, y=_sdf.PE_IV,
+                        mode="lines", name=f"PE {_ed['expiry']}",
+                        line=dict(color=_cc, width=1.2, dash="dot"),
+                    ))
+
+        fig_smile_ts.add_vline(x=_spot_ts,
+                               line=dict(color="#ffb347", dash="dot", width=1.5),
+                               annotation_text=f"Spot ₹{_spot_ts:.0f}")
+        if _hv_ts:
+            fig_smile_ts.add_hline(y=_hv_ts*100,
+                                   line=dict(color="#444", dash="dot", width=1),
+                                   annotation_text=f"HV20 {_hv_ts*100:.1f}%",
+                                   annotation_font=dict(size=8))
+        fig_smile_ts.update_layout(
+            title="Volatility Smile by Strike — Multi-Expiry Overlay",
+            height=340, plot_bgcolor="#000", paper_bgcolor="#000",
+            font=dict(color="#e8e8e8", family="IBM Plex Mono", size=9),
+            xaxis=dict(title="Strike", gridcolor="#111"),
+            yaxis=dict(title="IV %", gridcolor="#111"),
+            legend=dict(orientation="h", y=1.12, font=dict(size=8)),
+            margin=dict(t=50, b=10),
+        )
+        st.plotly_chart(fig_smile_ts, use_container_width=True)
+
+        # ── Chart 6: OI Distribution Across Expiries ────────────
+        st.divider()
+        st.markdown("#### OI Distribution Across Expiries")
+        st.caption("Total CE and PE OI per expiry — shows where market interest is concentrated.")
+
+        fig_oi_ts = go.Figure()
+        fig_oi_ts.add_trace(go.Bar(
+            x=_ts_exps,
+            y=[d["total_ce_oi"] / 1e5 for d in _me],
+            name="CE OI (lac)", marker_color="#ff3b3b", opacity=0.8
+        ))
+        fig_oi_ts.add_trace(go.Bar(
+            x=_ts_exps,
+            y=[d["total_pe_oi"] / 1e5 for d in _me],
+            name="PE OI (lac)", marker_color="#00d084", opacity=0.8
+        ))
+        fig_oi_ts.update_layout(
+            title="Total OI per Expiry — Call vs Put",
+            height=260, barmode="group", plot_bgcolor="#000", paper_bgcolor="#000",
+            font=dict(color="#e8e8e8", family="IBM Plex Mono", size=9),
+            yaxis=dict(title="OI (lac)", gridcolor="#111"),
+            legend=dict(orientation="h", y=1.12),
+            margin=dict(t=40, b=10),
+        )
+        st.plotly_chart(fig_oi_ts, use_container_width=True)
+
+        # PCR across expiries
+        fig_pcr_ts = go.Figure()
+        fig_pcr_ts.add_trace(go.Bar(
+            x=_ts_exps,
+            y=[d["pcr"] for d in _me],
+            marker_color=["#00d084" if d["pcr"] > 1.1 else "#ff3b3b" if d["pcr"] < 0.9 else "#ffb347"
+                          for d in _me],
+            name="PCR"
+        ))
+        fig_pcr_ts.add_hline(y=1.0, line=dict(color="#444", dash="dot"),
+                             annotation_text="PCR = 1.0 (neutral)")
+        fig_pcr_ts.update_layout(
+            title="Put-Call Ratio by Expiry",
+            height=200, plot_bgcolor="#000", paper_bgcolor="#000",
+            font=dict(color="#e8e8e8", family="IBM Plex Mono", size=9),
+            yaxis=dict(title="PCR", gridcolor="#111"),
+            margin=dict(t=40, b=10),
+        )
+        st.plotly_chart(fig_pcr_ts, use_container_width=True)
+
+        # ── Summary Table ────────────────────────────────────────
+        st.divider()
+        st.markdown("#### Full Term Structure Summary")
+        _sum_rows = []
+        for _ed in _me:
+            _iv_vs_hv = _ed["atm_iv_pct"] - (_hv_ts or CFG["hv_fallback"]) * 100
+            _regime   = ("LOW VOL"    if _ed["atm_iv_pct"] < 15 else
+                         "NORMAL"     if _ed["atm_iv_pct"] < 25 else
+                         "ELEVATED"   if _ed["atm_iv_pct"] < 35 else "HIGH VOL")
+            _sum_rows.append({
+                "Expiry":         _ed["expiry"],
+                "DTE":            _ed["dte"],
+                "ATM IV%":        f"{_ed['atm_iv_pct']:.2f}%",
+                "Fwd Vol%":       f"{_ed.get('fwd_vol_pct', _ed['atm_iv_pct']):.2f}%",
+                "IV vs HV (pp)":  f"{_iv_vs_hv:+.2f}",
+                "Straddle ₹":     f"₹{_ed['straddle']:.0f}",
+                "Exp Move ±%":    f"±{_ed['exp_move_pct']:.2f}%",
+                "PCR":            f"{_ed['pcr']:.3f}",
+                "CE OI (lac)":    f"{_ed['total_ce_oi']/1e5:.1f}",
+                "PE OI (lac)":    f"{_ed['total_pe_oi']/1e5:.1f}",
+                "Regime":         _regime,
+            })
+        st.dataframe(pd.DataFrame(_sum_rows), use_container_width=True, hide_index=True)
+
+        with st.expander("◼ HOW TO READ TERM STRUCTURE"):
+            st.markdown("""
+**IV Term Structure** shows how implied volatility changes with expiry date.
+
+| Shape | Meaning | Strategy Edge |
+|-------|---------|---------------|
+| **Contango** (near IV < far IV) | Normal — uncertainty grows over time | No calendar edge. Use single-expiry condors/spreads |
+| **Backwardation** (near IV > far IV) | Inverted — near-term event risk elevated | Calendar spread ATTRACTIVE — sell expensive near, buy cheap far |
+| **Flat** | Balanced | No carry advantage |
+
+**Forward Volatility** is the vol the market implies for the period *between* two expiries:
+σ_fwd(T₁→T₂) = √[(σ₂²·T₂ − σ₁²·T₁) / (T₂ − T₁)]
+
+If forward vol > far-month spot vol → the market expects vol to *increase* after the near expiry (event risk).
+If forward vol < far-month spot vol → the market expects vol to *decrease* → possible mean-reversion.
+
+**Calendar Spread entry rule:** Only enter when near-month IV > far-month IV (backwardation).
+You want to sell expensive near-term theta and buy cheap back-month vega.
+
+**OI concentration across expiries** tells you where institutional positioning is heaviest.
+The expiry with the largest OI is the "pinning" expiry — max pain gravity is strongest there.
+""")
+
+# ══════════════════════════════════════════════════════════════
+# TAB 10 — FLOW & SKEW
+# ══════════════════════════════════════════════════════════════
+with t_flow:
+    st.markdown("### 🌊 Options Flow, Skew & Liquidity")
+
+    # ── IV Percentile vs IV Rank comparison ─────────────────
+    st.markdown("#### IV Rank vs IV Percentile")
+    _ivr_col  = "#ff3b3b" if ivr >= 75 else ("#ffb347" if ivr >= 50 else "#1e90ff")
+    _ivp_col  = "#ff3b3b" if iv_pct >= 75 else ("#ffb347" if iv_pct >= 50 else "#1e90ff")
+    fc1, fc2, fc3 = st.columns(3)
+    fc1.markdown(f"""<div style="background:#0d0d0d;border:1px solid #2a2a2a;
+border-left:4px solid {_ivr_col};padding:12px 16px;font-family:'IBM Plex Mono',monospace;">
+  <div style="color:#555;font-size:0.76rem;letter-spacing:.08em;">IV RANK (range-normalised)</div>
+  <div style="color:{_ivr_col};font-size:1.5rem;font-weight:700;">{ivr:.1f}</div>
+  <div style="color:#888;font-size:0.78rem;">
+    (IV − min) / (max − min) × 100<br>Sensitive to outlier spikes in history
+  </div>
+</div>""", unsafe_allow_html=True)
+    fc2.markdown(f"""<div style="background:#0d0d0d;border:1px solid #2a2a2a;
+border-left:4px solid {_ivp_col};padding:12px 16px;font-family:'IBM Plex Mono',monospace;">
+  <div style="color:#555;font-size:0.76rem;letter-spacing:.08em;">IV PERCENTILE (robust)</div>
+  <div style="color:{_ivp_col};font-size:1.5rem;font-weight:700;">{iv_pct:.1f}</div>
+  <div style="color:#888;font-size:0.78rem;">
+    % of past IVs below current IV<br>Outlier-robust — preferred for signal quality
+  </div>
+</div>""", unsafe_allow_html=True)
+    fc3.markdown(f"""<div style="background:#0d0d0d;border:1px solid #2a2a2a;
+border-left:4px solid #888;padding:12px 16px;font-family:'IBM Plex Mono',monospace;">
+  <div style="color:#555;font-size:0.76rem;letter-spacing:.08em;">IV HISTORY DEPTH</div>
+  <div style="color:#e8e8e8;font-size:1.5rem;font-weight:700;">{len(_iv_hist_sym_flow)}</div>
+  <div style="color:#888;font-size:0.78rem;">
+    observations stored<br>Min 3 needed for rank/percentile
+  </div>
+</div>""", unsafe_allow_html=True)
+
+    # ── IV History chart ──────────────────────────────────────
+    if len(_iv_hist_sym_flow) >= 5:
+        st.divider()
+        fig_iv_hist = go.Figure()
+        _iv_x = list(range(len(_iv_hist_sym_flow)))
+        fig_iv_hist.add_trace(go.Scatter(
+            x=_iv_x, y=[v * 100 for v in _iv_hist_sym_flow],
+            mode="lines", name="ATM IV History",
+            line=dict(color="#ff8c00", width=1.8),
+            fill="tozeroy", fillcolor="rgba(255,140,0,0.05)",
+        ))
+        fig_iv_hist.add_hline(y=atm_iv * 100,
+                               line=dict(color="#ffb347", dash="dot", width=1.5),
+                               annotation_text=f"Current {atm_iv*100:.1f}%")
+        if hv20:
+            fig_iv_hist.add_hline(y=hv20 * 100,
+                                   line=dict(color="#00d084", dash="dot", width=1),
+                                   annotation_text=f"HV20 {hv20*100:.1f}%")
+        fig_iv_hist.update_layout(
+            title=f"{sym} — ATM IV History (session observations)",
+            height=230, plot_bgcolor="#000", paper_bgcolor="#000",
+            font=dict(color="#e8e8e8", family="IBM Plex Mono", size=9),
+            xaxis=dict(title="Observation #", gridcolor="#111"),
+            yaxis=dict(title="IV %", gridcolor="#111"),
+            margin=dict(t=40, b=10),
+        )
+        st.plotly_chart(fig_iv_hist, use_container_width=True)
+
+    # ── Vol Term Structure Slope ──────────────────────────────
+    st.divider()
+    st.markdown("#### Volatility Term Structure Slope")
+    _me_flow = st.session_state.opt_multi_expiry
+    if _me_flow and len(_me_flow) >= 2:
+        _ts_slope_pp = _me_flow[-1]["atm_iv_pct"] - _me_flow[0]["atm_iv_pct"]
+        _ts_slope_per_dte = round(_ts_slope_pp / max(_me_flow[-1]["dte"] - _me_flow[0]["dte"], 1), 3)
+        _slope_col  = "#ff3b3b" if _ts_slope_pp < -1.5 else ("#00d084" if _ts_slope_pp > 1.5 else "#ffb347")
+        _slope_lbl  = ("BACKWARDATION — near > far IV (inverted)" if _ts_slope_pp < -1.5
+                       else "CONTANGO — far > near IV (normal)" if _ts_slope_pp > 1.5
+                       else "FLAT — near ≈ far IV")
+        st.markdown(f"""<div style="background:#0d0d0d;border:1px solid #2a2a2a;
+border-left:4px solid {_slope_col};padding:12px 16px;font-family:'IBM Plex Mono',monospace;margin-bottom:10px;">
+  <div style="color:#555;font-size:0.76rem;letter-spacing:.08em;">TERM STRUCTURE SLOPE</div>
+  <div style="color:{_slope_col};font-size:1.2rem;font-weight:700;">{_ts_slope_pp:+.2f}pp  ·  {_slope_lbl}</div>
+  <div style="color:#888;font-size:0.80rem;">
+    Near: {_me_flow[0]['atm_iv_pct']:.1f}% (DTE {_me_flow[0]['dte']})  →  
+    Far: {_me_flow[-1]['atm_iv_pct']:.1f}% (DTE {_me_flow[-1]['dte']})  ·  
+    Slope: {_ts_slope_per_dte:+.3f}pp/DTE
+  </div>
+</div>""", unsafe_allow_html=True)
+
+        # Slope interpretation
+        _slope_interp = {
+            "BACKWARDATION": "Near-term fear is elevated. Calendar spread is attractive: "
+                             "sell expensive near-term, buy cheap far-term. "
+                             "Watch for event risk in the near expiry.",
+            "CONTANGO":      "Normal structure. Far-month uncertainty priced higher. "
+                             "Calendar spread has adverse carry — avoid unless there is a specific near-term catalyst.",
+            "FLAT":          "No clear carry edge in either calendar direction. "
+                             "Use outright straddles or iron condors rather than time-spread plays.",
+        }
+        _slope_key  = "BACKWARDATION" if _ts_slope_pp < -1.5 else ("CONTANGO" if _ts_slope_pp > 1.5 else "FLAT")
+        st.caption(_slope_interp[_slope_key])
+    else:
+        st.info("Load Term Structure (📅 LOAD TERM STRUCTURE in sidebar) to see slope analysis.")
+
+    # ── Full Put/Call IV Skew Curve ───────────────────────────
+    st.divider()
+    st.markdown("#### Put/Call IV Skew Curve — Full Strike Range")
+    st.caption("Shows IV vs moneyness for all strikes. Steep left wing = heavy put buying (crash fear). "
+               "Flat or inverted = complacent or call-skewed market.")
+
+    _skew_curve = oi_d.get("skew_curve", []) if oi_d else []
+    if _skew_curve:
+        _sdf = pd.DataFrame(_skew_curve)
+        _sdf = _sdf.sort_values("moneyness")
+
+        fig_skew = go.Figure()
+        fig_skew.add_trace(go.Scatter(
+            x=_sdf["moneyness"], y=_sdf["put_iv"],
+            mode="lines+markers", name="Put IV",
+            line=dict(color="#ff3b3b", width=2),
+            marker=dict(size=5),
+        ))
+        fig_skew.add_trace(go.Scatter(
+            x=_sdf["moneyness"], y=_sdf["call_iv"],
+            mode="lines+markers", name="Call IV",
+            line=dict(color="#1e90ff", width=2),
+            marker=dict(size=5),
+        ))
+        fig_skew.add_trace(go.Scatter(
+            x=_sdf["moneyness"], y=_sdf["skew_pp"],
+            mode="lines", name="Skew (Put−Call pp)",
+            line=dict(color="#ff8c00", width=1.5, dash="dot"),
+            yaxis="y2",
+        ))
+        if hv20:
+            fig_skew.add_hline(y=hv20 * 100,
+                                line=dict(color="#00d084", dash="dot", width=1),
+                                annotation_text=f"HV20 {hv20*100:.1f}%")
+        fig_skew.add_vline(x=0, line=dict(color="#ffb347", dash="dot", width=1.5),
+                           annotation_text="ATM")
+        fig_skew.update_layout(
+            title="IV Skew Curve — Put & Call IV by Moneyness",
+            height=360, plot_bgcolor="#000", paper_bgcolor="#000",
+            font=dict(color="#e8e8e8", family="IBM Plex Mono", size=9),
+            xaxis=dict(title="Moneyness % (−ve = OTM put, +ve = OTM call)", gridcolor="#111"),
+            yaxis=dict(title="IV %", gridcolor="#111"),
+            yaxis2=dict(title="Skew (pp)", overlaying="y", side="right",
+                        gridcolor="#1a1a1a", zeroline=True, zerolinecolor="#2a2a2a"),
+            legend=dict(orientation="h", y=1.12),
+            margin=dict(t=50, b=10),
+        )
+        st.plotly_chart(fig_skew, use_container_width=True)
+
+        # Skew table
+        st.dataframe(_sdf[["strike","moneyness","call_iv","put_iv","skew_pp"]].rename(columns={
+            "strike": "Strike", "moneyness": "Moneyness%",
+            "call_iv": "Call IV%", "put_iv": "Put IV%", "skew_pp": "Skew(pp)"
+        }), use_container_width=True, hide_index=True)
+    else:
+        st.info("Live chain data needed for skew curve. Load option chain (⚡ LOAD OPTIONS INTEL).")
+
+    # ── Liquidity Filter ─────────────────────────────────────
+    st.divider()
+    st.markdown("#### Liquidity Filter — Bid-Ask Spread, OI & Volume")
+    _liq_verdict = liquidity_d.get("verdict", "—")
+    _liq_col     = liquidity_d.get("color", "#888")
+    _liq_sc      = liquidity_d.get("liquid_score", 0)
+    _liq_spr     = liquidity_d.get("atm_spread_pct", 0)
+
+    lq1, lq2, lq3, lq4 = st.columns(4)
+    lq1.metric("Liquidity Score",  f"{_liq_sc}/100")
+    lq2.metric("ATM Spread %",     f"{_liq_spr:.1f}%")
+    lq3.metric("ATM OI Adequate",  "✓" if liquidity_d.get("atm_oi_ok") else "⚠")
+    lq4.metric("ATM Vol Adequate", "✓" if liquidity_d.get("atm_vol_ok") else "⚠")
+
+    st.markdown(f"""<div style="border-left:4px solid {_liq_col};padding:8px 14px;
+font-family:'IBM Plex Mono',monospace;font-size:0.86rem;color:{_liq_col};margin:8px 0;">
+  {_liq_verdict}
+</div>""", unsafe_allow_html=True)
+
+    _liq_rows = liquidity_d.get("rows", [])
+    if _liq_rows:
+        _ldf = pd.DataFrame(_liq_rows)
+        def _liq_ok_style(v):
+            if v == "✓": return "color:#00d084;font-weight:700"
+            if v == "⚠": return "color:#ffb347;font-weight:700"
+            return ""
+        def _spread_style(v):
+            try:
+                fv = float(v)
+                if fv < 3:   return "color:#00d084"
+                if fv < 8:   return "color:#ffb347"
+                return "color:#ff3b3b"
+            except: return ""
+        st.dataframe(
+            _ldf.style
+                .applymap(_liq_ok_style, subset=["CE OK","PE OK"])
+                .applymap(_spread_style, subset=["CE Spread%","PE Spread%"]),
+            use_container_width=True, hide_index=True
+        )
+        st.caption("✓ = spread <5% AND OI ≥1000 AND volume ≥100. ⚠ = fails one or more criteria. "
+                   "Use LIMIT orders at bid-ask mid. Never market-order multi-leg strategies.")
+
+# ══════════════════════════════════════════════════════════════
+# TAB 11 — REGIME & EVENTS
+# ══════════════════════════════════════════════════════════════
+with t_regime:
+    st.markdown("### 🔭 Market Regime Detection & Event Calendar")
+
+    # ── Regime Panel ─────────────────────────────────────────
+    st.markdown("#### Market Regime")
+    _rc = regime_d.get("color", "#888")
+    _rl = regime_d.get("regime", "—")
+
+    rc1, rc2, rc3, rc4, rc5 = st.columns(5)
+    rc1.metric("Regime",       _rl)
+    rc2.metric("Trend",        regime_d.get("trend", "—"))
+    rc3.metric("Vol State",    regime_d.get("vol", "—"))
+    rc4.metric("ADX(14)",      f"{regime_d.get('adx', 0):.1f}")
+    rc5.metric("BB Width%",    f"{regime_d.get('bb_width_pct', 0):.2f}%")
+
+    # Regime strategy guide
+    _REGIME_GUIDE = {
+        "TRENDING HIGH VOL": {
+            "best":   ["Bear/Bull Spread", "Long Call/Put", "Debit Spread"],
+            "avoid":  ["Iron Condor", "Short Straddle", "Short Strangle"],
+            "note":   "Trend + high IV = directional debit spreads (defined risk). "
+                      "Avoid credit strategies — dealers are short gamma, amplifying moves. "
+                      "Use smaller size and wider stops.",
+        },
+        "TRENDING LOW VOL": {
+            "best":   ["Long ATM Call/Put", "Bull/Bear Call/Put Spread", "Calendar"],
+            "avoid":  ["Short Straddle", "Iron Condor"],
+            "note":   "Low IV = buy premium cheaply and ride the trend. "
+                      "Debit spreads maximise directional capture per rupee of premium. "
+                      "Calendar spreads work well — back-month IV cheap relative to realised.",
+        },
+        "RANGE LOW VOL": {
+            "best":   ["Short Straddle (near expiry)", "Iron Condor", "Short Strangle"],
+            "avoid":  ["Long Call/Put", "Long Straddle"],
+            "note":   "Range + low IV = ideal credit environment. "
+                      "Spot pinned, theta working for sellers, IV not rich enough to justify debit. "
+                      "Use iron condors with strikes at OI walls.",
+        },
+        "RANGE HIGH VOL": {
+            "best":   ["Iron Condor", "Short Straddle", "Bull Put / Bear Call Spread"],
+            "avoid":  ["Long Straddle", "Long Strangle (without hedge)"],
+            "note":   "IV is elevated but range-bound structure means big moves unlikely. "
+                      "Sell premium with defined risk (condors > naked straddle). "
+                      "Take profit early — IV mean-reversion likely.",
+        },
+        "TRANSITIONAL": {
+            "best":   ["Iron Condor (conservative)", "Calendar"],
+            "avoid":  ["Naked shorts", "large directional debit"],
+            "note":   "Market in transition — no clear structural edge. Reduce size, "
+                      "widen strikes, and wait for regime clarity.",
+        },
+    }
+    _guide = _REGIME_GUIDE.get(_rl, {"best": ["—"], "avoid": ["—"], "note": "Regime not classified."})
+
+    rg1, rg2 = st.columns(2)
+    with rg1:
+        st.markdown(f"""<div style="background:#0d1a00;border:1px solid #00d084;
+border-left:4px solid #00d084;padding:12px 16px;font-family:'IBM Plex Mono',monospace;">
+  <div style="color:#00d084;font-size:0.80rem;font-weight:600;letter-spacing:.08em;margin-bottom:8px;">
+    ✓ STRATEGIES SUITED TO THIS REGIME
+  </div>
+  {"".join(f'<div style="color:#e8e8e8;font-size:0.86rem;padding:2px 0;">• {s}</div>' for s in _guide["best"])}
+</div>""", unsafe_allow_html=True)
+    with rg2:
+        st.markdown(f"""<div style="background:#1a0000;border:1px solid #ff3b3b;
+border-left:4px solid #ff3b3b;padding:12px 16px;font-family:'IBM Plex Mono',monospace;">
+  <div style="color:#ff3b3b;font-size:0.80rem;font-weight:600;letter-spacing:.08em;margin-bottom:8px;">
+    ✗ AVOID IN THIS REGIME
+  </div>
+  {"".join(f'<div style="color:#e8e8e8;font-size:0.86rem;padding:2px 0;">• {s}</div>' for s in _guide["avoid"])}
+</div>""", unsafe_allow_html=True)
+
+    st.markdown(f"""<div style="border-left:3px solid {_rc};padding:8px 14px;margin-top:8px;
+font-family:'IBM Plex Mono',monospace;font-size:0.86rem;color:#e8e8e8;">
+  <span style="color:{_rc};font-weight:600;">{_rl}</span> — {_guide["note"]}
+</div>""", unsafe_allow_html=True)
+
+    # ── RS vs Nifty ─────────────────────────────────────────
+    if rs_nifty:
+        st.divider()
+        st.markdown("#### Relative Strength vs Nifty")
+        _rs_ratio = rs_nifty.get("rs_ratio", 1.0)
+        _rs_trend = rs_nifty.get("trend", "—")
+        _rs_col   = rs_nifty.get("color", "#888")
+        _rs_sym   = rs_nifty.get("sym_ret_pct", 0)
+        _rs_nif   = rs_nifty.get("nifty_ret_pct", 0)
+
+        rs1, rs2, rs3, rs4 = st.columns(4)
+        rs1.metric("RS Ratio (20d)",   f"{_rs_ratio:.4f}",
+                   delta="OUTPERFORMING" if _rs_ratio > 1 else "UNDERPERFORMING")
+        rs2.metric(f"{sym} Return (20d)", f"{_rs_sym:+.2f}%")
+        rs3.metric("Nifty Return (20d)", f"{_rs_nif:+.2f}%")
+        rs4.metric("RS Trend",           _rs_trend)
+
+        # RS chart
+        _rs_ser = rs_nifty.get("rs_series", [])
+        if len(_rs_ser) >= 5:
+            fig_rs = go.Figure()
+            fig_rs.add_trace(go.Scatter(
+                x=list(range(len(_rs_ser))), y=_rs_ser,
+                mode="lines", name=f"{sym} RS vs Nifty",
+                line=dict(color=_rs_col, width=2),
+                fill="tozeroy",
+                fillcolor=f"rgba({int(_rs_col[1:3],16)},{int(_rs_col[3:5],16)},{int(_rs_col[5:7],16)},0.07)",
+            ))
+            fig_rs.add_hline(y=1.0, line=dict(color="#555", dash="dot", width=1.5),
+                              annotation_text="Nifty parity (RS = 1.0)")
+            fig_rs.update_layout(
+                title=f"{sym} Relative Strength vs Nifty (rolling 20-day return ratio)",
+                height=240, plot_bgcolor="#000", paper_bgcolor="#000",
+                font=dict(color="#e8e8e8", family="IBM Plex Mono", size=9),
+                xaxis=dict(title="Session #", gridcolor="#111"),
+                yaxis=dict(title="RS Ratio", gridcolor="#111"),
+                margin=dict(t=40, b=10),
+            )
+            st.plotly_chart(fig_rs, use_container_width=True)
+
+        # RS strategy implication
+        _rs_impl = {
+            "STRONGLY OUTPERFORMING": "Stock is leading the market — bullish bias confirmed by market structure. "
+                                       "Bull call spreads and long calls supported by both technicals and RS.",
+            "OUTPERFORMING":           "Stock beating Nifty — mild bullish confirmation. "
+                                       "Directional long trades have RS tailwind.",
+            "IN LINE WITH NIFTY":      "No relative edge vs market. "
+                                       "Strategy choice should rely purely on IV and technical bias.",
+            "UNDERPERFORMING":         "Stock lagging Nifty — weak money flow. "
+                                       "Long strategies carry RS headwind; consider bear spreads or neutral.",
+            "STRONGLY UNDERPERFORMING":"Clear RS breakdown — money is flowing away from this stock. "
+                                        "Put spreads and bearish credit spreads are regime-appropriate.",
+        }
+        st.caption(_rs_impl.get(_rs_trend, ""))
+    elif sym.upper() not in ("NIFTY","BANKNIFTY","FINNIFTY","MIDCPNIFTY"):
+        st.info("RS vs Nifty not available — yfinance data may be unavailable. Reload to retry.")
+
+    # ── Event Calendar ───────────────────────────────────────
+    st.divider()
+    st.markdown("#### Event Calendar — Within Expiry Window")
+    st.caption(f"Events detected between today and {expiry}.")
+
+    if events_list:
+        for _ev in events_list:
+            _ev_c   = _ev.get("color", "#888")
+            _ev_d   = _ev.get("days_away", 0)
+            _ev_lbl = "TODAY" if _ev_d == 0 else (f"in {_ev_d}d" if _ev_d > 0 else "past")
+            st.markdown(f"""<div style="background:#0d0d0d;border:1px solid #2a2a2a;
+border-left:4px solid {_ev_c};padding:10px 14px;margin-bottom:6px;font-family:'IBM Plex Mono',monospace;">
+  <div style="display:flex;justify-content:space-between;align-items:center;">
+    <div>
+      <span style="color:{_ev_c};font-size:0.92rem;font-weight:700;">{_ev['event']}</span>
+      <span style="color:#888;font-size:0.80rem;margin-left:12px;">{_ev.get('date_str','')}</span>
+    </div>
+    <span style="color:{_ev_c};font-size:0.80rem;font-weight:600;">{_ev_lbl}</span>
+  </div>
+  <div style="color:#888;font-size:0.80rem;margin-top:4px;">{_ev.get('impact','')}</div>
+</div>""", unsafe_allow_html=True)
+
+        # Event-based IV advice
+        high_impact = [e for e in events_list if e.get("days_away", 99) <= 5]
+        if high_impact:
+            st.markdown("""<div style="background:#1a0000;border:1px solid #ff3b3b;
+border-left:4px solid #ff3b3b;padding:12px 16px;font-family:'IBM Plex Mono',monospace;margin-top:8px;">
+  <div style="color:#ff3b3b;font-size:0.86rem;font-weight:600;">⚠ HIGH-IMPACT EVENT WITHIN 5 DAYS</div>
+  <div style="color:#e8e8e8;font-size:0.82rem;margin-top:4px;line-height:1.7;">
+    IV typically expands 20–40% in the 2 days before an RBI/Budget event and collapses 30–50% on the day.<br>
+    • If event is within DTE: avoid naked short premium — IV spike risk is significant.<br>
+    • Buy straddle before event + sell immediately after for vol-crush capture (advanced).<br>
+    • Defined-risk spreads are safest: max loss is capped regardless of IV move.
+  </div>
+</div>""", unsafe_allow_html=True)
+    else:
+        st.success("✓ No high-impact events detected within the expiry window.")
+
+
+# ══════════════════════════════════════════════════════════════
+# TAB 12 — BACKTEST BY REGIME
+# ══════════════════════════════════════════════════════════════
+with t_backtest:
+    st.markdown("### 📋 Forward Signal Log")
+    st.caption(
+        "Every load appends a signal snapshot to the log. This is real forward performance tracking — "
+        "not synthetic backtest approximations. Use this to evaluate whether the engine's signals "
+        "are leading actual price moves over time.")
+
+    _sig_log = st.session_state.get("opt_signal_log", [])
+    _sym_log = [e for e in _sig_log if e.get("symbol") == sym.upper()]
+
+    if not _sym_log:
+        st.info(f"No signal history yet for {sym}. Each time you click ⚡ LOAD, a snapshot is recorded.")
+        st.caption("After 5+ loads you'll see signal trends. After 20+ you can evaluate forward accuracy.")
+    else:
+        # Summary stats from log
+        _n_log   = len(_sym_log)
+        _bull    = sum(1 for e in _sym_log if e.get("prob_up", 0.5) > 0.55)
+        _bear    = sum(1 for e in _sym_log if e.get("prob_up", 0.5) < 0.45)
+        _neut    = _n_log - _bull - _bear
+        _avg_pu  = float(np.mean([e.get("prob_up", 0.5) for e in _sym_log]))
+        _avg_mag = float(np.mean([e.get("flow_magnitude", 0) for e in _sym_log]))
+        _avg_ev  = float(np.mean([e.get("strategy_ev", 0) for e in _sym_log]))
+
+        # Adaptive conviction threshold from log history
+        _mag_hist_log = [e.get("flow_magnitude", 0) for e in _sym_log]
+        _conv_thr_log = float(np.percentile(_mag_hist_log, 70)) if len(_mag_hist_log) >= 5 else CFG["flow_conviction_seed"]
+
+        sl1, sl2, sl3, sl4, sl5 = st.columns(5)
+        sl1.metric("Log entries",     str(_n_log))
+        sl2.metric("Avg P(↑)",        f"{_avg_pu*100:.1f}%")
+        sl3.metric("Bull/Neut/Bear",  f"{_bull}/{_neut}/{_bear}")
+        sl4.metric("Avg flow mag",    f"{_avg_mag:.3f}")
+        sl5.metric("Avg top EV",      f"₹{_avg_ev:,.0f}")
+
+        st.caption(f"Flow conviction threshold (70th pct of log): {_conv_thr_log:.3f}")
+
+        # Signal log table — most recent first
+        _log_rows = []
+        for e in reversed(_sym_log[-50:]):
+            _pu_l  = e.get("prob_up", 0.5)
+            _fm_l  = e.get("flow_magnitude", 0)
+            _ev_l  = e.get("strategy_ev", 0)
+            _log_rows.append({
+                "Time":       e.get("ts", "—")[-8:],    # HH:MM only
+                "Date":       e.get("ts", "—")[:10],
+                "P(↑)%":      f"{_pu_l*100:.1f}",
+                "Flow Mag":   f"{_fm_l:.3f}",
+                "Flow Score": f"{e.get('flow_score', 0):+.3f}",
+                "Bias":       e.get("bias", "—")[:9],
+                "Top Strategy":e.get("top_strategy", "—")[:18],
+                "EV":         f"₹{_ev_l:,.0f}",
+                "POP%":       f"{e.get('strategy_pop', 0.5)*100:.1f}",
+                "IVR":        f"{e.get('ivr', 0):.0f}",
+                "IV%":        f"{e.get('atm_iv_pct', 0):.1f}",
+            })
+
+        _log_df = pd.DataFrame(_log_rows)
+
+        def _log_pu_style(v):
+            try:
+                vf = float(v)
+                if vf > 55: return "color:#00d084;font-weight:700"
+                if vf < 45: return "color:#ff3b3b;font-weight:700"
+            except: pass
+            return "color:#888"
+
+        def _log_ev_style(v):
+            if isinstance(v, str) and v.startswith("₹") and "-" not in v: return "color:#00d084"
+            if isinstance(v, str) and "-" in v: return "color:#ff3b3b"
+            return ""
+
+        st.dataframe(
+            _log_df.style
+                .applymap(_log_pu_style, subset=["P(↑)%"])
+                .applymap(_log_ev_style, subset=["EV"]),
+            use_container_width=True, hide_index=True)
+
+        # P(↑) trend chart
+        if len(_sym_log) >= 3:
+            _pu_series = [e.get("prob_up", 0.5) * 100 for e in _sym_log]
+            _fm_series = [e.get("flow_magnitude", 0) for e in _sym_log]
+            _ts_labels = [e.get("ts", "")[-5:] for e in _sym_log]
+
+            _log_fig = go.Figure()
+            _log_fig.add_trace(go.Scatter(
+                x=list(range(len(_pu_series))), y=_pu_series,
+                mode="lines+markers", name="P(↑)%",
+                line=dict(color="#00d084", width=2),
+                marker=dict(size=5)))
+            _log_fig.add_trace(go.Scatter(
+                x=list(range(len(_fm_series))), y=[v * 100 for v in _fm_series],
+                mode="lines", name="Flow Magnitude ×100",
+                line=dict(color="#ff8c00", width=1.5, dash="dot"),
+                yaxis="y2"))
+            # Neutral zone band — 45% to 55% = no edge
+            _log_fig.add_hrect(y0=45, y1=55, fillcolor="#333", opacity=0.15,
+                                line_width=0, annotation_text="no-edge zone",
+                                annotation_font_color="#555", annotation_font_size=9)
+            _log_fig.update_layout(
+                title=f"{sym} — Signal History ({_n_log} loads)",
+                height=240, plot_bgcolor="#000", paper_bgcolor="#000",
+                font=dict(color="#e8e8e8", family="IBM Plex Mono", size=9),
+                xaxis=dict(gridcolor="#111", tickvals=list(range(len(_ts_labels))),
+                           ticktext=_ts_labels, tickangle=-45),
+                yaxis=dict(title="P(↑)%", gridcolor="#111", range=[30, 70]),
+                yaxis2=dict(title="Flow Mag ×100", overlaying="y", side="right",
+                            gridcolor="#111", range=[0, 60]),
+                legend=dict(orientation="h", yanchor="bottom", y=1.0),
+                margin=dict(t=40, b=40),
+            )
+            st.plotly_chart(_log_fig, use_container_width=True)
+
+        st.divider()
+        if st.button("🗑 Clear signal log for this symbol", key="clear_sig_log"):
+            _all_log = st.session_state.opt_signal_log
+            st.session_state.opt_signal_log = [e for e in _all_log if e.get("symbol") != sym.upper()]
+            _save_signal_log(st.session_state.opt_signal_log)
+            st.success(f"Cleared {sym} entries from signal log.")
+            st.rerun()
+
+        st.caption(
+            f"Log persists to {CFG['signal_log_file']} · max {CFG['signal_log_max']} entries · "
+            "Use this log to evaluate whether high-conviction flow signals (flow_magnitude > threshold) "
+            "precede actual price moves in the direction predicted.")
+
+
+# ══════════════════════════════════════════════════════════════
+# TAB 9 — MATHS & LOGIC REFERENCE
+# ══════════════════════════════════════════════════════════════
+with t_math:
+    st.markdown("### 📐 Engine Maths & Logic Reference")
+    st.caption("Complete derivations, formulas, and decision logic used by every module in this engine.")
+
+    SEC = {
+        "bb": "border-bottom:1px solid #ff8c00;padding-bottom:4px;margin-bottom:14px;",
+        "hd": "color:#ff8c00;font-size:1.0rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase;font-family:'IBM Plex Mono',monospace;",
+        "sh": "color:#ffb347;font-size:0.88rem;font-weight:600;font-family:'IBM Plex Mono',monospace;margin-top:16px;margin-bottom:6px;",
+        "body": "color:#e8e8e8;font-size:0.86rem;line-height:1.85;font-family:'IBM Plex Mono',monospace;",
+        "formula": "background:#0d1400;border-left:3px solid #ff8c00;padding:10px 16px;margin:8px 0 14px;font-size:0.88rem;color:#ffb347;font-family:'IBM Plex Mono',monospace;line-height:2.0;",
+        "note": "background:#111;border:1px solid #2a2a2a;border-left:3px solid #1e90ff;padding:8px 14px;font-size:0.82rem;color:#7ec8e3;font-family:'IBM Plex Mono',monospace;margin:8px 0 12px;line-height:1.7;",
+        "warn": "background:#1a0d00;border:1px solid #2a2a2a;border-left:3px solid #ff8c00;padding:8px 14px;font-size:0.82rem;color:#ffb347;font-family:'IBM Plex Mono',monospace;margin:8px 0 12px;line-height:1.7;",
+        "tag": "background:#1a1400;color:#ff8c00;font-size:0.78rem;padding:2px 8px;border:1px solid #ff8c00;font-family:'IBM Plex Mono',monospace;margin-right:6px;",
+    }
+
+    def sec(title):
+        st.markdown(f'<div style="{SEC["bb"]}"><span style="{SEC["hd"]}">{title}</span></div>', unsafe_allow_html=True)
+    def sh(title):
+        st.markdown(f'<div style="{SEC["sh"]}">{title}</div>', unsafe_allow_html=True)
+    def body(text):
+        st.markdown(f'<div style="{SEC["body"]}">{text}</div>', unsafe_allow_html=True)
+    def formula(text):
+        st.markdown(f'<div style="{SEC["formula"]}">{text}</div>', unsafe_allow_html=True)
+    def note(text):
+        st.markdown(f'<div style="{SEC["note"]}">ℹ {text}</div>', unsafe_allow_html=True)
+    def warn(text):
+        st.markdown(f'<div style="{SEC["warn"]}">⚠ {text}</div>', unsafe_allow_html=True)
+
+    # ── 1. TIME TO EXPIRY ─────────────────────────────────────
+    with st.expander("1 · Time to Expiry — Trading-Day Fraction T", expanded=True):
+        sec("Time to Expiry T")
+        body("""All Black-Scholes calculations use <b>T</b> expressed as a fraction of a trading year,
+        not calendar days. This is because option theta accrues only on days the market is open — weekends
+        and holidays do not eat into time value.""")
+        formula("""T = busday_count(today, expiry) / 252<br><br>
+where busday_count counts weekdays (Mon–Fri) between today and the expiry date.<br>
+252 = conventional number of NSE trading days per year (CFG["ann_days"]).<br><br>
+Example: 7-DTE expiry with 2 weekend days → busday_count = 5 → T = 5/252 = 0.01984<br>
+Old (wrong) method: T = 7/365 = 0.01918 — understates time by ~3%""")
+        note("T is computed once at load time via numpy.busday_count and stored in session_state['opt_T']. "
+             "No downstream calculation ever recomputes it from calendar days.")
+
+    # ── 2. BLACK-SCHOLES ENGINE ───────────────────────────────
+    with st.expander("2 · Black-Scholes Merton Pricing Model"):
+        sec("Black-Scholes Merton (BSM) with Dividend Yield")
+        body("""The engine uses the <b>Merton (1973) continuous-dividend</b> extension of Black-Scholes.
+        For pure index options (NIFTY, BANKNIFTY) q ≈ 0 and the formula reduces to classic BSM.
+        For dividend-paying stocks, q is fetched from yfinance and corrects for the
+        ex-dividend premium reduction that standard BSM ignores.""")
+
+        sh("Forward Price")
+        formula("F = S · e^(r − q)·T")
+        body("S = spot price, r = risk-free rate (RFR), q = continuous dividend yield, T = trading-day fraction.")
+
+        sh("d₁ and d₂")
+        formula("""d₁ = [ ln(F/K) + 0.5·σ²·T ] / (σ·√T)<br>
+d₂ = d₁ − σ·√T<br><br>
+K = strike price, σ = implied or historical volatility (annualised decimal)""")
+
+        sh("Option Prices")
+        formula("""Call = e^(−q·T) · S · N(d₁) − K · e^(−r·T) · N(d₂)<br>
+Put  = K · e^(−r·T) · N(−d₂) − e^(−q·T) · S · N(−d₁)<br><br>
+N(x) = standard normal CDF = 0.5 · [1 + erf(x/√2)]  — implemented with math.erf, no scipy needed""")
+
+        sh("Put-Call Parity (sanity check)")
+        formula("Call − Put = e^(−q·T) · S − K · e^(−r·T) = PV(Forward) − PV(Strike)")
+        note("If live CE_LTP and PE_LTP violate put-call parity by more than the bid-ask spread, "
+             "an arbitrage exists. The engine does not exploit this but it is visible in the chain tab.")
+
+        sh("Edge cases")
+        body("""• T ≤ 0: returns intrinsic value max(S−K, 0) or max(K−S, 0).<br>
+• σ ≤ 0 or S ≤ 0 or K ≤ 0: same intrinsic fallback.<br>
+• IV bounds: _sanitise_iv() clamps to [0.01, 5.0] (1%–500% annualised). Values outside are replaced
+  with the HV fallback to prevent API garbage from poisoning Greeks.""")
+
+    # ── 3. IMPLIED VOLATILITY ─────────────────────────────────
+    with st.expander("3 · Implied Volatility — Newton-Raphson Solver"):
+        sec("Implied Volatility (IV)")
+        body("""IV is the σ that makes the BSM price equal the observed market price.
+        There is no closed-form inverse, so we solve numerically via Newton-Raphson iteration.""")
+
+        sh("Algorithm")
+        formula("""Initial guess (Brenner-Subrahmanyam):
+  σ₀ = max(0.05, min(C / (S · √T · √(2/π) · 0.4), 2.0))<br><br>
+Newton step (up to 200 iterations):
+  σₙ₊₁ = σₙ + (market_price − BSM(σₙ)) / vega(σₙ)<br><br>
+Stop when |market_price − BSM(σ)| < 1e-6 or vega < 1e-10<br>
+Clamp: σ ∈ [0.001, 10.0] after each step""")
+
+        sh("ATM IV — Primary Method (Brenner-Subrahmanyam 1988)")
+        formula("""Straddle ≈ S · σ · √(2T/π)  →  σ_ATM = Straddle / (S · √T · √(2/π))<br><br>
+√(2/π) = 0.79788...<br><br>
+This uses the straddle midpoint LTP (CE_LTP + PE_LTP), not individual IV fields.
+Avoids call/put IV averaging bias and is robust to API format inconsistencies.""")
+
+        note("The per-leg IV from the Upstox API may be in percent format (e.g. 18.5) or decimal (0.185). "
+             "_sanitise_iv() normalises: if iv_raw > 2.0 → divide by 100. Then clamps to [0.01, 5.0].")
+
+    # ── 4. GREEKS ─────────────────────────────────────────────
+    with st.expander("4 · The Greeks — Delta, Gamma, Theta, Vega"):
+        sec("Option Greeks (First-Order Sensitivities)")
+
+        sh("Delta  Δ")
+        formula("""Call Δ = e^(−q·T) · N(d₁)       range: [0, 1]<br>
+Put  Δ = e^(−q·T) · (N(d₁) − 1)  range: [−1, 0]<br><br>
+Interpretation: ₹ change in option value per ₹1 change in spot.<br>
+ATM option: |Δ| ≈ 0.50.  Deep ITM: |Δ| → 1.  Deep OTM: |Δ| → 0.""")
+
+        sh("Gamma  Γ")
+        formula("""Γ = e^(−q·T) · φ(d₁) / (S · σ · √T)       same for calls and puts<br><br>
+φ(x) = standard normal PDF = e^(−x²/2) / √(2π)<br><br>
+Interpretation: rate of delta change per ₹1 move in spot.<br>
+Peaks at ATM and explodes near expiry — greatest gamma risk on expiry day.""")
+
+        sh("Theta  θ  (per trading day)")
+        formula("""Call θ = [ −S · e^(−q·T) · φ(d₁) · σ / (2·√T)  +  q·S·e^(−q·T)·N(d₁)  −  r·K·e^(−r·T)·N(d₂)  ] / 252<br>
+Put  θ = [ −S · e^(−q·T) · φ(d₁) · σ / (2·√T)  −  q·S·e^(−q·T)·N(−d₁)  +  r·K·e^(−r·T)·N(−d₂) ] / 252<br><br>
+Divided by 252 (trading days) NOT 365 (calendar days).
+A position only decays on market-open days; using 365 understates daily theta by ~13%.""")
+        warn("Old engines dividing theta by 365 understate daily decay by ~(252/365 − 1) ≈ 31%. "
+             "This engine uses CFG['theta_days'] = 252 throughout.")
+
+        sh("Vega  ν")
+        formula("""ν = S · e^(−q·T) · φ(d₁) · √T / 100<br><br>
+Divided by 100 → ν represents ₹ P&L per 1 percentage point (1%) change in IV.<br>
+Example: ν = 45 means the option gains ₹45 if IV rises 1%.""")
+
+        sh("ITM Probability  P(ITM)")
+        formula("""Call: P(ITM) = N(d₂)    (risk-neutral probability of S_T > K)<br>
+Put:  P(ITM) = N(−d₂)<br><br>
+This is NOT the same as delta. Delta = e^(−q·T)·N(d₁).
+N(d₂) is the true risk-neutral exercise probability; N(d₁) is delta-hedge ratio.""")
+
+    # ── 5. HISTORICAL VOLATILITY ──────────────────────────────
+    with st.expander("5 · Historical Volatility — HV Calculation"):
+        sec("Historical Volatility (HV)")
+        body("Computed from daily log returns of the close price series over a rolling window.")
+        formula("""Log return: rᵢ = ln(Cᵢ / Cᵢ₋₁)<br><br>
+HV(window) = std(r₁, r₂, ..., r_window) × √252<br><br>
+window = 20 trading days for HV20 (CFG["hv_window"])<br>
+window = 10 trading days for HV10 (CFG["hv_window_fast"])<br>
+Annualisation base = 252 (CFG["ann_days"]) — consistent with T computation""")
+        note("HV is a backward-looking realised volatility. IV is forward-looking implied volatility. "
+             "The IV/HV ratio is the primary edge signal: IV > HV → premium is rich → sell. "
+             "IV < HV → premium is cheap → buy.")
+
+    # ── 6. IV RANK ────────────────────────────────────────────
+    with st.expander("6 · IV Rank — Volatility Regime Scoring"):
+        sec("IV Rank (IVR)")
+        body("""IV Rank measures where the current ATM IV sits within its own history.
+        It is more informative than raw IV because the same 20% IV means different things
+        for NIFTY (always ~14-22%) vs a biotech stock (can range 15-80%).""")
+
+        sh("Formula")
+        formula("""IVR = (IV_current − IV_min) / (IV_max − IV_min) × 100<br><br>
+IV_min, IV_max drawn from up to 252 stored ATM IV observations (1 trading year).<br>
+History is persisted to .monarch_iv_history.json and survives app restarts.""")
+
+        sh("Bootstrap (fewer than 3 observations)")
+        formula("""IVR_bootstrap = 50 + 50 × tanh( (IV − HV) / (0.30 × HV) )<br><br>
+At IV = HV:         IVR ≈ 50  (fair value — no premium edge)<br>
+At IV = 1.30 × HV:  IVR ≈ 75  (elevated — sell zone)<br>
+At IV = 0.70 × HV:  IVR ≈ 25  (cheap — buy zone)<br><br>
+Denominator 0.30 × HV calibrated to NSE index IV/HV std (~25-35%).
+At 1 std above HV, IVR maps to ~75 (top quartile = sell signal).""")
+
+        sh("Regime Zones")
+        formula("""IVR < 25:   LOW VOL       → Buy premium (debit spreads, long options, straddles)<br>
+25 ≤ IVR < {CFG['iv_hv_pct_buy']+15}:  NORMAL-LOW    → Slight buy lean (calendars, ratio spreads)<br>
+{CFG['iv_hv_pct_buy']+15} ≤ IVR < {CFG['iv_hv_pct_sell']}:  NORMAL-HIGH   → Slight sell lean (balanced spreads)<br>
+{CFG['iv_hv_pct_sell']} ≤ IVR < {int(CFG['iv_hv_pct_sell']+(100-CFG['iv_hv_pct_sell'])*0.6)}: ELEVATED → Lean sell (credit spreads, iron condors)<br>
+IVR ≥ {int(CFG['iv_hv_pct_sell']+(100-CFG['iv_hv_pct_sell'])*0.6)}: HIGH VOL → Sell premium (strangles, short straddles)<br><br>
+<i>Thresholds are CFG-driven (iv_hv_pct_sell={CFG['iv_hv_pct_sell']}, iv_hv_pct_buy={CFG['iv_hv_pct_buy']}) — adaptive, not fixed quartile cuts.</i>""")
+
+    # ── 7. DIRECTIONAL BIAS ───────────────────────────────────
+    with st.expander("7 · Directional Bias — Adaptive Z-Score Factor Model"):
+        sec("Directional Bias Score  (−100 to +100)")
+        body("""The bias score aggregates 5 independent, non-collinear factor groups into a single score.
+        Every sub-signal is converted to a <b>z-score</b> (using its own 1-year rolling history)
+        or a <b>percentile rank</b> (within current data distribution) — no fixed tanh centres or 
+        magic scaling constants. Each factor is normalised to [−1, +1].
+        Final score = CFG-weighted sum, scaled to ±100 for display.""")
+
+        sh("Factor Groups — Leading Indicators First")
+        formula(f"""Signal model optimised for 1–5 day prediction horizon.<br>
+Markets move due to POSITIONING CHANGES, not price indicators.<br><br>
+GROUP 1 — FLOW  (weight {CFG['factor_weights']['flow']:.0%}) — LEADING: ΔIV, ΔPCR, ΔSkew, ΔOI, ΔGEX<br>
+  All deltas z-scored against rolling history → each ∈ [−1, +1]<br>
+  dPCR  rising = more put writing = support = BULLISH (+)<br>
+  dSkew steepening = downside fear = BEARISH (−)<br>
+  dIV   rising = hedging demand = BEARISH (−)<br>
+  Flow = 0.35×dPCR + 0.30×dSkew + 0.20×dIV + 0.10×dOI + 0.05×dGEX<br><br>
+GROUP 2 — POSITIONING  (weight {CFG['factor_weights']['positioning']:.0%}) — LEADING: PCR level, OI walls, max pain<br>
+  PCR level  = 2 × PCR_percentile_in_chain − 1  (high PCR = put support = bullish)<br>
+  OI skew    = zscore((put_OI_below − call_OI_above) / total_OI)<br>
+  Max pain   = −(spot − max_pain) / expected_move  (gravitational pull)<br>
+  Positioning = 0.45×PCR_level + 0.35×OI_skew + 0.20×max_pain<br><br>
+GROUP 3 — VOL REGIME  (weight {CFG['factor_weights']['vol_regime']:.0%}) — CONCURRENT: IV/HV pct, term structure<br>
+  IV/HV pct  = percentile of current IV/HV ratio in 1-year history<br>
+  Term slope = IV_far − IV_near  (backwardation = stress = bearish)<br>
+  Vol regime = 0.60 × (−IV_pct_z) + 0.40 × term_slope_z<br><br>
+GROUP 4 — RELATIVE STRENGTH  (weight {CFG['factor_weights']['rel_strength']:.0%}) — CONFIRMING: RS ratio vs Nifty<br>
+  RS z-score = zscore(RS_ratio_vs_Nifty) — confirming, not driving<br><br>
+GROUP 5 — TREND  (weight {CFG['factor_weights']['trend']:.0%}) — CONFIRMING (most lagging): EMA + ADX + RSI<br>
+  EMA score  = (passes / 5 checks) × 2 − 1<br>
+  ADX pct    = percentile × direction (no fixed ADX > 25 threshold)<br>
+  RSI z-score contributes only 10% within this factor<br>
+  Trend = 0.60×EMA + 0.30×ADX + 0.10×RSI_z<br><br>
+Note: RSI and MACD are absorbed into Trend at 10% of 10% = ~1% total signal influence.""")
+
+        sh("Final Score & Bias Thresholds")
+        formula(f"""raw_score = {CFG['factor_weights']['flow']:.2f}×flow + {CFG['factor_weights']['positioning']:.2f}×positioning + {CFG['factor_weights']['vol_regime']:.2f}×vol_regime + {CFG['factor_weights']['rel_strength']:.2f}×rel_strength + {CFG['factor_weights']['trend']:.2f}×trend  ∈ [−1, +1]<br>
+score_100 = round(raw_score × 100)   displayed as ±100<br><br>
+score ≥  30:  STRONGLY BULLISH<br>
+score ≥  12:  BULLISH<br>
+score >  −12: NEUTRAL<br>
+score ≥  −30: BEARISH<br>
+score <  −30: STRONGLY BEARISH<br><br>
+Factor weights: {dict(CFG['factor_weights'])}""")
+
+        note("RSI and MACD are intentionally demoted. A stock can sit at RSI 75 for 20 days. "
+             "But a 3-sigma ΔPCR event plus skew steepening resolves in 1–5 days — exactly the "
+             "prediction horizon this engine targets. Flow and positioning are leading; trend confirms.")
+
+    # ── 8. OI ANALYSIS ───────────────────────────────────────
+    with st.expander("8 · Open Interest Analysis — Max Pain, GEX, PCR, Skew"):
+        sec("Open Interest Analysis")
+
+        sh("Max Pain")
+        formula("""Max Pain = argmin_K  Σ_i [ max(K − K_i, 0) × CE_OI_i  +  max(K_i − K, 0) × PE_OI_i ]<br><br>
+For each candidate expiry price K, compute total dollar pain to option writers.<br>
+The strike that minimises aggregate writer loss is Max Pain.<br>
+Price gravitates toward max pain as expiry approaches due to dealer delta-hedging.""")
+
+        sh("Call Wall & Put Wall (OI Cluster Peak)")
+        formula("""For each side, find strike i that maximises the 3-strike sliding sum:<br>
+  wall = argmax_i ( OI[i-1] + OI[i] + OI[i+1] )<br><br>
+3-strike window smooths single-bar OI spikes and finds the true cluster centre.
+Call Wall = resistance (dealers short calls → sell futures above it).
+Put Wall  = support    (dealers short puts  → buy futures below it).""")
+
+        sh("Put-Call Ratio (PCR)")
+        formula("""PCR_OI = Total_PE_OI / Total_CE_OI  (across all strikes in chain)<br><br>
+PCR percentile = fraction of per-strike PCR values ≤ aggregate PCR (full chain, not just pain window)<br><br>
+Percentile ≥ 75%: BULLISH — heavy put writing = support below<br>
+Percentile 45–55%: NEUTRAL — balanced OI<br>
+Percentile ≤ 25%: BEARISH — heavy call writing = resistance above""")
+
+        sh("Expected Move")
+        formula("""ATM Straddle = CE_LTP_ATM + PE_LTP_ATM<br><br>
+Expected Move ±1σ = Straddle / Spot × 100  (in %)<br>
+Expected Move ±2σ = 2 × EM_1σ<br><br>
+Derived from Brenner-Subrahmanyam: Straddle ≈ S · σ · √(2T/π)
+→ σ = Straddle / (S · √T · √(2/π))""")
+
+        sh("Gamma Exposure (GEX)")
+        formula("""GEX per strike (₹) = [ γ_call × CE_OI − γ_put × PE_OI ] × lot_size × spot<br><br>
+Dealer convention: dealers are net SHORT options → their GEX = −(buyer's GEX)<br>
+  CE_OI × γ_call → positive GEX (dealers short calls → long delta → buy dips)<br>
+  PE_OI × γ_put  → negative GEX (dealers short puts  → short delta → sell rallies)<br><br>
+Scaled by lot_size × spot → rupee-notional units (comparable across instruments)<br><br>
+Net GEX > 0: POSITIVE regime → dealers amplify mean-reversion → range-bound, vol suppressed<br>
+Net GEX < 0: NEGATIVE regime → dealers amplify trending → breakout risk, vol expansion""")
+
+        sh("Gamma Flip Level")
+        formula("""Strikes sorted by distance from spot (nearest first).<br>
+Cumulative GEX accumulated outward until sign changes.<br>
+Gamma Flip = strike where cumulative GEX crosses zero.<br><br>
+Significance: above flip → positive GEX regime (pinning). Below → negative (trending).
+Crossing the flip can trigger rapid vol expansion and gap moves.""")
+
+        sh("IV Skew")
+        formula("""Skew (pp) = IV_put(ATM − 1 step) − IV_call(ATM + 1 step)  × 100<br><br>
+Positive skew (put IV > call IV): downside protection demand elevated — normal for indices<br>
+Negative skew (call IV > put IV): upside speculation — rare, signals breakout positioning<br>
+Near-zero skew: balanced demand — market not hedging directionally""")
+
+    # ── 9. STRATEGY FIT SCORE ─────────────────────────────────
+    with st.expander("9 · Strategy Scoring — Probabilistic EV Engine"):
+        sec("Strategy Selection: Expected Value Ranking (no if/then rules)")
+        body("""The engine no longer uses directional rules like 'if bullish → bull spread'.
+        All 14 canonical strategies are evaluated simultaneously by Expected Value
+        computed from Monte Carlo simulation. The highest composite EV score wins.""")
+
+        sh("Step 1 — Directional Signal (Leading Indicators First)")
+        formula(f"""Signal model optimised for 1–5 day prediction horizon.
+Markets move due to POSITIONING CHANGES, not price indicators.<br><br>
+<b>FACTOR 1 — FLOW (weight {CFG['factor_weights']['flow']:.0%}) — LEADING</b><br>
+  dPCR  = zscore(PCR_today − PCR_5day_avg)   → rising PCR = put writing = BULLISH (+)<br>
+  dSkew = zscore(Skew_today − Skew_5day_avg)  → steepening skew = fear = BEARISH (−)<br>
+  dIV   = zscore(IV_today − IV_5day_avg)      → rising IV = hedging = BEARISH (−)<br>
+  dOI   = zscore(OI_today − OI_5day_avg)      → magnitude of new positioning<br>
+  dGEX  = zscore(GEX_today − GEX_5day_avg)   → falling GEX = trending move coming<br>
+  Flow composite = 0.35×dPCR + 0.30×dSkew + 0.20×dIV + 0.10×dOI + 0.05×dGEX<br><br>
+<b>FACTOR 2 — POSITIONING (weight {CFG['factor_weights']['positioning']:.0%}) — LEADING</b><br>
+  PCR level  = 2 × PCR_percentile_in_chain − 1   (high PCR = put support = bullish)<br>
+  OI skew    = zscore((put_OI_below − call_OI_above) / total_OI)<br>
+  Max pain   = −(spot − max_pain) / expected_move  (gravitational pull)<br>
+  Positioning = 0.45×PCR_level + 0.35×OI_skew + 0.20×max_pain_pull<br><br>
+<b>FACTOR 3 — VOL REGIME (weight {CFG['factor_weights']['vol_regime']:.0%}) — CONCURRENT</b><br>
+  IV/HV percentile = percentile of current IV/HV in 1-year history<br>
+  Term slope = IV_far − IV_near  (backwardation = stress = bearish)<br>
+  Vol regime = 0.60 × (−IV_percentile_z) + 0.40 × term_slope_z<br><br>
+<b>FACTOR 4 — RELATIVE STRENGTH (weight {CFG['factor_weights']['rel_strength']:.0%}) — CONFIRMING</b><br>
+  RS z-score = zscore(RS_ratio vs Nifty 20D) + 0.3 × RS_slope<br><br>
+<b>FACTOR 5 — TREND (weight {CFG['factor_weights']['trend']:.0%}) — CONFIRMING (most lagging)</b><br>
+  EMA score = (passes/5 checks) × 2 − 1<br>
+  ADX pct   = percentile of ADX in rolling history × direction<br>
+  RSI z-score contributes only 10% within this factor<br>
+  Trend = 0.60×EMA + 0.30×ADX + 0.10×RSI<br><br>
+raw_score = {CFG['factor_weights']['flow']:.2f}×flow + {CFG['factor_weights']['positioning']:.2f}×positioning + {CFG['factor_weights']['vol_regime']:.2f}×vol_regime + {CFG['factor_weights']['rel_strength']:.2f}×rel_strength + {CFG['factor_weights']['trend']:.2f}×trend<br>
+prob_up   = logistic(raw_score × 4)  =  1 / (1 + e^{{−raw_score × 4}})<br>
+prob_down = 1 − prob_up<br><br>
+Scale: raw=0.50 → prob_up≈98% · raw=0.25 → prob_up≈73% · raw=0.10 → prob_up≈60%""")
+
+        sh("Step 2 — Monte Carlo EV per Strategy")
+        formula(f"""For each of 14 strategies:<br><br>
+  Simulate {CFG['pop_simulations']:,} terminal prices using:<br>
+    ST = S × exp((μ − 0.5σ²)T + σ√T × Z)   (real-world drift μ from 60-day history)<br>
+    σ = iv_surface(strike)   (per-strike IV from cubic spline interpolation)<br><br>
+  POP = P(total_PnL > 0)   across all paths<br>
+  EV  = E[total_PnL]       = mean PnL across all paths""")
+
+        sh("Step 3 — EV-Adjusted Composite Score")
+        formula("""ev_norm      = tanh(EV / MaxRisk × 0.5)              ∈ [0, 1]<br>
+dte_align    = exp(−ln(2) × dist / half_range)      ∈ [0.05, 1]   (no binary in/out)<br>
+safety_factor= logistic(2 × (safety_ratio − 1.0))   ∈ [0, 1]   (smooth sigmoid)<br>
+ts_factor    = 1 + 0.5 × tanh(IV_slope × 20)        ∈ [0.5, 1.5]  (calendar bonus)<br>
+dir_align    = prob_up   for bull strategies<br>
+              = prob_down for bear strategies<br>
+              = 1 − 2|prob_up − 0.5|  for neutral<br><br>
+ev_score     = ev_norm × POP × dte_align × safety_factor × ts_factor<br>
+composite    = 0.60 × ev_score + 0.40 × (dir_align − 0.5) × 2  ∈ [−1, +1]<br>
+display_score= (composite + 1) / 2 × 100   (0–100)<br><br>
+Selection criterion: sort strategies by composite descending. No if/then rules.""")
+
+        sh("Step 4 — Kelly Fraction")
+        formula("""Kelly = EV / MaxRisk   (EV-based Kelly, not win-rate formula)<br>
+Capped at 25% of capital. Fractional (50%) applied for variance reduction.<br>
+Position size = Kelly_capped × 0.5 × capital""")
+
+        note("The Iron Condor can rank #1 even when P(↑)=60% if its EV is higher than "
+             "a directional call after accounting for skew-aware Monte Carlo paths. "
+             "There are no strategy exclusions — every structure competes on EV.")
+
+    # ── 10. PAYOFF BUILDER ────────────────────────────────────
+    with st.expander("10 · Payoff Builder — P&L Computation"):
+        sec("Multi-Leg Payoff at Expiry")
+
+        sh("Per-Leg Payoff")
+        formula("""For each leg (option type, strike K, premium P, quantity Q, direction d = ±1):<br><br>
+  Intrinsic(spot) = max(spot − K, 0)  for CE<br>
+                  = max(K − spot, 0)  for PE<br><br>
+  Leg P&L = d × (Intrinsic − P) × Q × lot_size<br><br>
+  d = +1 for Buy, −1 for Sell<br>
+  P = entry premium (BS-theoretical or manually entered)<br>
+  Total P&L = Σ all legs""")
+
+        sh("Breakeven Detection")
+        formula("""Scan payoff array for sign changes between adjacent price points i-1 and i:<br><br>
+  if payoff[i-1] × payoff[i] < 0:<br>
+      frac = |payoff[i-1]| / (|payoff[i-1]| + |payoff[i]|)<br>
+      BE = price[i-1] + frac × (price[i] − price[i-1])<br><br>
+Linear interpolation between the two surrounding points — accurate to ±0.1 strike units.""")
+
+        sh("Chart Range")
+        formula("""Base range = ±3σ using trading-day T:<br><br>
+  exp_move_frac = IV × √(2T/π)        (expected |move| = E[|S_T − S|] / S)<br>
+  range_frac    = max(3 × exp_move_frac,  0.03)<br><br>
+  price_range = linspace(spot × (1 − range_frac), spot × (1 + range_frac), 400)<br><br>
+3σ captures 99.7% of the lognormal distribution.
+Floor of ±3% prevents degenerate zero-width charts on same-day expiry.""")
+
+        sh("Reward-to-Risk Ratio")
+        formula("""R:R = |max_profit / max_loss|<br><br>
+Reports ∞ when max_loss = 0 (e.g. long straddle — no loss scenario on expiry payoff).<br>
+Note: payoff is at-expiry intrinsic only — does not include time value of intermediate exit.""")
+
+    # ── 11. IV EDGE SIGNALS ───────────────────────────────────
+    with st.expander("11 · IV Edge Signals — Adaptive Rich vs Cheap Per Strike"):
+        sec("Per-Strike IV Edge Classification (Adaptive Percentile)")
+        body("""Every strike in the chain tab is labelled SELL (rich) or BUY (cheap)
+        based on its IV/HV ratio ranked within the CURRENT CHAIN's own distribution.
+        Thresholds are computed as percentiles of all observed IV/HV ratios across strikes —
+        fully adaptive to each instrument and regime. No fixed 1.20×/0.85× hard-coded constants.""")
+
+        formula(f"""For each strike: ratio = IV_strike / HV20<br><br>
+Collect all valid CE and PE IV/HV ratios across the chain window.<br>
+SELL threshold = {CFG['iv_hv_pct_sell']}th percentile of chain ratios<br>
+BUY  threshold = {CFG['iv_hv_pct_buy']}th percentile of chain ratios<br><br>
+ratio ≥ SELL threshold → SELL (rich) — this strike's IV is elevated vs the chain<br>
+ratio ≤ BUY  threshold → BUY  (cheap) — this strike's IV is depressed vs the chain<br>
+Otherwise: neutral (no edge)<br><br>
+Fallback: uses CFG["iv_rich_ratio"] / CFG["iv_cheap_ratio"] only when chain has < 4 valid strikes.<br>
+Thresholds are configurable via CFG["iv_hv_pct_sell"] and CFG["iv_hv_pct_buy"].""")
+
+        note("The directional signal (BUY / SELL on the CE/PE columns) is separate from the IV edge signal. "
+             "CE_Dir = BUY if bias_score ≥ 12 (bullish). PE_Dir = BUY if bias_score ≤ −12 (bearish). "
+             "Strongest edge = directional signal AND vol signal aligned on the same side.")
+
+    # ── 12. CALENDAR SPREAD TERM STRUCTURE ───────────────────
+    with st.expander("12 · Calendar Spread — Term Structure Logic"):
+        sec("Calendar Spread Entry Condition")
+        body("""A calendar spread (sell near-expiry CE, buy far-expiry CE at same strike) is only
+        attractive when the term structure is inverted: front-month IV > back-month IV.
+        This ensures you are selling expensive near-term vol and buying cheap far-term vol.""")
+
+        formula("""Entry condition:  front_IV > back_IV<br><br>
+Profit mechanism:<br>
+  1. Near-month option decays faster (higher theta)<br>
+  2. If IV term structure normalises, back-month gains more than near-month loses<br>
+  3. P&L peaks when spot pins ATM on near-month expiry<br><br>
+When front_IV ≤ back_IV (normal upward-sloping term structure):<br>
+  You are BUYING the expensive vol and SELLING the cheap vol — adverse carry.<br>
+  The engine flags this in the strategy rationale text.""")
+
+        warn("The calendar signal requires fetching the ATM IV for the NEXT expiry. "
+             "This is only available if you load two expiries separately and compare them. "
+             "The engine displays a term structure warning when front/back IVs are not available.")
+
+    # ── 13. DIVIDEND YIELD ADJUSTMENT ────────────────────────
+    with st.expander("13 · Dividend Yield — Merton Model Adjustment"):
+        sec("Continuous Dividend Yield q (Merton 1973)")
+        body("""Standard BSM assumes the underlying pays no dividends. For dividend-paying
+        stocks, the call is cheaper (dividend reduces forward price) and the put is richer.
+        The Merton model adjusts by replacing S with S·e^(−q·T) in the forward price.""")
+
+        formula("""Forward price with dividends:  F = S · e^(r − q) · T<br><br>
+Effect on call:  lower forward → call cheaper by ~q × S × T × Δ<br>
+Effect on put:   lower forward → put richer by the same amount<br><br>
+q is fetched from yfinance Ticker.info["dividendYield"] (annual %).<br>
+Sanity clamp: q must be in [0, 0.20] — rejects erroneous values > 20%.<br>
+For indices and non-dividend stocks: q = 0 → identical to classic BSM.""")
+
+        note("For NSE indices (NIFTY, BANKNIFTY etc.), q = 0 because index futures already "
+             "embed dividends in the cost-of-carry. For stocks like ITC (yield ~3.5%) or "
+             "COALINDIA (~7%), the Merton adjustment materially changes ATM prices.")
