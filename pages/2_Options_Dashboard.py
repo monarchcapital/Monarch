@@ -758,6 +758,20 @@ def _ingest_resolved_outcomes(symbol: str, resolved_pairs: list):
         _record("_calib_gex_pillar_hist",  entry.get("gex_pillar",  0.0), sym)
         # Record the realised return itself as a forward return observation
         _record("_calib_realised_ret_hist", ret, sym)
+        # ── PART 8: Dedicated probability calibration histories ───────────────
+        # These power the reliability diagram and Brier score in Edge Audit
+        prob_up_stored = entry.get("raw_score", 0.0)  # fallback if prob_up not in entry
+        # Use prob_up if stored in entry (newer snapshots), else derive from raw_score
+        if "prob_up" in entry:
+            prob_up_stored = float(entry["prob_up"])
+        _record("_calib_prob_up_hist",    prob_up_stored, sym)
+        _record("_calib_actual_up_hist",  1.0 if ret > 0 else 0.0, sym)
+        # move_vs_iv: actual_move / expected_move — filled when we have spot data
+        _em_stored = float(entry.get("expected_move", 0.0))
+        _spot_stored = float(entry.get("spot", 0.0))
+        if _spot_stored > 0 and _em_stored > 0:
+            _actual_move = abs(math.exp(ret) - 1.0) * _spot_stored
+            _record("_calib_move_vs_iv_hist", round(_actual_move / _em_stored, 4), sym)
 
 
 # ── Statistical helpers ────────────────────────────────────────────────────────
@@ -1015,11 +1029,12 @@ with st.sidebar:
                              value=st.session_state.opt_access_token, key="opt_tok_inp")
     if tok_inp and tok_inp != st.session_state.opt_access_token:
         st.session_state.opt_access_token = tok_inp
-        # FIX: clear all Upstox API caches so new token takes effect immediately
-        fetch_option_chain.clear()
-        fetch_expiries.clear()
-        fetch_upstox_candles.clear()
-        fetch_upstox_intraday_candles.clear()
+        # FIX: defer cache clearing until after all cached functions are defined.
+        # Calling .clear() here (before their definitions at line ~1606+) raises
+        # NameError on every token save. Use a session flag instead; the actual
+        # clear() calls run in _clear_api_caches() which is called after all
+        # @st.cache_data functions are defined (see call site below).
+        st.session_state["_pending_cache_clear"] = True
         try:
             with open(TOKEN_FILE, "w") as f: f.write(tok_inp)
             st.success("Token saved ✔")
@@ -1899,6 +1914,23 @@ def fetch_upstox_intraday_candles(_token: str, instrument_key: str,
         return df
     except Exception:
         return pd.DataFrame()
+
+
+def _clear_api_caches():
+    """Clear all Upstox @st.cache_data caches.
+    Must be called AFTER all cached functions are defined (not at module top-level
+    where the functions don't exist yet).  Called once per session whenever the
+    access token changes (flag set by the sidebar token widget).
+    """
+    fetch_option_chain.clear()
+    fetch_expiries.clear()
+    fetch_upstox_candles.clear()
+    fetch_upstox_intraday_candles.clear()
+
+# Execute any pending cache clear that was requested by the sidebar token widget
+# (which runs before the cached functions were defined).
+if st.session_state.pop("_pending_cache_clear", False):
+    _clear_api_caches()
 
 
 def get_ohlcv(symbol: str, token: str, master_df=None) -> pd.DataFrame:
@@ -3978,20 +4010,34 @@ def compute_probabilistic_score(
     # expected_move_iv = spot * atm_iv * sqrt(DTE/252)  (spec formula)
     _dte_days = max(T * CFG["ann_days"], 1.0)
     em_iv_spec = spot * atm_iv * math.sqrt(_dte_days / 252.0)   # spec: sqrt(DTE/252)
+    em_iv_pct  = round(em_iv_spec / (spot + 1e-9) * 100, 2)
+
     # Implied prob of up move from options pricing
     # implied_prob_up ≈ 0.50 + (expected_move / spot) / 2
     implied_prob_up = min(0.90, max(0.10, 0.50 + (em_iv_spec / (spot + 1e-9)) / 2.0))
 
-    # ── STEP 5: Directional edge ──────────────────────────────────────────────
-    # direction_edge = model prob_up − market implied prob_up
-    direction_edge = round(prob_up - implied_prob_up, 4)
-    # Positive edge → model more bullish than options imply
-    # Negative edge → model more bearish than options imply
-    edge_label = ("Bullish Edge" if direction_edge > 0.03
-                  else "Bearish Edge" if direction_edge < -0.03
+    # ── PART 4: Model expected move ───────────────────────────────────────────
+    # model_move = expected_move * (0.5 + |final_score|)
+    # This estimates how much the model expects relative to implied move.
+    # Use blended_raw if available (intraday blended), else raw_score
+    _final_score_for_move = raw_score   # best available final score
+    model_move     = em_iv_spec * (0.5 + abs(_final_score_for_move))
+    model_move_pct = round(model_move / (spot + 1e-9) * 100, 2)
+
+    # ── PART 5: Edge detection ────────────────────────────────────────────────
+    # Direction edge: prob_up - 0.50 (simpler, absolute measure of directional conviction)
+    direction_edge  = round(prob_up - 0.50, 4)
+    # Move edge: model_move - expected_move (positive = expect bigger move than IV implies)
+    move_edge       = round(model_move - em_iv_spec, 2)
+    move_edge_pct   = round(move_edge / (spot + 1e-9) * 100, 2)
+    # Vol edge: if model expects bigger move → options underpriced → BUY vol
+    vol_edge        = ("BUY" if move_edge > 0 else "SELL")
+
+    edge_label = ("Bullish Edge" if direction_edge > 0.05
+                  else "Bearish Edge" if direction_edge < -0.05
                   else "No Edge")
 
-    # ── STEP 3: Signal strength label ────────────────────────────────────────
+    # ── PART 3: Signal strength label ────────────────────────────────────────
     _pu_for_label = prob_up
     if _pu_for_label > 0.75:   signal_strength = "Very Strong Bullish"
     elif _pu_for_label > 0.65: signal_strength = "Strong Bullish"
@@ -4003,12 +4049,19 @@ def compute_probabilistic_score(
     elif _pu_for_label < 0.45: signal_strength = "Weak Bearish"
     else:                      signal_strength = "No Edge"
 
+    # ── PART 8: Store dedicated calibration histories ─────────────────────────
+    # _calib_prob_up_hist  — model predicted probability
+    # _calib_actual_up_hist— will be filled at outcome resolution (1 if return > 0)
+    # _calib_move_vs_iv_hist— actual_move / expected_move (filled at resolution)
+    _record("_calib_prob_up_hist", prob_up)
+    # _calib_actual_up_hist and _calib_move_vs_iv_hist filled in _ingest_resolved_outcomes
+
     return {
         "raw_score":         round(raw_score, 4),
         "prob_up":           round(prob_up, 4),
         "prob_down":         round(prob_down, 4),
         "feature_scores":    fs,
-        "expected_move":     round(_mc_expected_move, 2),   # MC std replaces straddle EM
+        "expected_move":     round(_mc_expected_move, 2),
         "expected_move_pct": round(_mc_expected_move / spot * 100, 2) if spot > 0 else round(em_pct, 2),
         "iv_hv_pct":         round(iv_hv_pct, 4),
         "pcr_pct":           round(pcr_pct, 4),
@@ -4018,12 +4071,16 @@ def compute_probabilistic_score(
         "factor_weights":    {k: round(v, 4) for k, v in fw.items()},
         "mc_direction":      round(_mc_direction, 4),
         "mc_expected_move":  round(_mc_expected_move, 2),
-        # Steps 3-5 additions
+        # Parts 3-5
         "implied_prob_up":   round(implied_prob_up, 4),
-        "implied_move_pct":  round(em_iv_spec / (spot + 1e-9) * 100, 2),
+        "implied_move_pct":  em_iv_pct,
+        "model_move_pct":    model_move_pct,
         "direction_edge":    direction_edge,
+        "move_edge_pct":     move_edge_pct,
+        "vol_edge":          vol_edge,
         "edge_label":        edge_label,
         "signal_strength":   signal_strength,
+        "final_score":       round(raw_score, 4),   # alias for clarity in Decision Panel
     }
 
 
@@ -4254,7 +4311,6 @@ def ev_rank_strategies(universe, spot, T, r, atm_iv, q,
 
         # FIX Bug 6: For unlimited-risk/reward strategies (max_risk=999 or max_reward=999),
         # use MC-derived actual risk/reward instead of the placeholder sentinel value.
-        # This prevents ev_norm collapsing (credit strategies) or saturating (debit strategies).
         _mc_pnl_5pct  = float(np.percentile(pnl, 5))   # worst 5% outcome
         _mc_pnl_95pct = float(np.percentile(pnl, 95))  # best 5% outcome
         _mc_risk_eff   = max(abs(_mc_pnl_5pct), sum(abs(leg["premium"]) for leg in s["legs"]), 1.0)
@@ -4262,17 +4318,34 @@ def ev_rank_strategies(universe, spot, T, r, atm_iv, q,
         if max_risk   >= 999: max_risk   = _mc_risk_eff
         if max_reward >= 999: max_reward = _mc_reward_eff
 
-        # ── True Kelly from PnL distribution (Improvement #5) ────
-        # Derive p, avg_win, avg_loss directly from MC PnL paths
+        # ── PART 6: EV blend — model probability + MC distribution ───────────
+        # Blend MC-derived EV with a model-probability-based EV estimate.
+        # This ensures model conviction (prob_up/prob_down) feeds into EV,
+        # not just the risk-neutral MC distribution.
+        # model_ev = prob_up * avg_win_mc - prob_down * avg_loss_mc
         wins_arr   = pnl[pnl > 0]
         losses_arr = pnl[pnl < 0]
-        if len(wins_arr) > 0 and len(losses_arr) > 0:
-            p_win    = len(wins_arr) / len(pnl)
-            avg_win  = float(wins_arr.mean())
-            avg_loss = float(abs(losses_arr.mean()))
-            kelly_raw = (p_win * avg_win - (1.0 - p_win) * avg_loss) / (avg_win + 1e-9)
+        _avg_win_mc  = float(wins_arr.mean())  if len(wins_arr)  > 0 else max_reward
+        _avg_loss_mc = float(abs(losses_arr.mean())) if len(losses_arr) > 0 else max_risk
+        model_ev = (final_prob_up * _avg_win_mc) - (final_prob_down * _avg_loss_mc)
+        # Blend: 60% MC paths (unbiased), 40% model probability (directional conviction)
+        ev = round(0.60 * ev + 0.40 * model_ev, 4)
+        ev_per_lot = ev * lot_size
+
+        # ── PART 7: Kelly using explicit model probability formula ────────────
+        # kelly = (prob_up * win - prob_down * loss) / loss  (spec formula)
+        # Use model prob_up/prob_down (blended with MC) for conviction-based sizing
+        if _avg_win_mc > 0 and _avg_loss_mc > 0:
+            _kelly_model = ((final_prob_up * _avg_win_mc
+                             - final_prob_down * _avg_loss_mc)
+                            / (_avg_loss_mc + 1e-9))
+            # Also compute pure MC Kelly for comparison
+            p_win    = len(wins_arr) / len(pnl) if len(wins_arr) > 0 else 0.0
+            _kelly_mc = ((p_win * _avg_win_mc - (1.0 - p_win) * _avg_loss_mc)
+                         / (_avg_win_mc + 1e-9))
+            # Blend: model Kelly carries directional conviction, MC Kelly is unbiased
+            kelly_raw = 0.60 * _kelly_mc + 0.40 * _kelly_model
         elif max_risk > 0 and max_risk < 1e6:
-            # Fallback to EV-based Kelly when PnL is one-sided
             kelly_raw = ev / (max_risk + 1e-9)
         elif max_risk >= 1e6:
             _proxy_risk = sum(abs(leg["premium"]) for leg in s["legs"]) * 2
@@ -4280,8 +4353,6 @@ def ev_rank_strategies(universe, spot, T, r, atm_iv, q,
         else:
             kelly_raw = 0.0
         kelly_capped = max(0.0, min(CFG.get("kelly_cap", 0.25), kelly_raw))
-        # Fractional Kelly: apply kelly_fraction from CFG (default 0.5 = half-Kelly)
-        # position_size = kelly * kelly_fraction * capital
         kelly_fractional = kelly_capped * CFG.get("kelly_fraction", 0.5)
 
         # ── DTE alignment — continuous exponential decay, no binary in/out ──
@@ -5571,13 +5642,14 @@ def _compute_edge_metrics(log: list, sym: str) -> dict:
 # 📅 Structure — Context
 # 📐 Reference — Reference
 # 🔬 Edge Audit — Does the signal actually have edge?
-t_signal, t_trade, t_chain, t_structure, t_reference, t_edge = st.tabs([
+t_signal, t_trade, t_chain, t_structure, t_reference, t_edge, t_prob = st.tabs([
     "⚡ Signal",
     "🎯 Trade",
     "📋 Chain & Data",
     "📅 Structure",
     "📐 Reference",
     "🔬 Edge Audit",
+    "🎲 Probability Engine",
 ])
 
 # Alias old tab names to new tabs so all existing rendering code works unchanged
@@ -5623,46 +5695,61 @@ with t_ov:
                    f"Gap between them is normal when historical IV had outlier spikes.")
     p7.metric("DTE",         str(dte))
 
-    # ── Steps 3-6: Probability Engine Panel ──────────────────────────────────
-    _imp_pu   = prob_score.get("implied_prob_up", 0.5)
-    _imp_mv   = prob_score.get("implied_move_pct", _emp)
-    _dir_edge = prob_score.get("direction_edge", 0.0)
-    _sig_str  = prob_score.get("signal_strength", "No Edge")
-    _edg_lbl  = prob_score.get("edge_label", "No Edge")
+    # ── PART 12: Decision Panel ───────────────────────────────────────────────
+    # Full output: Signals → Score → Probability → Edge → EV → Kelly → Strategy
+    _imp_pu      = prob_score.get("implied_prob_up",  0.5)
+    _imp_mv      = prob_score.get("implied_move_pct", _emp)
+    _model_mv    = prob_score.get("model_move_pct",   _emp)
+    _dir_edge    = prob_score.get("direction_edge",   0.0)
+    _move_edge   = prob_score.get("move_edge_pct",    0.0)
+    _vol_edge    = prob_score.get("vol_edge",         "—")
+    _sig_str     = prob_score.get("signal_strength",  "No Edge")
+    _edg_lbl     = prob_score.get("edge_label",       "No Edge")
 
-    _ss_col  = ("#00d084" if "Bullish" in _sig_str
-                else "#ff3b3b" if "Bearish" in _sig_str else "#888")
-    _de_col  = ("#00d084" if _dir_edge > 0.03
-                else "#ff3b3b" if _dir_edge < -0.03 else "#888")
-    _de_sign = "+" if _dir_edge >= 0 else ""
+    # Top strategy EV + Kelly for Decision Panel
+    _dp_strat = strat_recs[0] if strat_recs else {}
+    _dp_ev    = _dp_strat.get("ev", 0.0)
+    _dp_kelly = _dp_strat.get("kelly", 0.0)
+    _dp_kelly_pct = round(_dp_kelly * 100, 1)
+
+    # Colours
+    _ss_col   = ("#00d084" if "Bullish" in _sig_str
+                 else "#ff3b3b" if "Bearish" in _sig_str else "#888")
+    _de_col   = ("#00d084" if _dir_edge > 0.05
+                 else "#ff3b3b" if _dir_edge < -0.05 else "#888")
+    _me_col   = ("#00d084" if _move_edge > 0 else "#ff3b3b")
+    _ve_col   = ("#1e90ff" if _vol_edge == "BUY" else "#ff8c00")
+    _ev_col   = ("#00d084" if _dp_ev > 0 else "#ff3b3b")
+    _pu_col2  = ("#00d084" if _pu > 0.55 else "#ff3b3b" if _pu < 0.45 else "#ffb347")
+
+    def _dp_cell(label, value, color, sublabel=""):
+        sub = f'<div style="color:#444;font-size:0.68rem;margin-top:1px;">{sublabel}</div>' if sublabel else ""
+        return (f'<div style="min-width:90px;">'
+                f'<div style="color:#555;font-size:0.68rem;letter-spacing:.07em;'
+                f'text-transform:uppercase;">{label}</div>'
+                f'<div style="color:{color};font-size:0.90rem;font-weight:700;'
+                f'line-height:1.2;">{value}</div>{sub}</div>')
+
+    _sign_de  = "+" if _dir_edge >= 0 else ""
+    _sign_me  = "+" if _move_edge >= 0 else ""
 
     st.markdown(f"""
-<div style="background:#0d0d0d;border:1px solid #2a2a2a;border-left:3px solid {_ss_col};
-padding:10px 16px;margin:6px 0 4px;font-family:'IBM Plex Mono',monospace;
-display:flex;gap:32px;align-items:center;flex-wrap:wrap;">
-  <div>
-    <div style="color:#555;font-size:0.72rem;letter-spacing:.06em;">SIGNAL STRENGTH</div>
-    <div style="color:{_ss_col};font-size:0.96rem;font-weight:700;">{_sig_str}</div>
+<div style="background:#080808;border:1px solid #2a2a2a;border-left:4px solid {_ss_col};
+padding:12px 18px;margin:6px 0 6px;font-family:'IBM Plex Mono',monospace;">
+  <div style="color:#555;font-size:0.70rem;letter-spacing:.10em;margin-bottom:8px;">
+    ◼ DECISION PANEL &nbsp;·&nbsp; Signals → Score → Probability → Edge → EV → Kelly
   </div>
-  <div>
-    <div style="color:#555;font-size:0.72rem;letter-spacing:.06em;">MODEL P(↑)</div>
-    <div style="color:{_pu_col};font-size:0.96rem;font-weight:700;">{_pu*100:.1f}%</div>
-  </div>
-  <div>
-    <div style="color:#555;font-size:0.72rem;letter-spacing:.06em;">IMPLIED P(↑)</div>
-    <div style="color:#888;font-size:0.96rem;font-weight:700;">{_imp_pu*100:.1f}%</div>
-  </div>
-  <div>
-    <div style="color:#555;font-size:0.72rem;letter-spacing:.06em;">DIR EDGE</div>
-    <div style="color:{_de_col};font-size:0.96rem;font-weight:700;">{_de_sign}{_dir_edge*100:.1f}pp &nbsp;·&nbsp; {_edg_lbl}</div>
-  </div>
-  <div>
-    <div style="color:#555;font-size:0.72rem;letter-spacing:.06em;">IMPLIED MOVE</div>
-    <div style="color:#888;font-size:0.96rem;font-weight:700;">±{_imp_mv:.1f}%</div>
-  </div>
-  <div style="margin-left:auto;">
-    <div style="color:#555;font-size:0.70rem;">Model P(↑) − Implied P(↑)</div>
-    <div style="color:#444;font-size:0.70rem;">Positive = model more bullish than options imply</div>
+  <div style="display:flex;flex-wrap:wrap;gap:18px;align-items:flex-start;">
+    {_dp_cell("Signal Strength", _sig_str,  _ss_col)}
+    {_dp_cell("Prob Up ↑",  f"{_pu*100:.1f}%",   _pu_col2,  f"score {_rs:+.3f}")}
+    {_dp_cell("Prob Down ↓",f"{(1-_pu)*100:.1f}%", "#ff3b3b")}
+    {_dp_cell("Implied Move", f"±{_imp_mv:.1f}%", "#888",  f"IV×√(DTE/252)")}
+    {_dp_cell("Model Move",   f"±{_model_mv:.1f}%", _me_col, f"EM×(0.5+|score|)")}
+    {_dp_cell("Dir Edge",  f"{_sign_de}{_dir_edge*100:.1f}pp", _de_col, _edg_lbl)}
+    {_dp_cell("Move Edge",    f"{_sign_me}{_move_edge:.1f}%",  _me_col, "model−implied")}
+    {_dp_cell("Vol Edge",  _vol_edge,  _ve_col, "buy/sell options")}
+    {_dp_cell("Top EV",   f"₹{_dp_ev:+.0f}", _ev_col, _dp_strat.get("Strategy","—")[:16])}
+    {_dp_cell("Kelly Size", f"{_dp_kelly_pct:.1f}%", "#ff8c00", "of capital")}
   </div>
 </div>""", unsafe_allow_html=True)
 
@@ -6291,6 +6378,9 @@ font-family:'IBM Plex Mono',monospace;font-size:0.83rem;margin-bottom:4px;">
     _s7_edge  = prob_score.get("edge_label", "No Edge")
     _s7_de    = prob_score.get("direction_edge", 0.0)
     _s7_imp   = prob_score.get("implied_move_pct", 0.0)
+    _s7_model = prob_score.get("model_move_pct", 0.0)
+    _s7_me    = prob_score.get("move_edge_pct", 0.0)
+    _s7_ve    = prob_score.get("vol_edge", "—")
 
     # Determine recommended strategy class
     _high_prob = _s7_pu > 0.60
@@ -6343,6 +6433,15 @@ display:flex;gap:24px;align-items:center;flex-wrap:wrap;font-size:0.80rem;">
   <div>
     <span style="color:#555;font-size:0.70rem;">Implied Move: </span>
     <span style="color:#888;">±{_s7_imp:.1f}%</span>
+  </div>
+  <div>
+    <span style="color:#555;font-size:0.70rem;">Model Move: </span>
+    <span style="color:{'#00d084' if _s7_model > _s7_imp else '#ff8c00'};">±{_s7_model:.1f}%</span>
+  </div>
+  <div>
+    <span style="color:#555;font-size:0.70rem;">Vol Edge: </span>
+    <span style="color:{'#1e90ff' if _s7_ve=='BUY' else '#ff8c00'};font-weight:700;">{_s7_ve} options</span>
+    <span style="color:#444;font-size:0.68rem;"> (move edge {'+' if _s7_me>=0 else ''}{_s7_me:.1f}%)</span>
   </div>
   <div style="margin-left:auto;color:#555;font-size:0.72rem;">{_s7_rec_why}</div>
 </div>""", unsafe_allow_html=True)
@@ -9946,22 +10045,29 @@ Collect signals daily for 2–3 months for statistically meaningful results.
                 _pred_pu = 1.0 / (1.0 + np.exp(-_s8_sharp * _raw_arr))
                 _actual_up = (_ret_arr > 0).astype(float)
 
-                # Bin into 5 buckets by predicted probability
-                _bins = [0.0, 0.35, 0.45, 0.55, 0.65, 1.0]
-                _bin_labels = ["<35%", "35-45%", "45-55%", "55-65%", ">65%"]
+                # Bin into spec-defined 0.05-wide buckets
+                # 0.50–0.55, 0.55–0.60, 0.60–0.65, 0.65–0.70, 0.70–0.75, 0.75–0.80, 0.80–1.00
+                # Plus bearish mirror: 0.20–0.25, 0.25–0.30, 0.30–0.35, 0.35–0.40, 0.40–0.45, 0.45–0.50
+                _bins = [0.0, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45,
+                         0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 1.0]
+                _bin_labels = ["<20%","20-25%","25-30%","30-35%","35-40%","40-45%","45-50%",
+                               "50-55%","55-60%","60-65%","65-70%","70-75%","75-80%",">80%"]
                 _rel_rows = []
                 for i in range(len(_bins)-1):
                     mask = (_pred_pu >= _bins[i]) & (_pred_pu < _bins[i+1])
                     n_bin = int(mask.sum())
-                    if n_bin == 0:
+                    if n_bin < 2:
                         continue
-                    pred_mean  = float(_pred_pu[mask].mean())
+                    pred_mean   = float(_pred_pu[mask].mean())
                     actual_freq = float(_actual_up[mask].mean())
+                    _move_vs_iv_h = _get_hist("_calib_move_vs_iv_hist", sym)
+                    _mvi_subset   = float(np.mean(_move_vs_iv_h[-n_bin:])) if len(_move_vs_iv_h) >= n_bin else 0.0
                     _rel_rows.append({
                         "Predicted P(↑)": _bin_labels[i],
                         "Avg Predicted":  round(pred_mean * 100, 1),
                         "Actual Up %":    round(actual_freq * 100, 1),
                         "N":              n_bin,
+                        "Avg Move/IV":    round(_mvi_subset, 2) if _mvi_subset else "—",
                         "Gap":            round((actual_freq - pred_mean) * 100, 1),
                     })
 
@@ -10010,8 +10116,18 @@ Collect signals daily for 2–3 months for statistically meaningful results.
                             return "color:#00d084"
                         except Exception:
                             return ""
+                    def _mvi_style(v):
+                        try:
+                            m = float(str(v))
+                            if m > 1.05: return "color:#1e90ff;font-weight:700"   # long vol edge
+                            if m < 0.90: return "color:#ff8c00;font-weight:700"   # short vol edge
+                            return "color:#888"
+                        except Exception:
+                            return ""
                     st.dataframe(
-                        _rel_df.style.map(_gap_style, subset=["Gap"]),
+                        _rel_df.style
+                            .map(_gap_style, subset=["Gap"])
+                            .map(_mvi_style, subset=["Avg Move/IV"]),
                         use_container_width=True, hide_index=True
                     )
                     # Calibration verdict
@@ -10160,3 +10276,625 @@ Collect signals daily for 2–3 months for statistically meaningful results.
             st.info(f"ℹ️ Probability calibration requires at least 5 paired (score, return) observations. "
                     f"Currently {n_s8}. These accumulate automatically with daily use — "
                     "each Load records a snapshot and resolves it after 4 trading days.")
+
+# ══════════════════════════════════════════════════════════════
+# TAB — PROBABILITY ENGINE
+# Full probability-based decision panel:
+#   Signals → Score → Probability → Implied Move comparison
+#   → Edge → EV → Kelly → Strategy recommendation
+# All sections are self-contained and work with data already
+# computed in the render section above (prob_score, strat_recs,
+# chain_df, oi_d, atm_iv, hv20, dte, spot, etc.)
+# ══════════════════════════════════════════════════════════════
+with t_prob:
+
+    # ── helpers used throughout this tab ──────────────────────────────────────
+    def _peng_color(v, lo=0.40, hi=0.60, mid_lo=0.45, mid_hi=0.55):
+        """Return hex colour based on prob_up value."""
+        if v >= hi:    return "#00d084"   # strong bull
+        if v >= mid_hi: return "#7dca84"  # mild bull
+        if v <= lo:    return "#ff3b3b"   # strong bear
+        if v <= mid_lo: return "#ff7777"  # mild bear
+        return "#ffb347"                  # neutral
+
+    def _brier_color(b):
+        if b < 0.15: return "#00d084"
+        if b < 0.18: return "#7dca84"
+        if b < 0.20: return "#ffb347"
+        if b < 0.23: return "#ff7777"
+        return "#ff3b3b"
+
+    # ── live values from already-computed render-section variables ─────────────
+    _pe_pu    = float(prob_score.get("prob_up",   0.5))
+    _pe_pd    = float(prob_score.get("prob_down", 0.5))
+    _pe_rs    = float(prob_score.get("raw_score", 0.0))
+    _pe_em    = float(prob_score.get("expected_move", 0.0))
+    _pe_emp   = float(prob_score.get("expected_move_pct", 0.0))
+    _pe_dir_e = _pe_pu - 0.50                            # Direction edge
+    _pe_iv_dec = atm_iv                                  # already decimal form
+
+    # Historical move vs IV from calibration histories
+    _pe_mvi_hist = st.session_state.get("_calib_move_vs_iv_hist", [])
+    # also check namespaced version
+    _sym_ns = sym.upper()
+    _ns_key = f"{_sym_ns}:_calib_move_vs_iv_hist"
+    _pe_mvi_ns = st.session_state.get(_ns_key, [])
+    _pe_mvi_all = _pe_mvi_ns if _pe_mvi_ns else _pe_mvi_hist
+    _pe_avg_mvi = float(np.mean(_pe_mvi_all[-50:])) if len(_pe_mvi_all) >= 3 else None
+
+    # Vol edge direction
+    if _pe_avg_mvi is not None:
+        if _pe_avg_mvi > 1.05:   _pe_vol_edge = "BUY"
+        elif _pe_avg_mvi < 0.90: _pe_vol_edge = "SELL"
+        else:                     _pe_vol_edge = "NEUTRAL"
+    else:
+        _pe_vol_edge = prob_score.get("vol_edge", "—")
+
+    # Calibration histories for Brier / buckets
+    _pe_prob_hist   = st.session_state.get(_ns_key.replace("move_vs_iv", "prob_up"), []) or \
+                      st.session_state.get("_calib_prob_up_hist",   [])
+    _pe_actual_hist = st.session_state.get(_ns_key.replace("move_vs_iv", "actual_up"), []) or \
+                      st.session_state.get("_calib_actual_up_hist", [])
+    _pe_n_obs       = min(len(_pe_prob_hist), len(_pe_actual_hist))
+
+    # ── Page title ─────────────────────────────────────────────────────────────
+    st.markdown("### 🎲 Probability Engine — Decision Dashboard")
+    st.caption(
+        "Converts model signals into probabilities, compares with implied move, "
+        "and produces an actionable edge recommendation. "
+        "Data accumulates across loads — more history = sharper calibration."
+    )
+
+    if not st.session_state.opt_loaded:
+        st.info("⚠️ Load a symbol first (press **Load** in the sidebar) to populate this panel.")
+    else:
+        # ══════════════════════════════════════════════════════════════════════
+        # SECTION 1 — PROBABILITY PANEL
+        # ══════════════════════════════════════════════════════════════════════
+        st.markdown("---")
+        st.markdown("#### § 1 — Model Probabilities")
+
+        _pu_col  = _peng_color(_pe_pu)
+        _pd_col  = _peng_color(1 - _pe_pd, lo=0.40, hi=0.60)
+
+        _dir_edge_lbl = (
+            "🟢 Bullish Edge"  if _pe_dir_e >  0.05 else
+            "🔴 Bearish Edge"  if _pe_dir_e < -0.05 else
+            "⚪ Neutral"
+        )
+        _dir_edge_col = "#00d084" if _pe_dir_e > 0.05 else "#ff3b3b" if _pe_dir_e < -0.05 else "#888"
+
+        _s1c1, _s1c2, _s1c3, _s1c4 = st.columns(4)
+        _s1c1.metric("Probability Up ↑",   f"{_pe_pu*100:.1f}%",
+                     delta=f"raw score {_pe_rs:+.3f}", delta_color="normal",
+                     help="Logistic-calibrated probability of an up move next 1–5 days.")
+        _s1c2.metric("Probability Down ↓", f"{_pe_pd*100:.1f}%",
+                     help="1 − Prob Up.")
+        _s1c3.metric("Direction Edge",     f"{_pe_dir_e*100:+.1f}pp",
+                     help="Prob Up − 50%. Positive = bullish edge; negative = bearish edge.")
+        _s1c4.metric("Signal Strength",
+                     prob_score.get("signal_strength", "—"),
+                     help="Qualitative strength label derived from the raw score.")
+
+        # Probability gauge bar
+        _gauge_bull = max(0.0, min(1.0, _pe_pu))
+        _gauge_bear = max(0.0, min(1.0, _pe_pd))
+        _gauge_html = f"""
+<div style="font-family:'IBM Plex Mono',monospace;margin:10px 0 6px 0;">
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:4px;">
+    <span style="color:#ff3b3b;font-size:.78rem;width:60px;text-align:right;">BEAR {_gauge_bear*100:.0f}%</span>
+    <div style="flex:1;height:18px;background:#1a1a1a;border-radius:2px;overflow:hidden;display:flex;">
+      <div style="width:{_gauge_bear*100:.1f}%;background:linear-gradient(90deg,#ff3b3b,#ff7777);
+                  transition:width .4s ease;"></div>
+      <div style="width:{_gauge_bull*100:.1f}%;background:linear-gradient(90deg,#7dca84,#00d084);
+                  transition:width .4s ease;"></div>
+    </div>
+    <span style="color:#00d084;font-size:.78rem;width:60px;">BULL {_gauge_bull*100:.0f}%</span>
+  </div>
+  <div style="text-align:center;font-size:.82rem;color:{_dir_edge_col};font-weight:700;
+              letter-spacing:.1em;">{_dir_edge_lbl} &nbsp;·&nbsp; Edge = {_pe_dir_e*100:+.1f}pp</div>
+</div>"""
+        st.markdown(_gauge_html, unsafe_allow_html=True)
+
+        # Interpretation guide
+        with st.expander("ℹ️ How to read probabilities", expanded=False):
+            st.markdown("""
+| Prob Up | Interpretation |
+|---------|----------------|
+| > 0.65  | **Strong Bullish** — high-conviction long setup |
+| 0.55–0.65 | **Mild Bullish** — lean long, size smaller |
+| 0.45–0.55 | **Neutral** — no directional edge, vol trade only |
+| 0.35–0.45 | **Mild Bearish** — lean short, size smaller |
+| < 0.35  | **Strong Bearish** — high-conviction short setup |
+
+Direction Edge = Prob Up − 50%. Every 1pp above 50% represents 1pp of directional alpha over random.
+""")
+
+        # ══════════════════════════════════════════════════════════════════════
+        # SECTION 2 — MOVE VS IMPLIED MOVE
+        # ══════════════════════════════════════════════════════════════════════
+        st.markdown("---")
+        st.markdown("#### § 2 — Move vs Implied Move (Volatility Edge)")
+
+        # Expected move using NSE formula: spot × IV × √(DTE/252)
+        _pe_em_calc = spot * _pe_iv_dec * math.sqrt(max(dte, 1) / 252.0)
+        _pe_em_pct  = _pe_em_calc / spot * 100 if spot > 0 else 0.0
+
+        _s2c1, _s2c2, _s2c3, _s2c4 = st.columns(4)
+        _s2c1.metric("Expected Move (±)",
+                     f"₹{_pe_em_calc:,.0f}",
+                     delta=f"±{_pe_em_pct:.2f}%",
+                     help=f"NSE formula: Spot × IV × √(DTE/252) = {spot:,.0f} × {_pe_iv_dec*100:.1f}% × √({dte}/252)")
+        _s2c2.metric("ATM IV",    f"{_pe_iv_dec*100:.1f}%",
+                     delta=f"HV20 {hv20*100:.1f}%",
+                     help="Implied vol vs 20-day historical vol.")
+        _s2c3.metric("IV / HV Ratio",
+                     f"{(_pe_iv_dec/(hv20+1e-9)):.2f}×",
+                     help="Ratio > 1.2 → IV rich (sell premium). Ratio < 0.85 → IV cheap (buy premium).")
+
+        if _pe_avg_mvi is not None:
+            _mvi_delta = "underpriced 📈" if _pe_avg_mvi > 1.05 else "overpriced 📉" if _pe_avg_mvi < 0.90 else "fair ↔"
+            _s2c4.metric("Avg Move vs IV",
+                         f"{_pe_avg_mvi:.2f}×",
+                         delta=_mvi_delta,
+                         delta_color="off",
+                         help=f"Based on {len(_pe_mvi_all)} resolved observations. "
+                              ">1 = options underpriced; <1 = options overpriced.")
+        else:
+            _s2c4.metric("Avg Move vs IV", "— (no data)",
+                         help="Accumulates after enough resolved signal observations.")
+
+        # Move vs IV history mini-chart
+        if len(_pe_mvi_all) >= 5:
+            _mvi_series = _pe_mvi_all[-60:]
+            _fig_mvi = go.Figure()
+            _mvi_colors = ["#00d084" if v > 1.0 else "#ff3b3b" for v in _mvi_series]
+            _fig_mvi.add_trace(go.Bar(
+                x=list(range(len(_mvi_series))),
+                y=_mvi_series,
+                marker_color=_mvi_colors,
+                name="|Actual| / Implied",
+                hovertemplate="Obs %{x}: %{y:.2f}×<extra></extra>"
+            ))
+            _fig_mvi.add_hline(y=1.0, line=dict(color="#ff8c00", dash="dash", width=1.5),
+                                annotation_text="IV = actual (1.0×)")
+            if _pe_avg_mvi is not None:
+                _fig_mvi.add_hline(y=_pe_avg_mvi,
+                                   line=dict(color="#1e90ff", dash="dot", width=1),
+                                   annotation_text=f"avg {_pe_avg_mvi:.2f}×")
+            _fig_mvi.update_layout(
+                height=200, plot_bgcolor="#000", paper_bgcolor="#000",
+                font=dict(color="#e8e8e8", family="IBM Plex Mono", size=9),
+                xaxis=dict(title="Observation (recent →)", gridcolor="#111"),
+                yaxis=dict(title="|Actual| / Implied", gridcolor="#111", range=[0, 3.0]),
+                margin=dict(t=10, b=10, l=40, r=10),
+                showlegend=False,
+            )
+            st.plotly_chart(_fig_mvi, use_container_width=True)
+            _pct_over = float(np.mean([1 if m > 1 else 0 for m in _pe_mvi_all])) * 100
+            _mvi_interp = (
+                f"**Long Vol Edge** — {_pct_over:.0f}% of moves exceeded implied; options historically underpriced."
+                if (_pe_avg_mvi or 1) > 1.05 else
+                f"**Short Vol Edge** — only {_pct_over:.0f}% of moves exceeded implied; options historically overpriced."
+                if (_pe_avg_mvi or 1) < 0.90 else
+                f"**No Vol Edge** — moves ≈ implied ({_pct_over:.0f}% > 1.0×)."
+            )
+            st.markdown(_mvi_interp)
+        else:
+            _needed = 5 - len(_pe_mvi_all)
+            st.caption(f"⏳ Move vs IV history needs {_needed} more resolved observation(s). "
+                       "Each Load adds one; it resolves after ~4 trading days.")
+
+        # ══════════════════════════════════════════════════════════════════════
+        # SECTION 3 — PROBABILITY CALIBRATION TABLE
+        # ══════════════════════════════════════════════════════════════════════
+        st.markdown("---")
+        st.markdown("#### § 3 — Probability Calibration Table")
+        st.caption(
+            "Compares model-predicted probabilities against real outcomes. "
+            "Good calibration: Actual Up % should increase as Avg Model Prob increases. "
+            "Diagonal alignment = model is well-calibrated."
+        )
+
+        if _pe_n_obs >= 5:
+            _ph  = np.array(_pe_prob_hist[-_pe_n_obs:],   dtype=float)
+            _ah  = np.array(_pe_actual_hist[-_pe_n_obs:], dtype=float)
+
+            # Build buckets — both sides of 0.50 to capture bearish signals too
+            _buckets = [
+                (0.20, 0.30, "0.20–0.30 (Strong Bear)"),
+                (0.30, 0.40, "0.30–0.40 (Bear)"),
+                (0.40, 0.50, "0.40–0.50 (Mild Bear)"),
+                (0.50, 0.55, "0.50–0.55"),
+                (0.55, 0.60, "0.55–0.60"),
+                (0.60, 0.65, "0.60–0.65"),
+                (0.65, 0.70, "0.65–0.70"),
+                (0.70, 0.75, "0.70–0.75"),
+                (0.75, 0.80, "0.75–0.80"),
+                (0.80, 1.01, "0.80–1.00 (Strong Bull)"),
+            ]
+
+            _calib_rows = []
+            for _bl, _bh, _blbl in _buckets:
+                _mask = (_ph >= _bl) & (_ph < _bh)
+                _cnt  = int(_mask.sum())
+                if _cnt == 0:
+                    continue
+                _avg_pred = float(_ph[_mask].mean())
+                _act_freq = float(_ah[_mask].mean())
+                # Calibration gap: positive = overconfident, negative = underconfident
+                _gap      = _avg_pred - _act_freq
+                _gap_lbl  = (f"+{_gap*100:.1f}pp ⚠ over"  if _gap >  0.05
+                             else f"{_gap*100:.1f}pp ⚠ under" if _gap < -0.05
+                             else f"{_gap*100:+.1f}pp ✓")
+                _calib_rows.append({
+                    "Prob Bucket":       _blbl,
+                    "Avg Model Prob":    f"{_avg_pred*100:.1f}%",
+                    "Actual Up %":       f"{_act_freq*100:.1f}%",
+                    "Count":             _cnt,
+                    "Calibration Gap":   _gap_lbl,
+                })
+
+            if _calib_rows:
+                _calib_df = pd.DataFrame(_calib_rows)
+
+                def _gap_style(v):
+                    if "over"  in str(v): return "color:#ff7777"
+                    if "under" in str(v): return "color:#1e90ff"
+                    return "color:#00d084;font-weight:700"
+
+                def _act_style(v):
+                    try:
+                        pct = float(str(v).replace("%",""))
+                        if pct > 60: return "color:#00d084;font-weight:700"
+                        if pct < 40: return "color:#ff3b3b;font-weight:700"
+                    except Exception:
+                        pass
+                    return "color:#e8e8e8"
+
+                st.dataframe(
+                    _calib_df.style
+                        .map(_gap_style, subset=["Calibration Gap"])
+                        .map(_act_style,  subset=["Actual Up %"]),
+                    use_container_width=True, hide_index=True
+                )
+
+                # Reliability diagram (calibration plot)
+                if len(_calib_rows) >= 3:
+                    _x_pts = [float(r["Avg Model Prob"].replace("%",""))/100 for r in _calib_rows]
+                    _y_pts = [float(r["Actual Up %"].replace("%",""))/100 for r in _calib_rows]
+                    _n_pts = [r["Count"] for r in _calib_rows]
+
+                    _fig_cal = go.Figure()
+                    # Perfect calibration line
+                    _fig_cal.add_trace(go.Scatter(
+                        x=[0.2, 1.0], y=[0.2, 1.0],
+                        mode="lines", name="Perfect calibration",
+                        line=dict(color="#555", dash="dash", width=1)
+                    ))
+                    # Actual calibration dots
+                    _fig_cal.add_trace(go.Scatter(
+                        x=[v*100 for v in _x_pts],
+                        y=[v*100 for v in _y_pts],
+                        mode="markers+lines",
+                        name="Model calibration",
+                        marker=dict(size=[max(8, min(24, n)) for n in _n_pts],
+                                    color="#ff8c00", opacity=0.85),
+                        line=dict(color="#ff8c00", width=1.5),
+                        text=[f"n={n}" for n in _n_pts],
+                        hovertemplate="Pred: %{x:.1f}%<br>Actual: %{y:.1f}%<br>%{text}<extra></extra>"
+                    ))
+                    _fig_cal.update_layout(
+                        title="Reliability Diagram — Model Probability vs Actual Outcome",
+                        height=260, plot_bgcolor="#000", paper_bgcolor="#000",
+                        font=dict(color="#e8e8e8", family="IBM Plex Mono", size=9),
+                        xaxis=dict(title="Avg Model Prob %", gridcolor="#111", range=[20, 90]),
+                        yaxis=dict(title="Actual Up %",      gridcolor="#111", range=[20, 90]),
+                        margin=dict(t=40, b=10),
+                        legend=dict(x=0.02, y=0.98, font=dict(size=8))
+                    )
+                    st.plotly_chart(_fig_cal, use_container_width=True)
+            else:
+                st.caption("No observations in any bucket yet.")
+        else:
+            st.info(f"⏳ Calibration table needs at least 5 resolved observations. "
+                    f"Currently {_pe_n_obs}. Accumulates automatically — each Load + 4 trading days = 1 observation.")
+
+        # ══════════════════════════════════════════════════════════════════════
+        # SECTION 4 — BRIER SCORE
+        # ══════════════════════════════════════════════════════════════════════
+        st.markdown("---")
+        st.markdown("#### § 4 — Model Accuracy (Brier Score)")
+
+        if _pe_n_obs >= 5:
+            _ph_b  = np.array(_pe_prob_hist[-_pe_n_obs:],   dtype=float)
+            _ah_b  = np.array(_pe_actual_hist[-_pe_n_obs:], dtype=float)
+            _brier = float(np.mean((_ph_b - _ah_b) ** 2))
+            _brier_skill = 1.0 - _brier / 0.25
+
+            _bc = _brier_color(_brier)
+            _brier_label = (
+                "🟢 Very Strong" if _brier < 0.12 else
+                "🟢 Strong"      if _brier < 0.15 else
+                "🟡 Tradable"    if _brier < 0.18 else
+                "🟡 Weak"        if _brier < 0.20 else
+                "🔴 Near Random" if _brier < 0.23 else
+                "🔴 Below Random"
+            )
+
+            _s4c1, _s4c2, _s4c3, _s4c4 = st.columns(4)
+            _s4c1.metric("Brier Score",    f"{_brier:.4f}",
+                         help="Mean squared error of probability forecasts. Lower = better. Random = 0.25.")
+            _s4c2.metric("Brier Skill",    f"{_brier_skill*100:.1f}%",
+                         help="% improvement over a random (50/50) baseline. Positive = model adds value.")
+            _s4c3.metric("Assessment",     _brier_label,
+                         help="< 0.12 Very Strong · < 0.15 Strong · < 0.18 Tradable · < 0.20 Weak · > 0.23 Random")
+            _s4c4.metric("Observations",   str(_pe_n_obs),
+                         help="Number of resolved (signal, outcome) pairs used for Brier computation.")
+
+            # Brier score interpretation bar
+            _brier_bar_pct = max(0, min(100, (0.25 - _brier) / 0.25 * 100))
+            st.markdown(f"""
+<div style="font-family:'IBM Plex Mono',monospace;margin:8px 0;">
+  <div style="display:flex;align-items:center;gap:10px;">
+    <span style="color:#888;font-size:.76rem;width:80px;">Random 0.25</span>
+    <div style="flex:1;height:14px;background:#1a1a1a;border-radius:2px;overflow:hidden;">
+      <div style="width:{_brier_bar_pct:.1f}%;background:{_bc};transition:width .4s ease;"></div>
+    </div>
+    <span style="color:{_bc};font-size:.76rem;font-weight:700;width:80px;">
+      {_brier:.4f} ({_brier_bar_pct:.0f}% skill)
+    </span>
+  </div>
+  <div style="display:flex;justify-content:space-between;font-size:.70rem;color:#555;margin-top:2px;">
+    <span>← Worse (0.25)</span>
+    <span style="color:#ffb347">0.20 weak</span>
+    <span style="color:#7dca84">0.18 tradable</span>
+    <span style="color:#00d084">0.15 strong →</span>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+            # Brier score over time (rolling 20-obs window)
+            if _pe_n_obs >= 10:
+                _roll_brier = []
+                for _bi in range(10, _pe_n_obs + 1):
+                    _rb = float(np.mean((_ph_b[:_bi] - _ah_b[:_bi]) ** 2))
+                    _roll_brier.append(_rb)
+
+                _fig_brier = go.Figure()
+                _fig_brier.add_hline(y=0.25, line=dict(color="#ff3b3b", dash="dot", width=1),
+                                     annotation_text="Random (0.25)")
+                _fig_brier.add_hline(y=0.20, line=dict(color="#ff7777", dash="dot", width=1),
+                                     annotation_text="Weak (0.20)")
+                _fig_brier.add_hline(y=0.18, line=dict(color="#ffb347", dash="dot", width=1),
+                                     annotation_text="Tradable (0.18)")
+                _fig_brier.add_hline(y=0.15, line=dict(color="#00d084", dash="dot", width=1),
+                                     annotation_text="Strong (0.15)")
+                _fig_brier.add_trace(go.Scatter(
+                    x=list(range(10, _pe_n_obs + 1)), y=_roll_brier,
+                    mode="lines", name="Cumulative Brier",
+                    line=dict(color="#ff8c00", width=2)
+                ))
+                _fig_brier.update_layout(
+                    title="Cumulative Brier Score — Model Improvement Over Time",
+                    height=230, plot_bgcolor="#000", paper_bgcolor="#000",
+                    font=dict(color="#e8e8e8", family="IBM Plex Mono", size=9),
+                    xaxis=dict(title="Observations", gridcolor="#111"),
+                    yaxis=dict(title="Brier Score", gridcolor="#111",
+                               range=[0.05, 0.30], autorange=False),
+                    margin=dict(t=40, b=10), showlegend=False,
+                )
+                st.plotly_chart(_fig_brier, use_container_width=True)
+        else:
+            st.info(f"⏳ Brier score needs at least 5 resolved observations (currently {_pe_n_obs}).")
+
+        # ══════════════════════════════════════════════════════════════════════
+        # SECTION 5 — EDGE INTERPRETATION PANEL
+        # ══════════════════════════════════════════════════════════════════════
+        st.markdown("---")
+        st.markdown("#### § 5 — Edge Interpretation & Trade Recommendation")
+
+        # Determine edges
+        _pe_is_bull    = _pe_pu >  0.60
+        _pe_is_bear    = _pe_pu <  0.40
+        _pe_is_neutral = not _pe_is_bull and not _pe_is_bear
+        _pe_long_vol   = (_pe_vol_edge == "BUY")   or ((_pe_avg_mvi or 1.0) > 1.05)
+        _pe_short_vol  = (_pe_vol_edge == "SELL")  or ((_pe_avg_mvi or 1.0) < 0.90)
+        _pe_neutral_vol= not _pe_long_vol and not _pe_short_vol
+
+        # Recommend trade
+        if   _pe_is_bull  and _pe_long_vol:    _pe_trade = "BUY CALLS"
+        elif _pe_is_bull  and _pe_short_vol:   _pe_trade = "SELL PUT SPREAD"
+        elif _pe_is_bull  and _pe_neutral_vol: _pe_trade = "BUY CALLS (small)"
+        elif _pe_is_bear  and _pe_long_vol:    _pe_trade = "BUY PUTS"
+        elif _pe_is_bear  and _pe_short_vol:   _pe_trade = "SELL CALL SPREAD"
+        elif _pe_is_bear  and _pe_neutral_vol: _pe_trade = "BUY PUTS (small)"
+        elif _pe_is_neutral and _pe_short_vol: _pe_trade = "IRON CONDOR"
+        elif _pe_is_neutral and _pe_long_vol:  _pe_trade = "STRADDLE / STRANGLE"
+        else:                                   _pe_trade = "WAIT — no clear edge"
+
+        _pe_trade_col = (
+            "#00d084" if "BUY CALL"  in _pe_trade else
+            "#7dca84" if "PUT SPREAD" in _pe_trade else
+            "#ff3b3b" if "BUY PUT"   in _pe_trade else
+            "#ff7777" if "CALL SPREAD" in _pe_trade else
+            "#1e90ff" if "CONDOR"    in _pe_trade else
+            "#9b59b6" if "STRADDLE"  in _pe_trade else
+            "#888"
+        )
+
+        _ec1, _ec2 = st.columns([1, 1])
+
+        with _ec1:
+            st.markdown("**Direction Edge**")
+            _de_html = f"""
+<div style="font-family:'IBM Plex Mono',monospace;background:#111;border:1px solid #2a2a2a;
+            border-left:4px solid {_dir_edge_col};padding:12px 16px;margin-bottom:8px;">
+  <div style="font-size:1.4rem;color:{_dir_edge_col};font-weight:700;">
+    {_dir_edge_lbl}
+  </div>
+  <div style="color:#888;font-size:.80rem;margin-top:4px;">
+    Prob Up = {_pe_pu*100:.1f}% &nbsp;·&nbsp;
+    Prob Down = {_pe_pd*100:.1f}% &nbsp;·&nbsp;
+    Edge = {_pe_dir_e*100:+.1f}pp
+  </div>
+</div>"""
+            st.markdown(_de_html, unsafe_allow_html=True)
+
+            st.markdown("**Volatility Edge**")
+            _ve_col2 = "#1e90ff" if _pe_long_vol else "#ff8c00" if _pe_short_vol else "#888"
+            _ve_lbl2 = ("📈 Long Vol — Buy options" if _pe_long_vol else
+                        "📉 Short Vol — Sell options" if _pe_short_vol else
+                        "↔ No Vol Edge — neutral")
+            _mvi_disp = f"{_pe_avg_mvi:.2f}×" if _pe_avg_mvi is not None else "n/a"
+            _ve_html = f"""
+<div style="font-family:'IBM Plex Mono',monospace;background:#111;border:1px solid #2a2a2a;
+            border-left:4px solid {_ve_col2};padding:12px 16px;margin-bottom:8px;">
+  <div style="font-size:1.1rem;color:{_ve_col2};font-weight:700;">{_ve_lbl2}</div>
+  <div style="color:#888;font-size:.80rem;margin-top:4px;">
+    Avg Move/IV = {_mvi_disp} &nbsp;·&nbsp;
+    IV/HV = {(_pe_iv_dec/(hv20+1e-9)):.2f}×
+  </div>
+</div>"""
+            st.markdown(_ve_html, unsafe_allow_html=True)
+
+        with _ec2:
+            st.markdown("**Recommended Trade**")
+            _rt_html = f"""
+<div style="font-family:'IBM Plex Mono',monospace;background:#0d0d0d;border:2px solid {_pe_trade_col};
+            padding:20px 20px;text-align:center;margin-bottom:8px;">
+  <div style="font-size:1.6rem;color:{_pe_trade_col};font-weight:700;
+              letter-spacing:.12em;">{_pe_trade}</div>
+  <div style="color:#888;font-size:.78rem;margin-top:8px;">
+    Based on Prob Up {_pe_pu*100:.1f}% &nbsp;·&nbsp; Vol Edge: {_pe_vol_edge}
+  </div>
+</div>"""
+            st.markdown(_rt_html, unsafe_allow_html=True)
+
+            # Decision logic explainer
+            st.markdown("""
+<div style="font-family:'IBM Plex Mono',monospace;font-size:.74rem;color:#555;line-height:1.6em;">
+<b style="color:#888;">Logic:</b><br>
+Prob &gt; 0.60 + Long Vol → Buy Calls<br>
+Prob &gt; 0.60 + Short Vol → Sell Put Spread<br>
+Prob &lt; 0.40 + Long Vol → Buy Puts<br>
+Prob &lt; 0.40 + Short Vol → Sell Call Spread<br>
+Neutral + Short Vol → Iron Condor<br>
+Neutral + Long Vol → Straddle
+</div>""", unsafe_allow_html=True)
+
+        # ══════════════════════════════════════════════════════════════════════
+        # SECTION 6 — FINAL DASHBOARD OUTPUT
+        # ══════════════════════════════════════════════════════════════════════
+        st.markdown("---")
+        st.markdown("#### § 6 — Complete Decision Dashboard")
+        st.caption("All metrics in one place — use this to make the final trading decision.")
+
+        # Top strategy from EV engine
+        _pe_top_s   = strat_recs[0] if strat_recs else {}
+        _pe_top_ev  = float(_pe_top_s.get("ev", 0.0))
+        _pe_top_k   = float(_pe_top_s.get("kelly", 0.0))
+        _pe_top_pop = float(_pe_top_s.get("pop", 0.5))
+        _pe_top_nm  = _pe_top_s.get("Strategy", "—")
+
+        # Brier (reuse if already computed, else show placeholder)
+        _pe_brier_disp = f"{_brier:.4f} ({_brier_label})" if _pe_n_obs >= 5 else "— (< 5 obs)"
+
+        # Move vs IV display
+        _pe_mvi_disp2 = (
+            f"{_pe_avg_mvi:.2f}× — {'Underpriced' if _pe_avg_mvi > 1.05 else 'Overpriced' if _pe_avg_mvi < 0.90 else 'Fair'}"
+            if _pe_avg_mvi is not None else "— (accumulating)"
+        )
+
+        # Calibration summary
+        if _pe_n_obs >= 5:
+            _recent_pred = np.array(_pe_prob_hist[-20:], dtype=float)
+            _recent_act  = np.array(_pe_actual_hist[-20:], dtype=float)
+            _cal_acc_now = float(np.mean((_recent_pred > 0.5) == (_recent_act > 0.5))) * 100
+            _cal_label   = (
+                f"✅ Well-calibrated ({_cal_acc_now:.0f}% directional accuracy)" if _cal_acc_now >= 55 else
+                f"⚠️ Under-calibrated ({_cal_acc_now:.0f}% accuracy)" if _cal_acc_now >= 45 else
+                f"❌ Miscalibrated ({_cal_acc_now:.0f}% accuracy — below random)"
+            )
+        else:
+            _cal_label = "— (accumulating)"
+
+        _dashboard_data = {
+            "Metric": [
+                "Probability Up ↑",
+                "Probability Down ↓",
+                "Direction Edge",
+                "Expected Move",
+                "Move vs IV (avg)",
+                "ATM IV",
+                "IV / HV Ratio",
+                "Brier Score",
+                "Calibration (20-obs)",
+                "Top EV Strategy",
+                "Strategy EV",
+                "POP (Prob of Profit)",
+                "Kelly Fraction",
+                "Recommended Trade",
+            ],
+            "Value": [
+                f"{_pe_pu*100:.1f}%",
+                f"{_pe_pd*100:.1f}%",
+                f"{_pe_dir_e*100:+.1f}pp  ·  {_dir_edge_lbl}",
+                f"₹{_pe_em_calc:,.0f}  (±{_pe_em_pct:.2f}%)",
+                _pe_mvi_disp2,
+                f"{_pe_iv_dec*100:.1f}%",
+                f"{(_pe_iv_dec/(hv20+1e-9)):.2f}×",
+                _pe_brier_disp,
+                _cal_label,
+                _pe_top_nm,
+                f"{_pe_top_ev:+.2f}  (EV/MaxRisk)",
+                f"{_pe_top_pop*100:.1f}%",
+                f"{_pe_top_k*100:.1f}%  of capital",
+                _pe_trade,
+            ],
+        }
+        _dash_df = pd.DataFrame(_dashboard_data)
+
+        def _dash_val_style(v):
+            s = str(v)
+            if "BUY CALL"    in s: return "color:#00d084;font-weight:700"
+            if "PUT SPREAD"  in s: return "color:#7dca84;font-weight:700"
+            if "BUY PUT"     in s: return "color:#ff3b3b;font-weight:700"
+            if "CALL SPREAD" in s: return "color:#ff7777;font-weight:700"
+            if "CONDOR"      in s: return "color:#1e90ff;font-weight:700"
+            if "STRADDLE"    in s: return "color:#9b59b6;font-weight:700"
+            if "WAIT"        in s: return "color:#888"
+            if "Bullish"     in s: return "color:#00d084"
+            if "Bearish"     in s: return "color:#ff3b3b"
+            if "✅"          in s: return "color:#00d084"
+            if "⚠️"          in s: return "color:#ffb347"
+            if "❌"          in s: return "color:#ff3b3b"
+            return "color:#e8e8e8"
+
+        st.dataframe(
+            _dash_df.style.map(_dash_val_style, subset=["Value"]),
+            use_container_width=True, hide_index=True
+        )
+
+        # ── Final workflow reminder ─────────────────────────────────────────
+        st.markdown("---")
+        st.markdown(f"""
+<div style="font-family:'IBM Plex Mono',monospace;background:#0d0d0d;border:1px solid #2a2a2a;
+            padding:14px 18px;font-size:.80rem;line-height:1.8em;">
+<span style="color:#ff8c00;font-weight:700;letter-spacing:.1em;">DECISION WORKFLOW</span><br>
+<span style="color:#888;">Signals</span>
+<span style="color:#555;"> → </span>
+<span style="color:#888;">Score ({_pe_rs:+.3f})</span>
+<span style="color:#555;"> → </span>
+<span style="color:{_pu_col};">Prob Up {_pe_pu*100:.1f}%</span>
+<span style="color:#555;"> → </span>
+<span style="color:#e8e8e8;">vs Implied Move ±{_pe_em_pct:.1f}%</span>
+<span style="color:#555;"> → </span>
+<span style="color:{_ve_col2};">Vol Edge: {_pe_vol_edge}</span>
+<span style="color:#555;"> → </span>
+<span style="color:{_pe_trade_col};font-weight:700;">{_pe_trade}</span>
+<br><br>
+<span style="color:#555;font-size:.73rem;">
+  Make decisions based on Probability + Move vs IV + Brier Score + Edge — not on indicators alone.
+  Brier Score validates the probability engine; Move/IV validates the vol pricing assumption.
+</span>
+</div>""", unsafe_allow_html=True)
