@@ -11354,628 +11354,629 @@ with t_edge:
             if _pipe_rows:
                 _pipe_df = pd.DataFrame(_pipe_rows)
                 st.dataframe(_pipe_df, use_container_width=True, hide_index=True)
-        st.stop()
 
-    # ── Compute edge metrics ──────────────────────────────────────────────────
-    _edge_groups = _compute_edge_metrics(_edge_log, sym)
-
-    if not _edge_groups:
-        st.warning("Not enough resolved signals to compute edge metrics. Check back after more loads.")
     else:
-        # ── HORIZON SELECTOR ────────────────────────────────────────────────
-        _hz = st.radio("Analysis horizon", ["1d", "2d", "3d", "5d"],
-                       index=0, horizontal=True,
-                       help="Forward horizon used for return and accuracy metrics")
 
-        st.divider()
+        # ── Compute edge metrics ──────────────────────────────────────────────────
+        _edge_groups = _compute_edge_metrics(_edge_log, sym)
 
-        # ── EDGE SUMMARY TABLE ───────────────────────────────────────────────
-        st.markdown("#### 📊 Edge Metrics by Signal Group")
-        st.caption("Dir Acc = % signals where direction was correct · Move/IV = |actual move| / expected move · "
-                   "IV Δ = avg change in ATM IV next day · Skew Δ = avg skew change · "
-                   "→MP = % price moved toward max pain")
+        if not _edge_groups:
+            st.warning("Not enough resolved signals to compute edge metrics. Check back after more loads.")
+        else:
+            # ── HORIZON SELECTOR ────────────────────────────────────────────────
+            _hz = st.radio("Analysis horizon", ["1d", "2d", "3d", "5d"],
+                           index=0, horizontal=True,
+                           help="Forward horizon used for return and accuracy metrics")
 
-        _tbl_rows = []
-        for grp, m in _edge_groups.items():
-            if m is None:
-                continue
-            # Colour-code edge type
-            edge_str = m["edge"]
-            _tbl_rows.append({
-                "Signal Group":  grp,
-                "N":             m["n"],
-                f"Avg Ret ({_hz})": f"{m['avg_ret']:+.2f}%",
-                "Dir Acc":       f"{m['dir_acc']:.0f}%",
-                "Move/IV":       f"{m['move_iv']:.2f}×",
-                ">IV Move":      f"{m['pct_gt_iv']:.0f}%",
-                "IV Δ":          f"{m['iv_chg']:+.2f}pp",
-                "Skew Δ":        f"{m['skew_chg']:+.3f}pp",
-                "OI Δ (M)":      f"{m['oi_chg']:+.1f}",
-                "→MaxPain":      f"{m['pct_toward_mp']:.0f}%",
-                "Edge Type":     edge_str,
-            })
+            st.divider()
 
-        if _tbl_rows:
-            _tbl_df = pd.DataFrame(_tbl_rows)
+            # ── EDGE SUMMARY TABLE ───────────────────────────────────────────────
+            st.markdown("#### 📊 Edge Metrics by Signal Group")
+            st.caption("Dir Acc = % signals where direction was correct · Move/IV = |actual move| / expected move · "
+                       "IV Δ = avg change in ATM IV next day · Skew Δ = avg skew change · "
+                       "→MP = % price moved toward max pain")
 
-            def _edge_style(v):
-                if "Directional" in str(v): return "color:#00d084;font-weight:700"
-                if "Long Vol"    in str(v): return "color:#1e90ff;font-weight:700"
-                if "Short Vol"   in str(v): return "color:#ff8c00;font-weight:700"
-                if "Pinning"     in str(v): return "color:#9c27b0;font-weight:700"
-                if "Skew"        in str(v): return "color:#7ec8e3;font-weight:700"
-                if "Sell IV"     in str(v): return "color:#ff8c00"
-                if "Buy IV"      in str(v): return "color:#1e90ff"
-                if "No Edge"     in str(v): return "color:#555"
-                return "color:#888"
-
-            def _acc_style(v):
-                try:
-                    pct = float(str(v).replace("%",""))
-                    if pct > 58: return "color:#00d084;font-weight:700"
-                    if pct > 52: return "color:#ffb347"
-                    if pct < 45: return "color:#ff3b3b"
-                except Exception:
-                    pass
-                return "color:#888"
-
-            def _ret_style(v):
-                try:
-                    val = float(str(v).replace("%","").replace("+",""))
-                    if val > 0.1:  return "color:#00d084;font-weight:700"
-                    if val < -0.1: return "color:#ff3b3b;font-weight:700"
-                except Exception:
-                    pass
-                return "color:#888"
-
-            styled_tbl = _tbl_df.style \
-                .map(_edge_style, subset=["Edge Type"]) \
-                .map(_acc_style,  subset=["Dir Acc"]) \
-                .map(_ret_style,  subset=[f"Avg Ret ({_hz})"])
-            st.dataframe(styled_tbl, use_container_width=True, hide_index=True)
-
-        st.divider()
-
-        # ── INTERPRETATION PANEL ──────────────────────────────────────────────
-        st.markdown("#### 🔍 Edge Interpretation")
-
-        # Get all-signals metrics as baseline
-        _baseline = _edge_groups.get("📊 All Signals")
-        if _baseline:
-            _interp_cols = st.columns(2)
-
-            with _interp_cols[0]:
-                st.markdown("**What edge does the system have?**")
-                _findings = []
-
-                if _baseline["dir_acc"] > 55:
-                    _findings.append(("✅ Directional Edge",
-                                      f"Direction accuracy {_baseline['dir_acc']:.0f}% > 55% threshold. "
-                                      "The signal correctly predicts direction more often than chance."))
-                elif _baseline["dir_acc"] < 45:
-                    _findings.append(("❌ Reverse Directional Signal",
-                                      f"Direction accuracy only {_baseline['dir_acc']:.0f}%. "
-                                      "Consider reversing the signal interpretation."))
-                else:
-                    _findings.append(("⚪ No Directional Edge",
-                                      f"Direction accuracy {_baseline['dir_acc']:.0f}% — not significantly above 50%."))
-
-                if _baseline["move_iv"] > 1.05:
-                    _findings.append(("✅ Long Vol Edge",
-                                      f"Actual moves average {_baseline['move_iv']:.2f}× the implied move. "
-                                      "Options are systematically underpriced — buy vol strategies preferred."))
-                elif _baseline["move_iv"] < 0.90:
-                    _findings.append(("✅ Short Vol Edge",
-                                      f"Actual moves average {_baseline['move_iv']:.2f}× the implied move. "
-                                      "Options are systematically overpriced — sell vol strategies preferred."))
-
-                if _baseline["pct_toward_mp"] > 60:
-                    _findings.append(("✅ Max Pain Pinning",
-                                      f"Price moves toward max pain {_baseline['pct_toward_mp']:.0f}% of the time. "
-                                      "Strong gravitational pull — use max pain for target levels."))
-
-                if abs(_baseline["iv_chg"]) > 0.5:
-                    direction = "rises" if _baseline["iv_chg"] > 0 else "falls"
-                    _findings.append(("✅ IV Edge",
-                                      f"IV {direction} avg {abs(_baseline['iv_chg']):.1f}pp after signal. "
-                                      f"{'Buy IV' if _baseline['iv_chg'] > 0 else 'Sell IV'} strategies have positive expected IV change."))
-
-                if abs(_baseline["skew_chg"]) > 0.3:
-                    _findings.append(("✅ Skew Edge",
-                                      f"Skew changes avg {_baseline['skew_chg']:+.2f}pp after signal. "
-                                      "Skew-based strategies (risk reversals, skew trades) may have edge."))
-
-                if not _findings:
-                    _findings.append(("⚪ No Edge Detected",
-                                      "No statistically meaningful edge found in any dimension. "
-                                      "Collect more signals (need 20+ per group for confidence)."))
-
-                for title, desc in _findings:
-                    st.markdown(f"**{title}**")
-                    st.caption(desc)
-                    st.markdown("")
-
-            with _interp_cols[1]:
-                st.markdown("**Best-performing signal conditions:**")
-
-                # Find group with highest dir accuracy
-                _best_dir = max(
-                    [(g, m["dir_acc"]) for g, m in _edge_groups.items() if m and m["n"] >= 3],
-                    key=lambda x: x[1], default=(None, 0))
-                # Find group with best return
-                _best_ret = max(
-                    [(g, m["avg_ret"]) for g, m in _edge_groups.items() if m and m["n"] >= 3],
-                    key=lambda x: abs(x[1]), default=(None, 0))
-                # Find highest pinning
-                _best_pin = max(
-                    [(g, m["pct_toward_mp"]) for g, m in _edge_groups.items() if m and m["n"] >= 3],
-                    key=lambda x: x[1], default=(None, 0))
-
-                if _best_dir[0]:
-                    st.markdown(f"🎯 **Best direction:** {_best_dir[0]} — {_best_dir[1]:.0f}% accuracy")
-                if _best_ret[0]:
-                    st.markdown(f"📈 **Best return:** {_best_ret[0]} — avg {_best_ret[1]:+.2f}%/{_hz}")
-                if _best_pin[0]:
-                    st.markdown(f"📍 **Best pinning:** {_best_pin[0]} — {_best_pin[1]:.0f}% toward max pain")
-
-                st.divider()
-                st.markdown("**Confidence guide:**")
-                st.caption("< 5 signals: insufficient · 5–20: indicative · 20–50: moderate · 50+: high confidence")
-
-                # Show confidence bar
-                _conf_pct = min(100, int(_resolved_n / 50 * 100))
-                _conf_col = "#00d084" if _conf_pct >= 60 else ("#ffb347" if _conf_pct >= 20 else "#ff3b3b")
-                st.markdown(f"""
-<div style="font-family:'IBM Plex Mono',monospace;margin:6px 0;">
-  <div style="color:#555;font-size:0.74rem;margin-bottom:3px;">
-    Confidence: {_resolved_n} resolved / 50 recommended
-  </div>
-  <div style="background:#1a1a1a;height:10px;border-radius:3px;overflow:hidden;">
-    <div style="width:{_conf_pct}%;height:100%;background:{_conf_col};border-radius:3px;"></div>
-  </div>
-</div>""", unsafe_allow_html=True)
-
-        st.divider()
-
-        # ── RAW RESOLVED SIGNAL DETAIL TABLE ────────────────────────────────
-        with st.expander("📋 Raw Resolved Signal Log", expanded=False):
-            _res_rows = []
-            for e in sorted([x for x in _all_sym if x.get("resolved")],
-                            key=lambda x: x.get("ts",""), reverse=True)[:100]:
-                r1 = e.get("fwd_ret_1d")
-                r5 = e.get("fwd_ret_5d")
-                sp0 = e.get("spot", 0.0)
-                em  = e.get("expected_move", 0.0)
-                sp1 = e.get("fwd_spot_1d")
-                move_iv = abs(sp1 - sp0) / em if sp1 and sp0 > 0 and em > 0 else None
-
-                _bias = e.get("bias", "—")
-                _dir_ok = None
-                if r1 is not None:
-                    if "BULLISH" in _bias:   _dir_ok = "✅" if r1 > 0 else "❌"
-                    elif "BEARISH" in _bias: _dir_ok = "✅" if r1 < 0 else "❌"
-                    else:                    _dir_ok = "—"
-
-                _res_rows.append({
-                    "Date":      e.get("ts","")[:10],
-                    "Bias":      _bias,
-                    "Score":     f"{e.get('raw_score',0):+.3f}",
-                    "IV%":       f"{e.get('atm_iv_pct',0):.1f}",
-                    "PCR":       f"{e.get('pcr',0):.2f}",
-                    "Flow":      f"{e.get('flow_score',0):+.3f}",
-                    "EM ₹":      f"{em:.0f}",
-                    "Ret 1d":    f"{r1*100:+.2f}%" if r1 else "—",
-                    "Ret 5d":    f"{r5*100:+.2f}%" if r5 else "—",
-                    "Move/IV":   f"{move_iv:.2f}×" if move_iv else "—",
-                    "Dir ✓":     _dir_ok or "—",
+            _tbl_rows = []
+            for grp, m in _edge_groups.items():
+                if m is None:
+                    continue
+                # Colour-code edge type
+                edge_str = m["edge"]
+                _tbl_rows.append({
+                    "Signal Group":  grp,
+                    "N":             m["n"],
+                    f"Avg Ret ({_hz})": f"{m['avg_ret']:+.2f}%",
+                    "Dir Acc":       f"{m['dir_acc']:.0f}%",
+                    "Move/IV":       f"{m['move_iv']:.2f}×",
+                    ">IV Move":      f"{m['pct_gt_iv']:.0f}%",
+                    "IV Δ":          f"{m['iv_chg']:+.2f}pp",
+                    "Skew Δ":        f"{m['skew_chg']:+.3f}pp",
+                    "OI Δ (M)":      f"{m['oi_chg']:+.1f}",
+                    "→MaxPain":      f"{m['pct_toward_mp']:.0f}%",
+                    "Edge Type":     edge_str,
                 })
 
-            if _res_rows:
-                _res_df = pd.DataFrame(_res_rows)
+            if _tbl_rows:
+                _tbl_df = pd.DataFrame(_tbl_rows)
 
-                def _dir_ok_style(v):
-                    if v == "✅": return "color:#00d084;font-weight:700"
-                    if v == "❌": return "color:#ff3b3b;font-weight:700"
-                    return "color:#555"
+                def _edge_style(v):
+                    if "Directional" in str(v): return "color:#00d084;font-weight:700"
+                    if "Long Vol"    in str(v): return "color:#1e90ff;font-weight:700"
+                    if "Short Vol"   in str(v): return "color:#ff8c00;font-weight:700"
+                    if "Pinning"     in str(v): return "color:#9c27b0;font-weight:700"
+                    if "Skew"        in str(v): return "color:#7ec8e3;font-weight:700"
+                    if "Sell IV"     in str(v): return "color:#ff8c00"
+                    if "Buy IV"      in str(v): return "color:#1e90ff"
+                    if "No Edge"     in str(v): return "color:#555"
+                    return "color:#888"
 
-                st.dataframe(_res_df.style.map(_dir_ok_style, subset=["Dir ✓"]),
-                             use_container_width=True, hide_index=True)
+                def _acc_style(v):
+                    try:
+                        pct = float(str(v).replace("%",""))
+                        if pct > 58: return "color:#00d084;font-weight:700"
+                        if pct > 52: return "color:#ffb347"
+                        if pct < 45: return "color:#ff3b3b"
+                    except Exception:
+                        pass
+                    return "color:#888"
 
-        # ── VISUAL: Direction accuracy over time ──────────────────────────
-        with st.expander("📈 Direction Accuracy — Rolling 20-Signal Window", expanded=False):
-            _all_bias_signals = [e for e in _all_sym
-                                 if e.get("resolved") and e.get("fwd_ret_1d") is not None
-                                 and e.get("bias","NEUTRAL") != "NEUTRAL"]
-            if len(_all_bias_signals) >= 5:
-                _roll_acc = []
-                for i in range(len(_all_bias_signals)):
-                    window = _all_bias_signals[max(0, i-19):i+1]
-                    correct = []
-                    for e in window:
-                        r = e.get("fwd_ret_1d", 0)
-                        b = e.get("bias","")
-                        if "BULLISH" in b:   correct.append(1 if r > 0 else 0)
-                        elif "BEARISH" in b: correct.append(1 if r < 0 else 0)
-                    _roll_acc.append({
-                        "Signal #": i + 1,
-                        "Date":     e.get("ts","")[:10],
-                        "Rolling Accuracy": round(float(np.mean(correct)) * 100, 1) if correct else 50.0
-                    })
-                _acc_df = pd.DataFrame(_roll_acc)
-                fig_acc = go.Figure()
-                fig_acc.add_trace(go.Scatter(
-                    x=_acc_df["Signal #"], y=_acc_df["Rolling Accuracy"],
-                    mode="lines+markers", name="Rolling Accuracy",
-                    line=dict(color="#ff8c00", width=2),
-                    marker=dict(size=5)
-                ))
-                fig_acc.add_hline(y=55, line=dict(color="#00d084", dash="dash", width=1),
-                                  annotation_text="55% edge threshold")
-                fig_acc.add_hline(y=50, line=dict(color="#555", dash="dot", width=1),
-                                  annotation_text="random (50%)")
-                fig_acc.update_layout(
-                    title="Rolling 20-Signal Direction Accuracy",
-                    height=280, plot_bgcolor="#000", paper_bgcolor="#000",
-                    font=dict(color="#e8e8e8", family="IBM Plex Mono", size=9),
-                    xaxis=dict(title="Signal #", gridcolor="#111"),
-                    yaxis=dict(title="Accuracy %", gridcolor="#111", range=[30, 80]),
-                    margin=dict(t=40, b=10)
-                )
-                st.plotly_chart(fig_acc, use_container_width=True)
-            else:
-                st.caption("Need at least 5 resolved directional signals to plot rolling accuracy.")
+                def _ret_style(v):
+                    try:
+                        val = float(str(v).replace("%","").replace("+",""))
+                        if val > 0.1:  return "color:#00d084;font-weight:700"
+                        if val < -0.1: return "color:#ff3b3b;font-weight:700"
+                    except Exception:
+                        pass
+                    return "color:#888"
 
-        # ── VISUAL: Move vs Implied distribution ─────────────────────────
-        with st.expander("📊 Actual Move vs Implied Move Distribution", expanded=False):
-            _move_data = []
-            for e in [x for x in _all_sym if x.get("resolved")]:
-                sp0 = e.get("spot", 0.0)
-                sp1 = e.get("fwd_spot_1d")
-                em  = e.get("expected_move", 0.0)
-                if sp0 > 0 and sp1 and em > 0:
-                    _move_data.append(abs(sp1 - sp0) / em)
-            if len(_move_data) >= 5:
-                fig_mv = go.Figure()
-                fig_mv.add_trace(go.Histogram(
-                    x=_move_data, nbinsx=20,
-                    marker_color="#1e90ff", opacity=0.8, name="Move/IV ratio"
-                ))
-                fig_mv.add_vline(x=1.0, line=dict(color="#ff8c00", dash="dash", width=2),
-                                 annotation_text="IV = actual move")
-                _mean_move = float(np.mean(_move_data))
-                fig_mv.add_vline(x=_mean_move, line=dict(color="#00d084", dash="dot", width=1.5),
-                                 annotation_text=f"avg {_mean_move:.2f}×")
-                fig_mv.update_layout(
-                    title=f"Distribution of |Actual 1d Move| / Expected Move  (n={len(_move_data)})",
-                    height=260, plot_bgcolor="#000", paper_bgcolor="#000",
-                    font=dict(color="#e8e8e8", family="IBM Plex Mono", size=9),
-                    xaxis=dict(title="Actual / Implied", gridcolor="#111"),
-                    yaxis=dict(title="Count", gridcolor="#111"),
-                    margin=dict(t=40, b=10)
-                )
-                st.plotly_chart(fig_mv, use_container_width=True)
-                _pct_over = float(np.mean([1 if m > 1 else 0 for m in _move_data])) * 100
-                _vol_edge = "**Long Vol Edge** — options underpriced" if _mean_move > 1.05 else \
-                            "**Short Vol Edge** — options overpriced" if _mean_move < 0.90 else \
-                            "**No Vol Edge** — moves ≈ implied"
-                st.markdown(f"Avg move = {_mean_move:.2f}× implied · {_pct_over:.0f}% of moves exceeded implied · {_vol_edge}")
-            else:
-                st.caption("Need at least 5 resolved signals to plot distribution.")
+                styled_tbl = _tbl_df.style \
+                    .map(_edge_style, subset=["Edge Type"]) \
+                    .map(_acc_style,  subset=["Dir Acc"]) \
+                    .map(_ret_style,  subset=[f"Avg Ret ({_hz})"])
+                st.dataframe(styled_tbl, use_container_width=True, hide_index=True)
 
-        # ── METHODOLOGY NOTE ─────────────────────────────────────────────
-        with st.expander("ℹ️ Edge Audit Methodology", expanded=False):
-            st.markdown("""
-**What this module measures:**
+            st.divider()
 
-Every time you click ⚡ LOAD OPTIONS INTEL, a full snapshot is recorded with:
-spot, IV, IVR, IV/HV ratio, PCR, OI total, OI skew, max pain distance, skew, term structure slope,
-flow score, positioning score, vol regime score, trend score, and expected move.
+            # ── INTERPRETATION PANEL ──────────────────────────────────────────────
+            st.markdown("#### 🔍 Edge Interpretation")
 
-**Forward outcomes are resolved 5 trading days later** using OHLCV close prices:
-- 1d/2d/3d/5d forward log return
-- Absolute move vs expected move
-- IV change, skew change, OI change
-- Whether price moved toward max pain
+            # Get all-signals metrics as baseline
+            _baseline = _edge_groups.get("📊 All Signals")
+            if _baseline:
+                _interp_cols = st.columns(2)
 
-**Signal groups** are formed by direction bias, IV regime, PCR level, proximity to max pain,
-flow magnitude, and signal alignment (flow + positioning + vol all pointing same direction).
+                with _interp_cols[0]:
+                    st.markdown("**What edge does the system have?**")
+                    _findings = []
 
-**Edge thresholds (interpretation rules):**
-
-| Metric | Threshold | Edge |
-|---|---|---|
-| Direction accuracy | > 55% | Directional Edge |
-| Avg move / implied | > 1.05× | Long Vol Edge |
-| Avg move / implied | < 0.90× | Short Vol Edge |
-| Avg IV change | > +0.5pp | Buy IV Edge |
-| Avg IV change | < -0.5pp | Sell IV Edge |
-| % toward max pain | > 60% | Pinning Edge |
-| Avg skew change | > 0.3pp | Skew Edge |
-
-**Confidence:** 5+ signals = indicative, 20+ = moderate, 50+ = high confidence.
-Collect signals daily for 2–3 months for statistically meaningful results.
-""")
-
-        # ══════════════════════════════════════════════════════════════
-        # STEP 8 — PROBABILITY CALIBRATION RESULTS
-        # Predicted probability ≈ Actual probability
-        # ══════════════════════════════════════════════════════════════
-        st.divider()
-        st.markdown("#### 🎯 Step 8 — Probability Calibration")
-        st.caption("Does the model's predicted P(↑) match the actual frequency of up-moves? "
-                   "A well-calibrated model has: when it says 70% bullish, the market goes up ~70% of the time.")
-
-        # Pull raw/return history from session state (symbol-namespaced)
-        _s8_raw   = _get_hist("_calib_raw_score_hist", sym)
-        _s8_ret   = _get_hist("_calib_realised_ret_hist", sym)
-        _s8_sharp = _calib("logistic_sharpness")
-        n_s8      = min(len(_s8_raw), len(_s8_ret))
-
-        c8a, c8b, c8c, c8d = st.columns(4)
-        c8a.metric("Observations",    str(n_s8),
-                   help="Paired (raw_score, realised_return) observations used for calibration")
-        c8b.metric("Logistic k",       f"{_s8_sharp:.3f}",
-                   help="Calibrated sharpness. Default=4.0. Higher=steeper prob curve. "
-                        "Learned from correlation between raw_score and forward returns.")
-        c8c.metric("Min needed",       str(_CALIB_MIN_OBS),
-                   help=f"Minimum {_CALIB_MIN_OBS} observations before sharpness overrides cold-start prior")
-        _s8_status = ("🟢 LIVE — using learned k" if n_s8 >= _CALIB_MIN_OBS
-                      else f"🟡 WARMING UP — {n_s8}/{_CALIB_MIN_OBS}")
-        c8d.metric("Status",  _s8_status)
-
-        if n_s8 >= 5:
-            # ── Reliability Diagram (Calibration Plot) ────────────────────
-            with st.expander("📊 Reliability Diagram — Predicted vs Actual Probability", expanded=True):
-                st.caption("Each point = one bucket of signals with similar predicted P(↑). "
-                           "Perfect calibration = all points on the diagonal.")
-
-                # Convert raw scores to predicted probs using current sharpness
-                _raw_arr = np.array(_s8_raw[-min(n_s8, 200):])
-                _ret_arr = np.array(_s8_ret[-min(n_s8, 200):])
-                _pred_pu = 1.0 / (1.0 + np.exp(-_s8_sharp * _raw_arr))
-                _actual_up = (_ret_arr > 0).astype(float)
-
-                # Bin into spec-defined 0.05-wide buckets
-                # 0.50–0.55, 0.55–0.60, 0.60–0.65, 0.65–0.70, 0.70–0.75, 0.75–0.80, 0.80–1.00
-                # Plus bearish mirror: 0.20–0.25, 0.25–0.30, 0.30–0.35, 0.35–0.40, 0.40–0.45, 0.45–0.50
-                _bins = [0.0, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45,
-                         0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 1.0]
-                _bin_labels = ["<20%","20-25%","25-30%","30-35%","35-40%","40-45%","45-50%",
-                               "50-55%","55-60%","60-65%","65-70%","70-75%","75-80%",">80%"]
-                _rel_rows = []
-                for i in range(len(_bins)-1):
-                    mask = (_pred_pu >= _bins[i]) & (_pred_pu < _bins[i+1])
-                    n_bin = int(mask.sum())
-                    if n_bin < 2:
-                        continue
-                    pred_mean   = float(_pred_pu[mask].mean())
-                    actual_freq = float(_actual_up[mask].mean())
-                    _move_vs_iv_h = _get_hist("_calib_move_vs_iv_hist", sym)
-                    _mvi_subset   = float(np.mean(_move_vs_iv_h[-n_bin:])) if len(_move_vs_iv_h) >= n_bin else 0.0
-                    _rel_rows.append({
-                        "Predicted P(↑)": _bin_labels[i],
-                        "Avg Predicted":  round(pred_mean * 100, 1),
-                        "Actual Up %":    round(actual_freq * 100, 1),
-                        "N":              n_bin,
-                        "Avg Move/IV":    round(_mvi_subset, 2) if _mvi_subset else "—",
-                        "Gap":            round((actual_freq - pred_mean) * 100, 1),
-                    })
-
-                if _rel_rows:
-                    _rel_df = pd.DataFrame(_rel_rows)
-
-                    # Plot reliability diagram
-                    fig_rel = go.Figure()
-                    # Perfect calibration line
-                    fig_rel.add_trace(go.Scatter(
-                        x=[0, 100], y=[0, 100],
-                        mode="lines", name="Perfect calibration",
-                        line=dict(color="#555", dash="dash", width=1)
-                    ))
-                    # Actual calibration points
-                    _col_pts = ["#ff3b3b" if abs(r["Gap"]) > 10 else
-                                "#ffb347" if abs(r["Gap"]) > 5 else "#00d084"
-                                for r in _rel_rows]
-                    fig_rel.add_trace(go.Scatter(
-                        x=[r["Avg Predicted"] for r in _rel_rows],
-                        y=[r["Actual Up %"] for r in _rel_rows],
-                        mode="markers+lines",
-                        name="Model calibration",
-                        marker=dict(size=[max(8, r["N"]*2) for r in _rel_rows],
-                                   color=_col_pts, line=dict(color="#fff", width=1)),
-                        line=dict(color="#ff8c00", width=1.5),
-                        text=[f"N={r['N']}, Gap={r['Gap']:+.1f}pp" for r in _rel_rows],
-                        hovertemplate="%{text}<extra></extra>"
-                    ))
-                    fig_rel.update_layout(
-                        height=300, plot_bgcolor="#000", paper_bgcolor="#000",
-                        font=dict(color="#e8e8e8", family="IBM Plex Mono", size=9),
-                        xaxis=dict(title="Predicted P(↑) %", range=[0,100], gridcolor="#111"),
-                        yaxis=dict(title="Actual Up %",       range=[0,100], gridcolor="#111"),
-                        margin=dict(t=20, b=10),
-                        legend=dict(orientation="h", y=1.08)
-                    )
-                    st.plotly_chart(fig_rel, use_container_width=True)
-
-                    # Table with gap highlighting
-                    def _gap_style(v):
-                        try:
-                            g = float(str(v).replace("+",""))
-                            if abs(g) > 10: return "color:#ff3b3b;font-weight:700"
-                            if abs(g) > 5:  return "color:#ffb347"
-                            return "color:#00d084"
-                        except Exception:
-                            return ""
-                    def _mvi_style(v):
-                        try:
-                            m = float(str(v))
-                            if m > 1.05: return "color:#1e90ff;font-weight:700"   # long vol edge
-                            if m < 0.90: return "color:#ff8c00;font-weight:700"   # short vol edge
-                            return "color:#888"
-                        except Exception:
-                            return ""
-                    st.dataframe(
-                        _rel_df.style
-                            .map(_gap_style, subset=["Gap"])
-                            .map(_mvi_style, subset=["Avg Move/IV"]),
-                        use_container_width=True, hide_index=True
-                    )
-                    # Calibration verdict
-                    _max_gap = max(abs(r["Gap"]) for r in _rel_rows)
-                    if _max_gap <= 5:
-                        st.success(f"✅ Well-calibrated — max gap {_max_gap:.1f}pp. "
-                                   "Predicted probabilities closely match actual frequencies.")
-                    elif _max_gap <= 10:
-                        st.warning(f"⚠️ Moderate miscalibration — max gap {_max_gap:.1f}pp. "
-                                   "Adjust logistic sharpness (k) or collect more data.")
+                    if _baseline["dir_acc"] > 55:
+                        _findings.append(("✅ Directional Edge",
+                                          f"Direction accuracy {_baseline['dir_acc']:.0f}% > 55% threshold. "
+                                          "The signal correctly predicts direction more often than chance."))
+                    elif _baseline["dir_acc"] < 45:
+                        _findings.append(("❌ Reverse Directional Signal",
+                                          f"Direction accuracy only {_baseline['dir_acc']:.0f}%. "
+                                          "Consider reversing the signal interpretation."))
                     else:
-                        st.error(f"❌ Poor calibration — max gap {_max_gap:.1f}pp. "
-                                 "The model over/underestimates probabilities significantly. "
-                                 "More data needed for auto-calibration to correct this.")
+                        _findings.append(("⚪ No Directional Edge",
+                                          f"Direction accuracy {_baseline['dir_acc']:.0f}% — not significantly above 50%."))
 
-            # ── Brier Score ───────────────────────────────────────────────
-            with st.expander("📐 Brier Score — Probability Forecast Accuracy", expanded=False):
-                st.caption("Brier Score = mean((predicted_prob − actual_outcome)²). "
-                           "Lower is better. Random model = 0.25. Perfect = 0.00.")
+                    if _baseline["move_iv"] > 1.05:
+                        _findings.append(("✅ Long Vol Edge",
+                                          f"Actual moves average {_baseline['move_iv']:.2f}× the implied move. "
+                                          "Options are systematically underpriced — buy vol strategies preferred."))
+                    elif _baseline["move_iv"] < 0.90:
+                        _findings.append(("✅ Short Vol Edge",
+                                          f"Actual moves average {_baseline['move_iv']:.2f}× the implied move. "
+                                          "Options are systematically overpriced — sell vol strategies preferred."))
 
-                _brier = float(np.mean((_pred_pu - _actual_up) ** 2))
-                _brier_skill = 1.0 - _brier / 0.25   # skill vs random baseline
-                _brier_col = ("#00d084" if _brier < 0.20
-                              else "#ffb347" if _brier < 0.23
-                              else "#ff3b3b")
+                    if _baseline["pct_toward_mp"] > 60:
+                        _findings.append(("✅ Max Pain Pinning",
+                                          f"Price moves toward max pain {_baseline['pct_toward_mp']:.0f}% of the time. "
+                                          "Strong gravitational pull — use max pain for target levels."))
 
-                bc1, bc2, bc3 = st.columns(3)
-                bc1.metric("Brier Score",  f"{_brier:.4f}",
-                           delta=f"vs random: {0.25:.4f}",
-                           delta_color="inverse",
-                           help="Mean squared error of probability forecasts. Lower = better. Random = 0.25")
-                bc2.metric("Brier Skill",  f"{_brier_skill*100:.1f}%",
-                           help="% improvement over a random (50/50) baseline. Positive = model adds value.")
-                _log_score = float(-np.mean(
-                    _actual_up * np.log(_pred_pu + 1e-9) +
-                    (1 - _actual_up) * np.log(1 - _pred_pu + 1e-9)
-                ))
-                bc3.metric("Log Score",    f"{_log_score:.4f}",
-                           help="Binary cross-entropy. Lower is better. Random = ln(2) ≈ 0.693")
+                    if abs(_baseline["iv_chg"]) > 0.5:
+                        direction = "rises" if _baseline["iv_chg"] > 0 else "falls"
+                        _findings.append(("✅ IV Edge",
+                                          f"IV {direction} avg {abs(_baseline['iv_chg']):.1f}pp after signal. "
+                                          f"{'Buy IV' if _baseline['iv_chg'] > 0 else 'Sell IV'} strategies have positive expected IV change."))
 
-                st.markdown(f"""
-<div style="font-family:'IBM Plex Mono',monospace;font-size:0.78rem;color:#555;margin-top:6px;">
-  <span style="color:{_brier_col};font-weight:700;">Brier Score {_brier:.4f}</span>
-  &nbsp;·&nbsp; n={n_s8} observations &nbsp;·&nbsp; k={_s8_sharp:.3f}
-  &nbsp;·&nbsp;
-  {'✅ Better than random' if _brier_skill > 0 else '❌ Worse than random'}
-</div>""", unsafe_allow_html=True)
+                    if abs(_baseline["skew_chg"]) > 0.3:
+                        _findings.append(("✅ Skew Edge",
+                                          f"Skew changes avg {_baseline['skew_chg']:+.2f}pp after signal. "
+                                          "Skew-based strategies (risk reversals, skew trades) may have edge."))
 
-            # ── Sharpness Calibration History ─────────────────────────────
-            with st.expander("📈 Logistic Sharpness k — Learning Curve", expanded=False):
-                st.caption("Shows how the calibrated sharpness k has evolved. "
-                           "Starts at prior (4.0), updated as real outcomes accumulate.")
+                    if not _findings:
+                        _findings.append(("⚪ No Edge Detected",
+                                          "No statistically meaningful edge found in any dimension. "
+                                          "Collect more signals (need 20+ per group for confidence)."))
 
-                # Reconstruct what k would have been at each step using OLS
-                if n_s8 >= 10:
-                    _k_history = []
-                    for _i in range(10, n_s8 + 1):
-                        _x = np.array(_s8_raw[:_i])
-                        _y = np.array(_s8_ret[:_i])
-                        _xx = float(np.dot(_x, _x))
-                        if _xx > 1e-9:
-                            _k_ols = float(np.dot(_x, _y)) / _xx
-                            # Shrink toward prior
-                            _shrink = max(0.0, 1.0 - (_i - _CALIB_MIN_OBS) / _CALIB_WINDOW)
-                            _k_blended = (1.0 - _shrink) * _k_ols + _shrink * 4.0
-                            _k_history.append(round(max(0.5, min(20.0, _k_blended)), 4))
-                        else:
-                            _k_history.append(4.0)
+                    for title, desc in _findings:
+                        st.markdown(f"**{title}**")
+                        st.caption(desc)
+                        st.markdown("")
 
-                    fig_k = go.Figure()
-                    fig_k.add_hline(y=4.0, line=dict(color="#555", dash="dot", width=1),
-                                    annotation_text="Prior k=4.0")
-                    fig_k.add_trace(go.Scatter(
-                        x=list(range(10, n_s8 + 1)), y=_k_history,
-                        mode="lines", name="Calibrated k",
-                        line=dict(color="#ff8c00", width=2)
+                with _interp_cols[1]:
+                    st.markdown("**Best-performing signal conditions:**")
+
+                    # Find group with highest dir accuracy
+                    _best_dir = max(
+                        [(g, m["dir_acc"]) for g, m in _edge_groups.items() if m and m["n"] >= 3],
+                        key=lambda x: x[1], default=(None, 0))
+                    # Find group with best return
+                    _best_ret = max(
+                        [(g, m["avg_ret"]) for g, m in _edge_groups.items() if m and m["n"] >= 3],
+                        key=lambda x: abs(x[1]), default=(None, 0))
+                    # Find highest pinning
+                    _best_pin = max(
+                        [(g, m["pct_toward_mp"]) for g, m in _edge_groups.items() if m and m["n"] >= 3],
+                        key=lambda x: x[1], default=(None, 0))
+
+                    if _best_dir[0]:
+                        st.markdown(f"🎯 **Best direction:** {_best_dir[0]} — {_best_dir[1]:.0f}% accuracy")
+                    if _best_ret[0]:
+                        st.markdown(f"📈 **Best return:** {_best_ret[0]} — avg {_best_ret[1]:+.2f}%/{_hz}")
+                    if _best_pin[0]:
+                        st.markdown(f"📍 **Best pinning:** {_best_pin[0]} — {_best_pin[1]:.0f}% toward max pain")
+
+                    st.divider()
+                    st.markdown("**Confidence guide:**")
+                    st.caption("< 5 signals: insufficient · 5–20: indicative · 20–50: moderate · 50+: high confidence")
+
+                    # Show confidence bar
+                    _conf_pct = min(100, int(_resolved_n / 50 * 100))
+                    _conf_col = "#00d084" if _conf_pct >= 60 else ("#ffb347" if _conf_pct >= 20 else "#ff3b3b")
+                    st.markdown(f"""
+    <div style="font-family:'IBM Plex Mono',monospace;margin:6px 0;">
+      <div style="color:#555;font-size:0.74rem;margin-bottom:3px;">
+        Confidence: {_resolved_n} resolved / 50 recommended
+      </div>
+      <div style="background:#1a1a1a;height:10px;border-radius:3px;overflow:hidden;">
+        <div style="width:{_conf_pct}%;height:100%;background:{_conf_col};border-radius:3px;"></div>
+      </div>
+    </div>""", unsafe_allow_html=True)
+
+            st.divider()
+
+            # ── RAW RESOLVED SIGNAL DETAIL TABLE ────────────────────────────────
+            with st.expander("📋 Raw Resolved Signal Log", expanded=False):
+                _res_rows = []
+                for e in sorted([x for x in _all_sym if x.get("resolved")],
+                                key=lambda x: x.get("ts",""), reverse=True)[:100]:
+                    r1 = e.get("fwd_ret_1d")
+                    r5 = e.get("fwd_ret_5d")
+                    sp0 = e.get("spot", 0.0)
+                    em  = e.get("expected_move", 0.0)
+                    sp1 = e.get("fwd_spot_1d")
+                    move_iv = abs(sp1 - sp0) / em if sp1 and sp0 > 0 and em > 0 else None
+
+                    _bias = e.get("bias", "—")
+                    _dir_ok = None
+                    if r1 is not None:
+                        if "BULLISH" in _bias:   _dir_ok = "✅" if r1 > 0 else "❌"
+                        elif "BEARISH" in _bias: _dir_ok = "✅" if r1 < 0 else "❌"
+                        else:                    _dir_ok = "—"
+
+                    _res_rows.append({
+                        "Date":      e.get("ts","")[:10],
+                        "Bias":      _bias,
+                        "Score":     f"{e.get('raw_score',0):+.3f}",
+                        "IV%":       f"{e.get('atm_iv_pct',0):.1f}",
+                        "PCR":       f"{e.get('pcr',0):.2f}",
+                        "Flow":      f"{e.get('flow_score',0):+.3f}",
+                        "EM ₹":      f"{em:.0f}",
+                        "Ret 1d":    f"{r1*100:+.2f}%" if r1 else "—",
+                        "Ret 5d":    f"{r5*100:+.2f}%" if r5 else "—",
+                        "Move/IV":   f"{move_iv:.2f}×" if move_iv else "—",
+                        "Dir ✓":     _dir_ok or "—",
+                    })
+
+                if _res_rows:
+                    _res_df = pd.DataFrame(_res_rows)
+
+                    def _dir_ok_style(v):
+                        if v == "✅": return "color:#00d084;font-weight:700"
+                        if v == "❌": return "color:#ff3b3b;font-weight:700"
+                        return "color:#555"
+
+                    st.dataframe(_res_df.style.map(_dir_ok_style, subset=["Dir ✓"]),
+                                 use_container_width=True, hide_index=True)
+
+            # ── VISUAL: Direction accuracy over time ──────────────────────────
+            with st.expander("📈 Direction Accuracy — Rolling 20-Signal Window", expanded=False):
+                _all_bias_signals = [e for e in _all_sym
+                                     if e.get("resolved") and e.get("fwd_ret_1d") is not None
+                                     and e.get("bias","NEUTRAL") != "NEUTRAL"]
+                if len(_all_bias_signals) >= 5:
+                    _roll_acc = []
+                    for i in range(len(_all_bias_signals)):
+                        window = _all_bias_signals[max(0, i-19):i+1]
+                        correct = []
+                        for e in window:
+                            r = e.get("fwd_ret_1d", 0)
+                            b = e.get("bias","")
+                            if "BULLISH" in b:   correct.append(1 if r > 0 else 0)
+                            elif "BEARISH" in b: correct.append(1 if r < 0 else 0)
+                        _roll_acc.append({
+                            "Signal #": i + 1,
+                            "Date":     e.get("ts","")[:10],
+                            "Rolling Accuracy": round(float(np.mean(correct)) * 100, 1) if correct else 50.0
+                        })
+                    _acc_df = pd.DataFrame(_roll_acc)
+                    fig_acc = go.Figure()
+                    fig_acc.add_trace(go.Scatter(
+                        x=_acc_df["Signal #"], y=_acc_df["Rolling Accuracy"],
+                        mode="lines+markers", name="Rolling Accuracy",
+                        line=dict(color="#ff8c00", width=2),
+                        marker=dict(size=5)
                     ))
-                    fig_k.add_hline(y=_s8_sharp,
-                                    line=dict(color="#00d084", dash="dash", width=1.5),
-                                    annotation_text=f"Current k={_s8_sharp:.3f}")
-                    fig_k.update_layout(
-                        title="Logistic Sharpness k Over Time",
-                        height=240, plot_bgcolor="#000", paper_bgcolor="#000",
+                    fig_acc.add_hline(y=55, line=dict(color="#00d084", dash="dash", width=1),
+                                      annotation_text="55% edge threshold")
+                    fig_acc.add_hline(y=50, line=dict(color="#555", dash="dot", width=1),
+                                      annotation_text="random (50%)")
+                    fig_acc.update_layout(
+                        title="Rolling 20-Signal Direction Accuracy",
+                        height=280, plot_bgcolor="#000", paper_bgcolor="#000",
                         font=dict(color="#e8e8e8", family="IBM Plex Mono", size=9),
-                        xaxis=dict(title="Observations", gridcolor="#111"),
-                        yaxis=dict(title="k", gridcolor="#111"),
+                        xaxis=dict(title="Signal #", gridcolor="#111"),
+                        yaxis=dict(title="Accuracy %", gridcolor="#111", range=[30, 80]),
                         margin=dict(t=40, b=10)
                     )
-                    st.plotly_chart(fig_k, use_container_width=True)
-
-                    _k_interp = ("Sharpness above prior → model signals are more decisive than cold-start" if _s8_sharp > 4.5
-                                 else "Sharpness below prior → signals are weaker than expected, wider prob spread" if _s8_sharp < 3.5
-                                 else "Sharpness near prior → model behaving as expected")
-                    st.caption(f"Current k={_s8_sharp:.3f} · {_k_interp}")
+                    st.plotly_chart(fig_acc, use_container_width=True)
                 else:
-                    st.caption(f"Need 10+ observations to show learning curve. Currently {n_s8}.")
+                    st.caption("Need at least 5 resolved directional signals to plot rolling accuracy.")
 
-            # ── Predicted vs Actual Scatter ───────────────────────────────
-            with st.expander("🔍 Predicted Probability vs Actual 1d Return", expanded=False):
-                st.caption("Each point is one signal. X = model's predicted P(↑), Y = actual 1-day log return. "
-                           "Good calibration → positive correlation, points trending upward left-to-right.")
-
-                fig_scat = go.Figure()
-                _colors_scat = ["#00d084" if r > 0 else "#ff3b3b" for r in _ret_arr]
-                fig_scat.add_trace(go.Scatter(
-                    x=(_pred_pu * 100).tolist(),
-                    y=(_ret_arr * 100).tolist(),
-                    mode="markers",
-                    marker=dict(size=6, color=_colors_scat, opacity=0.7),
-                    name="Signals",
-                    hovertemplate="P(↑): %{x:.1f}%<br>Ret: %{y:.2f}%<extra></extra>"
-                ))
-                # Trend line
-                if len(_pred_pu) >= 5:
-                    _z = np.polyfit(_pred_pu, _ret_arr * 100, 1)
-                    _px = np.linspace(_pred_pu.min(), _pred_pu.max(), 50)
-                    _py = np.polyval(_z, _px)
-                    fig_scat.add_trace(go.Scatter(
-                        x=(_px * 100).tolist(), y=_py.tolist(),
-                        mode="lines", name="Trend",
-                        line=dict(color="#ff8c00", width=1.5, dash="dot")
+            # ── VISUAL: Move vs Implied distribution ─────────────────────────
+            with st.expander("📊 Actual Move vs Implied Move Distribution", expanded=False):
+                _move_data = []
+                for e in [x for x in _all_sym if x.get("resolved")]:
+                    sp0 = e.get("spot", 0.0)
+                    sp1 = e.get("fwd_spot_1d")
+                    em  = e.get("expected_move", 0.0)
+                    if sp0 > 0 and sp1 and em > 0:
+                        _move_data.append(abs(sp1 - sp0) / em)
+                if len(_move_data) >= 5:
+                    fig_mv = go.Figure()
+                    fig_mv.add_trace(go.Histogram(
+                        x=_move_data, nbinsx=20,
+                        marker_color="#1e90ff", opacity=0.8, name="Move/IV ratio"
                     ))
-                    _corr = float(np.corrcoef(_pred_pu, _ret_arr)[0, 1])
-                    _corr_col = "#00d084" if _corr > 0.1 else "#ff3b3b" if _corr < -0.1 else "#888"
-
-                fig_scat.add_hline(y=0, line=dict(color="#333", width=1))
-                fig_scat.add_vline(x=50, line=dict(color="#333", width=1))
-                fig_scat.update_layout(
-                    height=280, plot_bgcolor="#000", paper_bgcolor="#000",
-                    font=dict(color="#e8e8e8", family="IBM Plex Mono", size=9),
-                    xaxis=dict(title="Predicted P(↑) %", gridcolor="#111", range=[20, 80]),
-                    yaxis=dict(title="Actual 1d Return %", gridcolor="#111"),
-                    margin=dict(t=20, b=10)
-                )
-                st.plotly_chart(fig_scat, use_container_width=True)
-
-                if len(_pred_pu) >= 5:
-                    st.markdown(
-                        f"Correlation: <span style='color:{_corr_col};font-weight:700;font-family:monospace;'>"
-                        f"{_corr:+.3f}</span> "
-                        f"({'positive — model direction aligns with returns' if _corr > 0.05 else 'negative — model may need recalibration' if _corr < -0.05 else 'near zero — no directional correlation yet'})",
-                        unsafe_allow_html=True
+                    fig_mv.add_vline(x=1.0, line=dict(color="#ff8c00", dash="dash", width=2),
+                                     annotation_text="IV = actual move")
+                    _mean_move = float(np.mean(_move_data))
+                    fig_mv.add_vline(x=_mean_move, line=dict(color="#00d084", dash="dot", width=1.5),
+                                     annotation_text=f"avg {_mean_move:.2f}×")
+                    fig_mv.update_layout(
+                        title=f"Distribution of |Actual 1d Move| / Expected Move  (n={len(_move_data)})",
+                        height=260, plot_bgcolor="#000", paper_bgcolor="#000",
+                        font=dict(color="#e8e8e8", family="IBM Plex Mono", size=9),
+                        xaxis=dict(title="Actual / Implied", gridcolor="#111"),
+                        yaxis=dict(title="Count", gridcolor="#111"),
+                        margin=dict(t=40, b=10)
                     )
+                    st.plotly_chart(fig_mv, use_container_width=True)
+                    _pct_over = float(np.mean([1 if m > 1 else 0 for m in _move_data])) * 100
+                    _vol_edge = "**Long Vol Edge** — options underpriced" if _mean_move > 1.05 else \
+                                "**Short Vol Edge** — options overpriced" if _mean_move < 0.90 else \
+                                "**No Vol Edge** — moves ≈ implied"
+                    st.markdown(f"Avg move = {_mean_move:.2f}× implied · {_pct_over:.0f}% of moves exceeded implied · {_vol_edge}")
+                else:
+                    st.caption("Need at least 5 resolved signals to plot distribution.")
 
-        else:
-            st.info(f"ℹ️ Probability calibration requires at least 5 paired (score, return) observations. "
-                    f"Currently {n_s8}. These accumulate automatically with daily use — "
-                    "each Load records a snapshot and resolves it after 4 trading days.")
+            # ── METHODOLOGY NOTE ─────────────────────────────────────────────
+            with st.expander("ℹ️ Edge Audit Methodology", expanded=False):
+                st.markdown("""
+    **What this module measures:**
 
-# ══════════════════════════════════════════════════════════════
-# TAB — PROBABILITY ENGINE
-# Full probability-based decision panel:
-#   Signals → Score → Probability → Implied Move comparison
-#   → Edge → EV → Kelly → Strategy recommendation
-# All sections are self-contained and work with data already
-# computed in the render section above (prob_score, strat_recs,
-# chain_df, oi_d, atm_iv, hv20, dte, spot, etc.)
-# ══════════════════════════════════════════════════════════════
+    Every time you click ⚡ LOAD OPTIONS INTEL, a full snapshot is recorded with:
+    spot, IV, IVR, IV/HV ratio, PCR, OI total, OI skew, max pain distance, skew, term structure slope,
+    flow score, positioning score, vol regime score, trend score, and expected move.
+
+    **Forward outcomes are resolved 5 trading days later** using OHLCV close prices:
+    - 1d/2d/3d/5d forward log return
+    - Absolute move vs expected move
+    - IV change, skew change, OI change
+    - Whether price moved toward max pain
+
+    **Signal groups** are formed by direction bias, IV regime, PCR level, proximity to max pain,
+    flow magnitude, and signal alignment (flow + positioning + vol all pointing same direction).
+
+    **Edge thresholds (interpretation rules):**
+
+    | Metric | Threshold | Edge |
+    |---|---|---|
+    | Direction accuracy | > 55% | Directional Edge |
+    | Avg move / implied | > 1.05× | Long Vol Edge |
+    | Avg move / implied | < 0.90× | Short Vol Edge |
+    | Avg IV change | > +0.5pp | Buy IV Edge |
+    | Avg IV change | < -0.5pp | Sell IV Edge |
+    | % toward max pain | > 60% | Pinning Edge |
+    | Avg skew change | > 0.3pp | Skew Edge |
+
+    **Confidence:** 5+ signals = indicative, 20+ = moderate, 50+ = high confidence.
+    Collect signals daily for 2–3 months for statistically meaningful results.
+    """)
+
+            # ══════════════════════════════════════════════════════════════
+            # STEP 8 — PROBABILITY CALIBRATION RESULTS
+            # Predicted probability ≈ Actual probability
+            # ══════════════════════════════════════════════════════════════
+            st.divider()
+            st.markdown("#### 🎯 Step 8 — Probability Calibration")
+            st.caption("Does the model's predicted P(↑) match the actual frequency of up-moves? "
+                       "A well-calibrated model has: when it says 70% bullish, the market goes up ~70% of the time.")
+
+            # Pull raw/return history from session state (symbol-namespaced)
+            _s8_raw   = _get_hist("_calib_raw_score_hist", sym)
+            _s8_ret   = _get_hist("_calib_realised_ret_hist", sym)
+            _s8_sharp = _calib("logistic_sharpness")
+            n_s8      = min(len(_s8_raw), len(_s8_ret))
+
+            c8a, c8b, c8c, c8d = st.columns(4)
+            c8a.metric("Observations",    str(n_s8),
+                       help="Paired (raw_score, realised_return) observations used for calibration")
+            c8b.metric("Logistic k",       f"{_s8_sharp:.3f}",
+                       help="Calibrated sharpness. Default=4.0. Higher=steeper prob curve. "
+                            "Learned from correlation between raw_score and forward returns.")
+            c8c.metric("Min needed",       str(_CALIB_MIN_OBS),
+                       help=f"Minimum {_CALIB_MIN_OBS} observations before sharpness overrides cold-start prior")
+            _s8_status = ("🟢 LIVE — using learned k" if n_s8 >= _CALIB_MIN_OBS
+                          else f"🟡 WARMING UP — {n_s8}/{_CALIB_MIN_OBS}")
+            c8d.metric("Status",  _s8_status)
+
+            if n_s8 >= 5:
+                # ── Reliability Diagram (Calibration Plot) ────────────────────
+                with st.expander("📊 Reliability Diagram — Predicted vs Actual Probability", expanded=True):
+                    st.caption("Each point = one bucket of signals with similar predicted P(↑). "
+                               "Perfect calibration = all points on the diagonal.")
+
+                    # Convert raw scores to predicted probs using current sharpness
+                    _raw_arr = np.array(_s8_raw[-min(n_s8, 200):])
+                    _ret_arr = np.array(_s8_ret[-min(n_s8, 200):])
+                    _pred_pu = 1.0 / (1.0 + np.exp(-_s8_sharp * _raw_arr))
+                    _actual_up = (_ret_arr > 0).astype(float)
+
+                    # Bin into spec-defined 0.05-wide buckets
+                    # 0.50–0.55, 0.55–0.60, 0.60–0.65, 0.65–0.70, 0.70–0.75, 0.75–0.80, 0.80–1.00
+                    # Plus bearish mirror: 0.20–0.25, 0.25–0.30, 0.30–0.35, 0.35–0.40, 0.40–0.45, 0.45–0.50
+                    _bins = [0.0, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45,
+                             0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 1.0]
+                    _bin_labels = ["<20%","20-25%","25-30%","30-35%","35-40%","40-45%","45-50%",
+                                   "50-55%","55-60%","60-65%","65-70%","70-75%","75-80%",">80%"]
+                    _rel_rows = []
+                    for i in range(len(_bins)-1):
+                        mask = (_pred_pu >= _bins[i]) & (_pred_pu < _bins[i+1])
+                        n_bin = int(mask.sum())
+                        if n_bin < 2:
+                            continue
+                        pred_mean   = float(_pred_pu[mask].mean())
+                        actual_freq = float(_actual_up[mask].mean())
+                        _move_vs_iv_h = _get_hist("_calib_move_vs_iv_hist", sym)
+                        _mvi_subset   = float(np.mean(_move_vs_iv_h[-n_bin:])) if len(_move_vs_iv_h) >= n_bin else 0.0
+                        _rel_rows.append({
+                            "Predicted P(↑)": _bin_labels[i],
+                            "Avg Predicted":  round(pred_mean * 100, 1),
+                            "Actual Up %":    round(actual_freq * 100, 1),
+                            "N":              n_bin,
+                            "Avg Move/IV":    round(_mvi_subset, 2) if _mvi_subset else "—",
+                            "Gap":            round((actual_freq - pred_mean) * 100, 1),
+                        })
+
+                    if _rel_rows:
+                        _rel_df = pd.DataFrame(_rel_rows)
+
+                        # Plot reliability diagram
+                        fig_rel = go.Figure()
+                        # Perfect calibration line
+                        fig_rel.add_trace(go.Scatter(
+                            x=[0, 100], y=[0, 100],
+                            mode="lines", name="Perfect calibration",
+                            line=dict(color="#555", dash="dash", width=1)
+                        ))
+                        # Actual calibration points
+                        _col_pts = ["#ff3b3b" if abs(r["Gap"]) > 10 else
+                                    "#ffb347" if abs(r["Gap"]) > 5 else "#00d084"
+                                    for r in _rel_rows]
+                        fig_rel.add_trace(go.Scatter(
+                            x=[r["Avg Predicted"] for r in _rel_rows],
+                            y=[r["Actual Up %"] for r in _rel_rows],
+                            mode="markers+lines",
+                            name="Model calibration",
+                            marker=dict(size=[max(8, r["N"]*2) for r in _rel_rows],
+                                       color=_col_pts, line=dict(color="#fff", width=1)),
+                            line=dict(color="#ff8c00", width=1.5),
+                            text=[f"N={r['N']}, Gap={r['Gap']:+.1f}pp" for r in _rel_rows],
+                            hovertemplate="%{text}<extra></extra>"
+                        ))
+                        fig_rel.update_layout(
+                            height=300, plot_bgcolor="#000", paper_bgcolor="#000",
+                            font=dict(color="#e8e8e8", family="IBM Plex Mono", size=9),
+                            xaxis=dict(title="Predicted P(↑) %", range=[0,100], gridcolor="#111"),
+                            yaxis=dict(title="Actual Up %",       range=[0,100], gridcolor="#111"),
+                            margin=dict(t=20, b=10),
+                            legend=dict(orientation="h", y=1.08)
+                        )
+                        st.plotly_chart(fig_rel, use_container_width=True)
+
+                        # Table with gap highlighting
+                        def _gap_style(v):
+                            try:
+                                g = float(str(v).replace("+",""))
+                                if abs(g) > 10: return "color:#ff3b3b;font-weight:700"
+                                if abs(g) > 5:  return "color:#ffb347"
+                                return "color:#00d084"
+                            except Exception:
+                                return ""
+                        def _mvi_style(v):
+                            try:
+                                m = float(str(v))
+                                if m > 1.05: return "color:#1e90ff;font-weight:700"   # long vol edge
+                                if m < 0.90: return "color:#ff8c00;font-weight:700"   # short vol edge
+                                return "color:#888"
+                            except Exception:
+                                return ""
+                        st.dataframe(
+                            _rel_df.style
+                                .map(_gap_style, subset=["Gap"])
+                                .map(_mvi_style, subset=["Avg Move/IV"]),
+                            use_container_width=True, hide_index=True
+                        )
+                        # Calibration verdict
+                        _max_gap = max(abs(r["Gap"]) for r in _rel_rows)
+                        if _max_gap <= 5:
+                            st.success(f"✅ Well-calibrated — max gap {_max_gap:.1f}pp. "
+                                       "Predicted probabilities closely match actual frequencies.")
+                        elif _max_gap <= 10:
+                            st.warning(f"⚠️ Moderate miscalibration — max gap {_max_gap:.1f}pp. "
+                                       "Adjust logistic sharpness (k) or collect more data.")
+                        else:
+                            st.error(f"❌ Poor calibration — max gap {_max_gap:.1f}pp. "
+                                     "The model over/underestimates probabilities significantly. "
+                                     "More data needed for auto-calibration to correct this.")
+
+                # ── Brier Score ───────────────────────────────────────────────
+                with st.expander("📐 Brier Score — Probability Forecast Accuracy", expanded=False):
+                    st.caption("Brier Score = mean((predicted_prob − actual_outcome)²). "
+                               "Lower is better. Random model = 0.25. Perfect = 0.00.")
+
+                    _brier = float(np.mean((_pred_pu - _actual_up) ** 2))
+                    _brier_skill = 1.0 - _brier / 0.25   # skill vs random baseline
+                    _brier_col = ("#00d084" if _brier < 0.20
+                                  else "#ffb347" if _brier < 0.23
+                                  else "#ff3b3b")
+
+                    bc1, bc2, bc3 = st.columns(3)
+                    bc1.metric("Brier Score",  f"{_brier:.4f}",
+                               delta=f"vs random: {0.25:.4f}",
+                               delta_color="inverse",
+                               help="Mean squared error of probability forecasts. Lower = better. Random = 0.25")
+                    bc2.metric("Brier Skill",  f"{_brier_skill*100:.1f}%",
+                               help="% improvement over a random (50/50) baseline. Positive = model adds value.")
+                    _log_score = float(-np.mean(
+                        _actual_up * np.log(_pred_pu + 1e-9) +
+                        (1 - _actual_up) * np.log(1 - _pred_pu + 1e-9)
+                    ))
+                    bc3.metric("Log Score",    f"{_log_score:.4f}",
+                               help="Binary cross-entropy. Lower is better. Random = ln(2) ≈ 0.693")
+
+                    st.markdown(f"""
+    <div style="font-family:'IBM Plex Mono',monospace;font-size:0.78rem;color:#555;margin-top:6px;">
+      <span style="color:{_brier_col};font-weight:700;">Brier Score {_brier:.4f}</span>
+      &nbsp;·&nbsp; n={n_s8} observations &nbsp;·&nbsp; k={_s8_sharp:.3f}
+      &nbsp;·&nbsp;
+      {'✅ Better than random' if _brier_skill > 0 else '❌ Worse than random'}
+    </div>""", unsafe_allow_html=True)
+
+                # ── Sharpness Calibration History ─────────────────────────────
+                with st.expander("📈 Logistic Sharpness k — Learning Curve", expanded=False):
+                    st.caption("Shows how the calibrated sharpness k has evolved. "
+                               "Starts at prior (4.0), updated as real outcomes accumulate.")
+
+                    # Reconstruct what k would have been at each step using OLS
+                    if n_s8 >= 10:
+                        _k_history = []
+                        for _i in range(10, n_s8 + 1):
+                            _x = np.array(_s8_raw[:_i])
+                            _y = np.array(_s8_ret[:_i])
+                            _xx = float(np.dot(_x, _x))
+                            if _xx > 1e-9:
+                                _k_ols = float(np.dot(_x, _y)) / _xx
+                                # Shrink toward prior
+                                _shrink = max(0.0, 1.0 - (_i - _CALIB_MIN_OBS) / _CALIB_WINDOW)
+                                _k_blended = (1.0 - _shrink) * _k_ols + _shrink * 4.0
+                                _k_history.append(round(max(0.5, min(20.0, _k_blended)), 4))
+                            else:
+                                _k_history.append(4.0)
+
+                        fig_k = go.Figure()
+                        fig_k.add_hline(y=4.0, line=dict(color="#555", dash="dot", width=1),
+                                        annotation_text="Prior k=4.0")
+                        fig_k.add_trace(go.Scatter(
+                            x=list(range(10, n_s8 + 1)), y=_k_history,
+                            mode="lines", name="Calibrated k",
+                            line=dict(color="#ff8c00", width=2)
+                        ))
+                        fig_k.add_hline(y=_s8_sharp,
+                                        line=dict(color="#00d084", dash="dash", width=1.5),
+                                        annotation_text=f"Current k={_s8_sharp:.3f}")
+                        fig_k.update_layout(
+                            title="Logistic Sharpness k Over Time",
+                            height=240, plot_bgcolor="#000", paper_bgcolor="#000",
+                            font=dict(color="#e8e8e8", family="IBM Plex Mono", size=9),
+                            xaxis=dict(title="Observations", gridcolor="#111"),
+                            yaxis=dict(title="k", gridcolor="#111"),
+                            margin=dict(t=40, b=10)
+                        )
+                        st.plotly_chart(fig_k, use_container_width=True)
+
+                        _k_interp = ("Sharpness above prior → model signals are more decisive than cold-start" if _s8_sharp > 4.5
+                                     else "Sharpness below prior → signals are weaker than expected, wider prob spread" if _s8_sharp < 3.5
+                                     else "Sharpness near prior → model behaving as expected")
+                        st.caption(f"Current k={_s8_sharp:.3f} · {_k_interp}")
+                    else:
+                        st.caption(f"Need 10+ observations to show learning curve. Currently {n_s8}.")
+
+                # ── Predicted vs Actual Scatter ───────────────────────────────
+                with st.expander("🔍 Predicted Probability vs Actual 1d Return", expanded=False):
+                    st.caption("Each point is one signal. X = model's predicted P(↑), Y = actual 1-day log return. "
+                               "Good calibration → positive correlation, points trending upward left-to-right.")
+
+                    fig_scat = go.Figure()
+                    _colors_scat = ["#00d084" if r > 0 else "#ff3b3b" for r in _ret_arr]
+                    fig_scat.add_trace(go.Scatter(
+                        x=(_pred_pu * 100).tolist(),
+                        y=(_ret_arr * 100).tolist(),
+                        mode="markers",
+                        marker=dict(size=6, color=_colors_scat, opacity=0.7),
+                        name="Signals",
+                        hovertemplate="P(↑): %{x:.1f}%<br>Ret: %{y:.2f}%<extra></extra>"
+                    ))
+                    # Trend line
+                    if len(_pred_pu) >= 5:
+                        _z = np.polyfit(_pred_pu, _ret_arr * 100, 1)
+                        _px = np.linspace(_pred_pu.min(), _pred_pu.max(), 50)
+                        _py = np.polyval(_z, _px)
+                        fig_scat.add_trace(go.Scatter(
+                            x=(_px * 100).tolist(), y=_py.tolist(),
+                            mode="lines", name="Trend",
+                            line=dict(color="#ff8c00", width=1.5, dash="dot")
+                        ))
+                        _corr = float(np.corrcoef(_pred_pu, _ret_arr)[0, 1])
+                        _corr_col = "#00d084" if _corr > 0.1 else "#ff3b3b" if _corr < -0.1 else "#888"
+
+                    fig_scat.add_hline(y=0, line=dict(color="#333", width=1))
+                    fig_scat.add_vline(x=50, line=dict(color="#333", width=1))
+                    fig_scat.update_layout(
+                        height=280, plot_bgcolor="#000", paper_bgcolor="#000",
+                        font=dict(color="#e8e8e8", family="IBM Plex Mono", size=9),
+                        xaxis=dict(title="Predicted P(↑) %", gridcolor="#111", range=[20, 80]),
+                        yaxis=dict(title="Actual 1d Return %", gridcolor="#111"),
+                        margin=dict(t=20, b=10)
+                    )
+                    st.plotly_chart(fig_scat, use_container_width=True)
+
+                    if len(_pred_pu) >= 5:
+                        st.markdown(
+                            f"Correlation: <span style='color:{_corr_col};font-weight:700;font-family:monospace;'>"
+                            f"{_corr:+.3f}</span> "
+                            f"({'positive — model direction aligns with returns' if _corr > 0.05 else 'negative — model may need recalibration' if _corr < -0.05 else 'near zero — no directional correlation yet'})",
+                            unsafe_allow_html=True
+                        )
+
+            else:
+                st.info(f"ℹ️ Probability calibration requires at least 5 paired (score, return) observations. "
+                        f"Currently {n_s8}. These accumulate automatically with daily use — "
+                        "each Load records a snapshot and resolves it after 4 trading days.")
+
+    # ══════════════════════════════════════════════════════════════
+    # TAB — PROBABILITY ENGINE
+    # Full probability-based decision panel:
+    #   Signals → Score → Probability → Implied Move comparison
+    #   → Edge → EV → Kelly → Strategy recommendation
+    # All sections are self-contained and work with data already
+    # computed in the render section above (prob_score, strat_recs,
+    # chain_df, oi_d, atm_iv, hv20, dte, spot, etc.)
+    # ══════════════════════════════════════════════════════════════
 with t_prob:
     # Read from session_state only - never from module-level vars
     _pe_loaded = st.session_state.get("opt_loaded", False)
@@ -11989,273 +11990,273 @@ with t_prob:
     st.markdown("### Probability Engine")
 
     if not _pe_loaded or _pe_spot <= 0:
-        st.warning("Load a symbol first — press LOAD OPTIONS INTEL in the sidebar.")
-        st.stop()
-
-    # Pull values from prob_score
-    _pe_pu   = float(_pe_ps.get("prob_up",   0.50))
-    _pe_pd   = float(_pe_ps.get("prob_down", 0.50))
-    _pe_rs   = float(_pe_ps.get("raw_score", 0.0))
-    _pe_edge = _pe_pu - 0.50
-    _pe_str  = str(_pe_ps.get("signal_strength", "No Edge"))
-    _pe_iv_pct = _pe_iv * 100.0
-    _pe_hv_pct = _pe_hv * 100.0
-    _pe_ivhv   = _pe_iv / (_pe_hv + 1e-9)
-
-    # Implied move: spot * IV * sqrt(DTE/252)
-    _pe_impl_pct = _pe_iv * math.sqrt(_pe_dte / 252.0) * 100.0
-    _pe_impl_rs  = _pe_spot * _pe_impl_pct / 100.0
-
-    # Colours
-    _pe_pu_col  = "#00d084" if _pe_pu >= 0.60 else "#ff3b3b" if _pe_pu <= 0.40 else "#ffb347"
-    _pe_edg_col = "#00d084" if _pe_edge > 0.05 else "#ff3b3b" if _pe_edge < -0.05 else "#888"
-    _pe_edg_lbl = "Bullish Edge" if _pe_edge > 0.05 else "Bearish Edge" if _pe_edge < -0.05 else "Neutral"
-
-    # ── SECTION 1: PROBABILITIES ──────────────────────────────────────────────
-    st.markdown("---")
-    st.markdown("#### Section 1 — Model Probabilities")
-
-    _s1a, _s1b, _s1c, _s1d = st.columns(4)
-    _s1a.metric("Prob Up",       f"{_pe_pu*100:.1f}%",
-                delta=f"score {_pe_rs:+.3f}", delta_color="normal")
-    _s1b.metric("Prob Down",     f"{_pe_pd*100:.1f}%")
-    _s1c.metric("Direction Edge",f"{_pe_edge*100:+.1f}pp")
-    _s1d.metric("Signal",        _pe_str)
-
-    # Simple progress bars using st.progress (always works)
-    st.caption(f"Bull {_pe_pu*100:.0f}% vs Bear {_pe_pd*100:.0f}% | {_pe_edg_lbl}")
-    st.progress(min(int(_pe_pu * 100), 100),
-                text=f"Prob Up: {_pe_pu*100:.1f}%  |  Edge: {_pe_edge*100:+.1f}pp")
-
-    with st.expander("How to read probabilities", expanded=False):
-        st.markdown("""
-| Prob Up | Meaning |
-|---------|---------|
-| > 65% | Strong Bullish |
-| 55-65% | Mild Bullish |
-| 45-55% | Neutral — vol trade only |
-| 35-45% | Mild Bearish |
-| < 35% | Strong Bearish |
-        """)
-
-    # ── SECTION 2: MOVE COMPARISON ────────────────────────────────────────────
-    st.markdown("---")
-    st.markdown("#### Section 2 — Move vs Implied Move")
-
-    # Calibration histories
-    _sym_pfx   = _pe_sym.upper()
-    _prob_hist = (st.session_state.get(f"{_sym_pfx}:_calib_prob_up_hist",   []) or
-                  st.session_state.get("_calib_prob_up_hist",   []))
-    _act_hist  = (st.session_state.get(f"{_sym_pfx}:_calib_actual_up_hist", []) or
-                  st.session_state.get("_calib_actual_up_hist", []))
-    _sc_hist   = (st.session_state.get(f"{_sym_pfx}:_calib_raw_score_hist", []) or
-                  st.session_state.get("_calib_raw_score_hist",  []))
-    _ret_hist  = (st.session_state.get(f"{_sym_pfx}:_calib_realised_ret_hist", []) or
-                  st.session_state.get("_calib_realised_ret_hist", []))
-    _mvi_hist  = (st.session_state.get(f"{_sym_pfx}:_calib_move_vs_iv_hist", []) or
-                  st.session_state.get("_calib_move_vs_iv_hist", []))
-    _n_obs     = min(len(_prob_hist), len(_act_hist))
-
-    # Model move from score buckets (data-driven) or fallback to implied
-    _model_move_pct  = None
-    _buckets = [(0.00,0.25,"0-0.25"),(0.25,0.50,"0.25-0.50"),
-                (0.50,0.75,"0.50-0.75"),(0.75,1.00,"0.75-1.00"),
-                (1.00,1.50,"1.00-1.50"),(1.50,99.0,"1.50+")]
-
-    if len(_sc_hist) >= 5 and len(_ret_hist) >= 5:
-        _sc_arr = np.array(_sc_hist[-min(len(_sc_hist),len(_ret_hist)):], dtype=float)
-        _rt_arr = np.array(_ret_hist[-min(len(_sc_hist),len(_ret_hist)):], dtype=float)
-        _mv_arr = np.abs(np.exp(_rt_arr) - 1.0) * 100.0
-        _abs_rs = abs(_pe_rs)
-        for _blo, _bhi, _ in _buckets:
-            _msk = (np.abs(_sc_arr) >= _blo) & (np.abs(_sc_arr) < _bhi)
-            if _msk.sum() > 0 and _blo <= _abs_rs < _bhi:
-                _model_move_pct = float(np.mean(_mv_arr[_msk]))
-                break
-
-    _mdl_pct = _model_move_pct if _model_move_pct else _pe_impl_pct
-    _mdl_rs  = _pe_spot * _mdl_pct / 100.0
-    _me_pct  = _mdl_pct - _pe_impl_pct if _model_move_pct else None
-
-    # Vol edge from avg move vs IV history
-    _avg_mvi   = float(np.mean(_mvi_hist[-50:])) if len(_mvi_hist) >= 3 else None
-    _vol_edge  = ("BUY"  if _avg_mvi and _avg_mvi > 1.05 else
-                  "SELL" if _avg_mvi and _avg_mvi < 0.90 else
-                  str(_pe_ps.get("vol_edge", "NEUTRAL")))
-    if _me_pct is not None:
-        if _me_pct > 0.3:  _vol_edge = "BUY"
-        elif _me_pct < -0.3: _vol_edge = "SELL"
-
-    _m1, _m2, _m3, _m4 = st.columns(4)
-    _m1.metric("Implied Move", f"Rs{_pe_impl_rs:,.0f}",
-               delta=f"+-{_pe_impl_pct:.2f}%")
-    _m2.metric("Model Move",   f"Rs{_mdl_rs:,.0f}",
-               delta=f"+-{_mdl_pct:.2f}%", delta_color="off")
-    _m3.metric("IV / HV",      f"{_pe_ivhv:.2f}x",
-               delta=f"IV {_pe_iv_pct:.1f}% HV {_pe_hv_pct:.1f}%", delta_color="off")
-    if _me_pct is not None:
-        _me_lbl = "Underpriced" if _me_pct > 0.3 else "Overpriced" if _me_pct < -0.3 else "Fair"
-        _m4.metric("Move Edge", f"{_me_pct:+.2f}pp", delta=_me_lbl, delta_color="off")
-    elif _avg_mvi:
-        _m4.metric("Avg Move/IV", f"{_avg_mvi:.2f}x",
-                   delta="Long vol" if _avg_mvi > 1.05 else "Short vol" if _avg_mvi < 0.90 else "Fair",
-                   delta_color="off")
+        st.warning("Load a symbol first — press ⚡ LOAD OPTIONS INTEL in the sidebar.")
     else:
-        _m4.metric("Move Edge", "< 3 obs")
 
-    st.caption(f"Observations for data-driven move: {len(_sc_hist)} score / {len(_ret_hist)} return / {len(_mvi_hist)} move-vs-IV")
+        # Pull values from prob_score
+        _pe_pu   = float(_pe_ps.get("prob_up",   0.50))
+        _pe_pd   = float(_pe_ps.get("prob_down", 0.50))
+        _pe_rs   = float(_pe_ps.get("raw_score", 0.0))
+        _pe_edge = _pe_pu - 0.50
+        _pe_str  = str(_pe_ps.get("signal_strength", "No Edge"))
+        _pe_iv_pct = _pe_iv * 100.0
+        _pe_hv_pct = _pe_hv * 100.0
+        _pe_ivhv   = _pe_iv / (_pe_hv + 1e-9)
 
-    # ── SECTION 3: CALIBRATION TABLE ─────────────────────────────────────────
-    st.markdown("---")
-    st.markdown("#### Section 3 — Probability Calibration")
-    st.caption(f"Observations: {_n_obs} (needs 5 to show table, 20+ for reliability)")
+        # Implied move: spot * IV * sqrt(DTE/252)
+        _pe_impl_pct = _pe_iv * math.sqrt(_pe_dte / 252.0) * 100.0
+        _pe_impl_rs  = _pe_spot * _pe_impl_pct / 100.0
 
-    if _n_obs >= 5:
-        _ph = np.array(_prob_hist[-_n_obs:], dtype=float)
-        _ah = np.array(_act_hist[-_n_obs:],  dtype=float)
-        _cal_rows = []
-        for _bl, _bh, _blbl in [(0.20,0.40,"0.20-0.40 Bearish"),(0.40,0.50,"0.40-0.50"),
-                                  (0.50,0.60,"0.50-0.60"),(0.60,0.80,"0.60-0.80 Bullish"),
-                                  (0.80,1.01,"0.80+ Strong Bull")]:
-            _msk = (_ph >= _bl) & (_ph < _bh)
-            _cnt = int(_msk.sum())
-            if _cnt == 0: continue
-            _ap = float(_ph[_msk].mean())
-            _af = float(_ah[_msk].mean())
-            _gap = _ap - _af
-            _cal_rows.append({
-                "Bucket": _blbl,
-                "Model Prob": f"{_ap*100:.1f}%",
-                "Actual Up":  f"{_af*100:.1f}%",
-                "Count":      _cnt,
-                "Gap":        f"{_gap*100:+.1f}pp"
-            })
-        if _cal_rows:
-            st.dataframe(pd.DataFrame(_cal_rows), use_container_width=True, hide_index=True)
-    else:
-        st.info(f"Calibration table needs 5 resolved observations. Currently: {_n_obs}. "
-                "Observations accumulate automatically — each Load + 4 trading days = 1 observation.")
+        # Colours
+        _pe_pu_col  = "#00d084" if _pe_pu >= 0.60 else "#ff3b3b" if _pe_pu <= 0.40 else "#ffb347"
+        _pe_edg_col = "#00d084" if _pe_edge > 0.05 else "#ff3b3b" if _pe_edge < -0.05 else "#888"
+        _pe_edg_lbl = "Bullish Edge" if _pe_edge > 0.05 else "Bearish Edge" if _pe_edge < -0.05 else "Neutral"
 
-    # ── SECTION 4: BRIER SCORE ────────────────────────────────────────────────
-    st.markdown("---")
-    st.markdown("#### Section 4 — Model Accuracy (Brier Score)")
+        # ── SECTION 1: PROBABILITIES ──────────────────────────────────────────────
+        st.markdown("---")
+        st.markdown("#### Section 1 — Model Probabilities")
 
-    if _n_obs >= 5:
-        _ph_b  = np.array(_prob_hist[-_n_obs:], dtype=float)
-        _ah_b  = np.array(_act_hist[-_n_obs:],  dtype=float)
-        _brier = float(np.mean((_ph_b - _ah_b) ** 2))
-        _skill = 1.0 - _brier / 0.25
-        _blbl  = ("Very Strong" if _brier < 0.12 else "Strong"    if _brier < 0.15 else
-                  "Tradable"    if _brier < 0.18 else "Weak"       if _brier < 0.20 else
-                  "Near Random" if _brier < 0.23 else "Below Random")
+        _s1a, _s1b, _s1c, _s1d = st.columns(4)
+        _s1a.metric("Prob Up",       f"{_pe_pu*100:.1f}%",
+                    delta=f"score {_pe_rs:+.3f}", delta_color="normal")
+        _s1b.metric("Prob Down",     f"{_pe_pd*100:.1f}%")
+        _s1c.metric("Direction Edge",f"{_pe_edge*100:+.1f}pp")
+        _s1d.metric("Signal",        _pe_str)
 
-        _b1, _b2, _b3, _b4 = st.columns(4)
-        _b1.metric("Brier Score",   f"{_brier:.4f}",
-                   help="Lower = better. Random = 0.25, Perfect = 0.00")
-        _b2.metric("Brier Skill",   f"{_skill*100:.1f}%",
-                   help="% improvement over random baseline")
-        _b3.metric("Assessment",    _blbl)
-        _b4.metric("Observations",  str(_n_obs))
+        # Simple progress bars using st.progress (always works)
+        st.caption(f"Bull {_pe_pu*100:.0f}% vs Bear {_pe_pd*100:.0f}% | {_pe_edg_lbl}")
+        st.progress(min(int(_pe_pu * 100), 100),
+                    text=f"Prob Up: {_pe_pu*100:.1f}%  |  Edge: {_pe_edge*100:+.1f}pp")
 
-        _bar_pct = max(0, min(100, int((0.25 - _brier) / 0.25 * 100)))
-        st.progress(_bar_pct,
-                    text=f"Brier: {_brier:.4f} | Skill: {_skill*100:.0f}% | {_blbl}")
-        st.caption("Reference: 0.25 = random  |  0.20 = weak  |  0.18 = tradable  |  0.15 = strong  |  0.12 = very strong")
-    else:
-        st.info(f"Brier score needs 5 observations (currently {_n_obs}). "
-                "Each Load click followed by market close adds one observation after ~4 trading days.")
+        with st.expander("How to read probabilities", expanded=False):
+            st.markdown("""
+    | Prob Up | Meaning |
+    |---------|---------|
+    | > 65% | Strong Bullish |
+    | 55-65% | Mild Bullish |
+    | 45-55% | Neutral — vol trade only |
+    | 35-45% | Mild Bearish |
+    | < 35% | Strong Bearish |
+            """)
 
-    # ── SECTION 5: EDGE + RECOMMENDATION ─────────────────────────────────────
-    st.markdown("---")
-    st.markdown("#### Section 5 — Edge and Trade Recommendation")
+        # ── SECTION 2: MOVE COMPARISON ────────────────────────────────────────────
+        st.markdown("---")
+        st.markdown("#### Section 2 — Move vs Implied Move")
 
-    _is_bull    = _pe_pu > 0.60
-    _is_bear    = _pe_pu < 0.40
-    _is_neutral = not _is_bull and not _is_bear
-    _long_vol   = _vol_edge == "BUY"
-    _short_vol  = _vol_edge == "SELL"
+        # Calibration histories
+        _sym_pfx   = _pe_sym.upper()
+        _prob_hist = (st.session_state.get(f"{_sym_pfx}:_calib_prob_up_hist",   []) or
+                      st.session_state.get("_calib_prob_up_hist",   []))
+        _act_hist  = (st.session_state.get(f"{_sym_pfx}:_calib_actual_up_hist", []) or
+                      st.session_state.get("_calib_actual_up_hist", []))
+        _sc_hist   = (st.session_state.get(f"{_sym_pfx}:_calib_raw_score_hist", []) or
+                      st.session_state.get("_calib_raw_score_hist",  []))
+        _ret_hist  = (st.session_state.get(f"{_sym_pfx}:_calib_realised_ret_hist", []) or
+                      st.session_state.get("_calib_realised_ret_hist", []))
+        _mvi_hist  = (st.session_state.get(f"{_sym_pfx}:_calib_move_vs_iv_hist", []) or
+                      st.session_state.get("_calib_move_vs_iv_hist", []))
+        _n_obs     = min(len(_prob_hist), len(_act_hist))
 
-    if   _is_bull  and _long_vol:   _trade = "BUY CALLS"
-    elif _is_bull  and _short_vol:  _trade = "SELL PUT SPREAD"
-    elif _is_bull:                   _trade = "BUY CALLS (small)"
-    elif _is_bear  and _long_vol:   _trade = "BUY PUTS"
-    elif _is_bear  and _short_vol:  _trade = "SELL CALL SPREAD"
-    elif _is_bear:                   _trade = "BUY PUTS (small)"
-    elif _is_neutral and _short_vol: _trade = "IRON CONDOR"
-    elif _is_neutral and _long_vol:  _trade = "STRADDLE"
-    else:                            _trade = "WAIT — no clear edge"
+        # Model move from score buckets (data-driven) or fallback to implied
+        _model_move_pct  = None
+        _buckets = [(0.00,0.25,"0-0.25"),(0.25,0.50,"0.25-0.50"),
+                    (0.50,0.75,"0.50-0.75"),(0.75,1.00,"0.75-1.00"),
+                    (1.00,1.50,"1.00-1.50"),(1.50,99.0,"1.50+")]
 
-    _e1, _e2 = st.columns(2)
-    with _e1:
-        st.metric("Direction Edge", _pe_edg_lbl,
-                  delta=f"Prob Up {_pe_pu*100:.1f}%  |  score {_pe_rs:+.3f}")
-        st.metric("Volatility Edge", _vol_edge,
-                  delta=f"IV/HV {_pe_ivhv:.2f}x" +
-                        (f"  |  Avg Move/IV {_avg_mvi:.2f}x" if _avg_mvi else ""),
-                  delta_color="off")
-        st.metric("Recommended", _trade)
+        if len(_sc_hist) >= 5 and len(_ret_hist) >= 5:
+            _sc_arr = np.array(_sc_hist[-min(len(_sc_hist),len(_ret_hist)):], dtype=float)
+            _rt_arr = np.array(_ret_hist[-min(len(_sc_hist),len(_ret_hist)):], dtype=float)
+            _mv_arr = np.abs(np.exp(_rt_arr) - 1.0) * 100.0
+            _abs_rs = abs(_pe_rs)
+            for _blo, _bhi, _ in _buckets:
+                _msk = (np.abs(_sc_arr) >= _blo) & (np.abs(_sc_arr) < _bhi)
+                if _msk.sum() > 0 and _blo <= _abs_rs < _bhi:
+                    _model_move_pct = float(np.mean(_mv_arr[_msk]))
+                    break
 
-    with _e2:
-        st.markdown("**Decision Logic**")
-        st.markdown(f"""
-- Prob Up **{_pe_pu*100:.1f}%** → {_pe_edg_lbl}
-- Vol Edge: **{_vol_edge}** (IV/HV {_pe_ivhv:.2f}x)
-- Score: **{_pe_rs:+.3f}** → {_pe_str}
-- Brier: **{"%.4f" % _brier if _n_obs >= 5 else "< 5 obs"}**
+        _mdl_pct = _model_move_pct if _model_move_pct else _pe_impl_pct
+        _mdl_rs  = _pe_spot * _mdl_pct / 100.0
+        _me_pct  = _mdl_pct - _pe_impl_pct if _model_move_pct else None
 
----
-**{_trade}**
-""")
+        # Vol edge from avg move vs IV history
+        _avg_mvi   = float(np.mean(_mvi_hist[-50:])) if len(_mvi_hist) >= 3 else None
+        _vol_edge  = ("BUY"  if _avg_mvi and _avg_mvi > 1.05 else
+                      "SELL" if _avg_mvi and _avg_mvi < 0.90 else
+                      str(_pe_ps.get("vol_edge", "NEUTRAL")))
+        if _me_pct is not None:
+            if _me_pct > 0.3:  _vol_edge = "BUY"
+            elif _me_pct < -0.3: _vol_edge = "SELL"
 
-    # ── SECTION 6: COMPLETE DASHBOARD TABLE ──────────────────────────────────
-    st.markdown("---")
-    st.markdown("#### Section 6 — Full Decision Dashboard")
+        _m1, _m2, _m3, _m4 = st.columns(4)
+        _m1.metric("Implied Move", f"Rs{_pe_impl_rs:,.0f}",
+                   delta=f"+-{_pe_impl_pct:.2f}%")
+        _m2.metric("Model Move",   f"Rs{_mdl_rs:,.0f}",
+                   delta=f"+-{_mdl_pct:.2f}%", delta_color="off")
+        _m3.metric("IV / HV",      f"{_pe_ivhv:.2f}x",
+                   delta=f"IV {_pe_iv_pct:.1f}% HV {_pe_hv_pct:.1f}%", delta_color="off")
+        if _me_pct is not None:
+            _me_lbl = "Underpriced" if _me_pct > 0.3 else "Overpriced" if _me_pct < -0.3 else "Fair"
+            _m4.metric("Move Edge", f"{_me_pct:+.2f}pp", delta=_me_lbl, delta_color="off")
+        elif _avg_mvi:
+            _m4.metric("Avg Move/IV", f"{_avg_mvi:.2f}x",
+                       delta="Long vol" if _avg_mvi > 1.05 else "Short vol" if _avg_mvi < 0.90 else "Fair",
+                       delta_color="off")
+        else:
+            _m4.metric("Move Edge", "< 3 obs")
 
-    _brier_disp = f"{_brier:.4f} ({_blbl})" if _n_obs >= 5 else "< 5 obs"
-    _me_disp    = (f"{_me_pct:+.2f}pp ({'Buy options' if _me_pct>0.3 else 'Sell options' if _me_pct<-0.3 else 'Fair'})"
-                   if _me_pct is not None else
-                   (f"{_avg_mvi:.2f}x avg" if _avg_mvi else "< 3 obs"))
-    _cal_disp   = "< 5 obs"
-    if _n_obs >= 5:
-        _rpa     = np.array(_prob_hist[-20:], dtype=float)
-        _raa     = np.array(_act_hist[-20:],  dtype=float)
-        _cacc    = float(np.mean((_rpa > 0.5) == (_raa > 0.5))) * 100
-        _cal_disp = f"{_cacc:.0f}% directional accuracy (last 20 obs)"
+        st.caption(f"Observations for data-driven move: {len(_sc_hist)} score / {len(_ret_hist)} return / {len(_mvi_hist)} move-vs-IV")
 
-    _dashboard = pd.DataFrame({
-        "Metric": [
-            "Prob Up", "Prob Down", "Direction Edge", "Signal Strength",
-            "Implied Move", "Model Move", "Move Edge", "Vol Edge",
-            "ATM IV", "IV / HV Ratio", "HV20",
-            "Brier Score", "Calibration",
-            "Recommended Trade"
-        ],
-        "Value": [
-            f"{_pe_pu*100:.1f}%",
-            f"{_pe_pd*100:.1f}%",
-            f"{_pe_edge*100:+.1f}pp — {_pe_edg_lbl}",
-            _pe_str,
-            f"+-{_pe_impl_pct:.2f}%  (Rs{_pe_impl_rs:,.0f})",
-            f"+-{_mdl_pct:.2f}%  (Rs{_mdl_rs:,.0f})" + ("" if _model_move_pct else "  [implied fallback]"),
-            _me_disp,
-            _vol_edge,
-            f"{_pe_iv_pct:.1f}%",
-            f"{_pe_ivhv:.2f}x",
-            f"{_pe_hv_pct:.1f}%",
-            _brier_disp,
-            _cal_disp,
-            _trade,
-        ]
-    })
-    st.dataframe(_dashboard, use_container_width=True, hide_index=True)
+        # ── SECTION 3: CALIBRATION TABLE ─────────────────────────────────────────
+        st.markdown("---")
+        st.markdown("#### Section 3 — Probability Calibration")
+        st.caption(f"Observations: {_n_obs} (needs 5 to show table, 20+ for reliability)")
 
-    st.caption(
-        f"Workflow: Signals -> Score ({_pe_rs:+.3f}) -> "
-        f"Prob Up {_pe_pu*100:.1f}% -> Implied +-{_pe_impl_pct:.1f}% -> "
-        f"Vol Edge {_vol_edge} -> {_trade}"
-    )
-    st.caption(
-        "NOTE: Prob Up is currently a logistic transform of lagging technical signals. "
-        "It becomes a real calibrated probability after 50+ resolved observations "
-        "accumulate in the Brier score section above."
-    )
+        if _n_obs >= 5:
+            _ph = np.array(_prob_hist[-_n_obs:], dtype=float)
+            _ah = np.array(_act_hist[-_n_obs:],  dtype=float)
+            _cal_rows = []
+            for _bl, _bh, _blbl in [(0.20,0.40,"0.20-0.40 Bearish"),(0.40,0.50,"0.40-0.50"),
+                                      (0.50,0.60,"0.50-0.60"),(0.60,0.80,"0.60-0.80 Bullish"),
+                                      (0.80,1.01,"0.80+ Strong Bull")]:
+                _msk = (_ph >= _bl) & (_ph < _bh)
+                _cnt = int(_msk.sum())
+                if _cnt == 0: continue
+                _ap = float(_ph[_msk].mean())
+                _af = float(_ah[_msk].mean())
+                _gap = _ap - _af
+                _cal_rows.append({
+                    "Bucket": _blbl,
+                    "Model Prob": f"{_ap*100:.1f}%",
+                    "Actual Up":  f"{_af*100:.1f}%",
+                    "Count":      _cnt,
+                    "Gap":        f"{_gap*100:+.1f}pp"
+                })
+            if _cal_rows:
+                st.dataframe(pd.DataFrame(_cal_rows), use_container_width=True, hide_index=True)
+        else:
+            st.info(f"Calibration table needs 5 resolved observations. Currently: {_n_obs}. "
+                    "Observations accumulate automatically — each Load + 4 trading days = 1 observation.")
+
+        # ── SECTION 4: BRIER SCORE ────────────────────────────────────────────────
+        st.markdown("---")
+        st.markdown("#### Section 4 — Model Accuracy (Brier Score)")
+
+        if _n_obs >= 5:
+            _ph_b  = np.array(_prob_hist[-_n_obs:], dtype=float)
+            _ah_b  = np.array(_act_hist[-_n_obs:],  dtype=float)
+            _brier = float(np.mean((_ph_b - _ah_b) ** 2))
+            _skill = 1.0 - _brier / 0.25
+            _blbl  = ("Very Strong" if _brier < 0.12 else "Strong"    if _brier < 0.15 else
+                      "Tradable"    if _brier < 0.18 else "Weak"       if _brier < 0.20 else
+                      "Near Random" if _brier < 0.23 else "Below Random")
+
+            _b1, _b2, _b3, _b4 = st.columns(4)
+            _b1.metric("Brier Score",   f"{_brier:.4f}",
+                       help="Lower = better. Random = 0.25, Perfect = 0.00")
+            _b2.metric("Brier Skill",   f"{_skill*100:.1f}%",
+                       help="% improvement over random baseline")
+            _b3.metric("Assessment",    _blbl)
+            _b4.metric("Observations",  str(_n_obs))
+
+            _bar_pct = max(0, min(100, int((0.25 - _brier) / 0.25 * 100)))
+            st.progress(_bar_pct,
+                        text=f"Brier: {_brier:.4f} | Skill: {_skill*100:.0f}% | {_blbl}")
+            st.caption("Reference: 0.25 = random  |  0.20 = weak  |  0.18 = tradable  |  0.15 = strong  |  0.12 = very strong")
+        else:
+            st.info(f"Brier score needs 5 observations (currently {_n_obs}). "
+                    "Each Load click followed by market close adds one observation after ~4 trading days.")
+
+        # ── SECTION 5: EDGE + RECOMMENDATION ─────────────────────────────────────
+        st.markdown("---")
+        st.markdown("#### Section 5 — Edge and Trade Recommendation")
+
+        _is_bull    = _pe_pu > 0.60
+        _is_bear    = _pe_pu < 0.40
+        _is_neutral = not _is_bull and not _is_bear
+        _long_vol   = _vol_edge == "BUY"
+        _short_vol  = _vol_edge == "SELL"
+
+        if   _is_bull  and _long_vol:   _trade = "BUY CALLS"
+        elif _is_bull  and _short_vol:  _trade = "SELL PUT SPREAD"
+        elif _is_bull:                   _trade = "BUY CALLS (small)"
+        elif _is_bear  and _long_vol:   _trade = "BUY PUTS"
+        elif _is_bear  and _short_vol:  _trade = "SELL CALL SPREAD"
+        elif _is_bear:                   _trade = "BUY PUTS (small)"
+        elif _is_neutral and _short_vol: _trade = "IRON CONDOR"
+        elif _is_neutral and _long_vol:  _trade = "STRADDLE"
+        else:                            _trade = "WAIT — no clear edge"
+
+        _e1, _e2 = st.columns(2)
+        with _e1:
+            st.metric("Direction Edge", _pe_edg_lbl,
+                      delta=f"Prob Up {_pe_pu*100:.1f}%  |  score {_pe_rs:+.3f}")
+            st.metric("Volatility Edge", _vol_edge,
+                      delta=f"IV/HV {_pe_ivhv:.2f}x" +
+                            (f"  |  Avg Move/IV {_avg_mvi:.2f}x" if _avg_mvi else ""),
+                      delta_color="off")
+            st.metric("Recommended", _trade)
+
+        with _e2:
+            st.markdown("**Decision Logic**")
+            st.markdown(f"""
+    - Prob Up **{_pe_pu*100:.1f}%** → {_pe_edg_lbl}
+    - Vol Edge: **{_vol_edge}** (IV/HV {_pe_ivhv:.2f}x)
+    - Score: **{_pe_rs:+.3f}** → {_pe_str}
+    - Brier: **{"%.4f" % _brier if _n_obs >= 5 else "< 5 obs"}**
+
+    ---
+    **{_trade}**
+    """)
+
+        # ── SECTION 6: COMPLETE DASHBOARD TABLE ──────────────────────────────────
+        st.markdown("---")
+        st.markdown("#### Section 6 — Full Decision Dashboard")
+
+        _brier_disp = f"{_brier:.4f} ({_blbl})" if _n_obs >= 5 else "< 5 obs"
+        _me_disp    = (f"{_me_pct:+.2f}pp ({'Buy options' if _me_pct>0.3 else 'Sell options' if _me_pct<-0.3 else 'Fair'})"
+                       if _me_pct is not None else
+                       (f"{_avg_mvi:.2f}x avg" if _avg_mvi else "< 3 obs"))
+        _cal_disp   = "< 5 obs"
+        if _n_obs >= 5:
+            _rpa     = np.array(_prob_hist[-20:], dtype=float)
+            _raa     = np.array(_act_hist[-20:],  dtype=float)
+            _cacc    = float(np.mean((_rpa > 0.5) == (_raa > 0.5))) * 100
+            _cal_disp = f"{_cacc:.0f}% directional accuracy (last 20 obs)"
+
+        _dashboard = pd.DataFrame({
+            "Metric": [
+                "Prob Up", "Prob Down", "Direction Edge", "Signal Strength",
+                "Implied Move", "Model Move", "Move Edge", "Vol Edge",
+                "ATM IV", "IV / HV Ratio", "HV20",
+                "Brier Score", "Calibration",
+                "Recommended Trade"
+            ],
+            "Value": [
+                f"{_pe_pu*100:.1f}%",
+                f"{_pe_pd*100:.1f}%",
+                f"{_pe_edge*100:+.1f}pp — {_pe_edg_lbl}",
+                _pe_str,
+                f"+-{_pe_impl_pct:.2f}%  (Rs{_pe_impl_rs:,.0f})",
+                f"+-{_mdl_pct:.2f}%  (Rs{_mdl_rs:,.0f})" + ("" if _model_move_pct else "  [implied fallback]"),
+                _me_disp,
+                _vol_edge,
+                f"{_pe_iv_pct:.1f}%",
+                f"{_pe_ivhv:.2f}x",
+                f"{_pe_hv_pct:.1f}%",
+                _brier_disp,
+                _cal_disp,
+                _trade,
+            ]
+        })
+        st.dataframe(_dashboard, use_container_width=True, hide_index=True)
+
+        st.caption(
+            f"Workflow: Signals -> Score ({_pe_rs:+.3f}) -> "
+            f"Prob Up {_pe_pu*100:.1f}% -> Implied +-{_pe_impl_pct:.1f}% -> "
+            f"Vol Edge {_vol_edge} -> {_trade}"
+        )
+        st.caption(
+            "NOTE: Prob Up is currently a logistic transform of lagging technical signals. "
+            "It becomes a real calibrated probability after 50+ resolved observations "
+            "accumulate in the Brier score section above."
+        )
