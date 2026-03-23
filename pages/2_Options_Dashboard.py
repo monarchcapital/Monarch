@@ -5862,48 +5862,6 @@ if "opt_ohlcv_df"       not in st.session_state: st.session_state.opt_ohlcv_df  
 if "opt_factor_hist"    not in st.session_state: st.session_state.opt_factor_hist    = {}
 if "opt_intraday_df"    not in st.session_state: st.session_state.opt_intraday_df    = pd.DataFrame()
 if "opt_intraday_signals" not in st.session_state: st.session_state.opt_intraday_signals = {}
-# ── Tradebook: active trades + historical PnL ───────────────────────────────
-_TRADEBOOK_FILE = ".monarch_tradebook.json"
-_HISTPNL_FILE   = ".monarch_hist_pnl.json"
-
-def _load_tradebook() -> list:
-    try:
-        if os.path.exists(_TRADEBOOK_FILE):
-            with open(_TRADEBOOK_FILE, "r") as f:
-                d = json.load(f)
-            return d if isinstance(d, list) else []
-    except Exception:
-        pass
-    return []
-
-def _save_tradebook(data: list):
-    try:
-        with open(_TRADEBOOK_FILE, "w") as f:
-            json.dump(data, f, indent=2)
-    except Exception:
-        pass
-
-def _load_hist_pnl() -> list:
-    try:
-        if os.path.exists(_HISTPNL_FILE):
-            with open(_HISTPNL_FILE, "r") as f:
-                d = json.load(f)
-            return d if isinstance(d, list) else []
-    except Exception:
-        pass
-    return []
-
-def _save_hist_pnl(data: list):
-    try:
-        with open(_HISTPNL_FILE, "w") as f:
-            json.dump(data, f, indent=2)
-    except Exception:
-        pass
-
-if "opt_tradebook"  not in st.session_state:
-    st.session_state.opt_tradebook  = _load_tradebook()
-if "opt_hist_pnl"   not in st.session_state:
-    st.session_state.opt_hist_pnl   = _load_hist_pnl()
 
 # ── CRITICAL: Restore all signal histories from disk ──────────────────────────
 # Without this, every app restart wipes calibration signal histories, pending
@@ -6461,8 +6419,371 @@ if multi_load_btn:
         st.session_state.opt_multi_loaded = True
         st.rerun()
 
-if not st.session_state.opt_loaded:
+# ── Tradebook: persistence helpers ──────────────────────────────────────────
+_TRADEBOOK_FILE = ".monarch_tradebook.json"
+_HISTPNL_FILE   = ".monarch_hist_pnl.json"
+
+def _load_tradebook() -> list:
+    try:
+        if os.path.exists(_TRADEBOOK_FILE):
+            with open(_TRADEBOOK_FILE, "r") as f:
+                d = json.load(f)
+            return d if isinstance(d, list) else []
+    except Exception:
+        pass
+    return []
+
+def _save_tradebook(data: list):
+    try:
+        with open(_TRADEBOOK_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+def _load_hist_pnl() -> list:
+    try:
+        if os.path.exists(_HISTPNL_FILE):
+            with open(_HISTPNL_FILE, "r") as f:
+                d = json.load(f)
+            return d if isinstance(d, list) else []
+    except Exception:
+        pass
+    return []
+
+def _save_hist_pnl(data: list):
+    try:
+        with open(_HISTPNL_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+if "opt_tradebook" not in st.session_state:
+    st.session_state.opt_tradebook = _load_tradebook()
+if "opt_hist_pnl"  not in st.session_state:
+    st.session_state.opt_hist_pnl  = _load_hist_pnl()
+
+# ── Create ALL tabs here — before st.stop() so Tradebook always renders ──────
+# Other tabs only show content when opt_loaded=True (guarded inside each tab).
+# Tradebook reads exclusively from session_state so it works at all times.
+(t_signal, t_trade, t_chain, t_structure,
+ t_reference, t_edge, t_prob, t_tradebook) = st.tabs([
+    "⚡ Signal",
+    "🎯 Trade",
+    "📋 Chain & Data",
+    "📅 Structure",
+    "📐 Reference",
+    "🔬 Edge Audit",
+    "🎲 Probability Engine",
+    "📒 Tradebook",
+])
+
+# ── Tradebook tab — fully self-contained, reads only session_state ────────────
+def _estimate_trade_pnl(te: dict, live_spot: float = None) -> float:
+    """Estimate directional PnL for a logged trade.
+    Uses live_spot if provided (after load), else falls back to spot_current stored in entry.
+    For neutral strategies (condor/straddle): negative when move exceeds expected move.
+    """
+    spot_e = float(te.get("spot_entry", 0) or 0)
+    spot_c = float(live_spot if live_spot else te.get("spot_current", spot_e) or spot_e)
+    pos    = float(te.get("pos_size_rs", 0) or 0)
+    if spot_e <= 0 or pos <= 0:
+        return 0.0
+    pct_move = (spot_c - spot_e) / spot_e
+    strat = (te.get("strategy") or "").lower()
+    if any(x in strat for x in ["buy call", "call buy", "bull call", "bull spread",
+                                  "sell put", "put sell", "put spread"]):
+        mult = 1.0
+    elif any(x in strat for x in ["buy put", "put buy", "bear put", "bear spread",
+                                    "sell call", "call sell", "bear call"]):
+        mult = -1.0
+    elif any(x in strat for x in ["condor", "strangle", "straddle", "calendar", "butterfly"]):
+        em_pct = float(te.get("exp_move_pct", 2.0) or 2.0) / 100.0
+        excess = abs(pct_move) - em_pct
+        mult   = -1.0 if excess > 0 else 1.0
+        pct_move = abs(pct_move)
+    else:
+        bias_entry = te.get("bias", "NEUTRAL")
+        mult = 1.0 if "BULL" in str(bias_entry) else (-1.0 if "BEAR" in str(bias_entry) else 1.0)
+    return round(pct_move * mult * pos, 2)
+
+with t_tradebook:
+    st.markdown("### 📒 Tradebook — Active Trades & Historical PnL")
+
+    # Refresh spot_current for active trades from live session state (post-load)
+    _live_spot_tb = st.session_state.get("opt_spot", None)
+    _live_iv_tb   = st.session_state.get("opt_atm_iv", None)
+    _tb_list      = st.session_state.opt_tradebook
+    _changed_tb   = False
+    for _te in _tb_list:
+        if _te.get("status") == "ACTIVE" and _live_spot_tb:
+            _te["spot_current"]   = float(_live_spot_tb)
+            _te["atm_iv_current"] = float(_live_iv_tb) if _live_iv_tb else _te.get("atm_iv_current", 0)
+            _changed_tb = True
+    if _changed_tb:
+        st.session_state.opt_tradebook = _tb_list
+        _save_tradebook(_tb_list)
+
+    _active_trades = [t for t in st.session_state.opt_tradebook if t.get("status") == "ACTIVE"]
+    _hist_trades   = st.session_state.opt_hist_pnl
+
+    # ── Summary header metrics ────────────────────────────────────────────────
+    _hm1, _hm2, _hm3, _hm4 = st.columns(4)
+    _hm1.metric("Active Trades",    str(len(_active_trades)))
+    _hm2.metric("Historical (Closed)", str(len(_hist_trades)))
+    _total_unreal = sum(_estimate_trade_pnl(t, _live_spot_tb) for t in _active_trades)
+    _hist_realised = sum(float(t.get("realised_pnl", 0) or 0) for t in _hist_trades)
+    _hm3.metric("Est. Unrealised PnL",
+                f"{'+'if _total_unreal>=0 else ''}₹{_total_unreal:,.0f}")
+    _hm4.metric("Realised PnL (Closed)",
+                f"{'+'if _hist_realised>=0 else ''}₹{_hist_realised:,.0f}")
+
+    if not st.session_state.get("opt_loaded"):
+        st.info("💡 Load options intel (⚡ LOAD OPTIONS INTEL) to enable live PnL updates. "
+                "Logged trades and historical PnL are always visible here.")
+
+    st.caption(
+        "⚠ PnL estimates are directional approximations: (spot_now − spot_entry) / spot_entry × position size, "
+        "adjusted for strategy direction. Neutral strategies go negative when move exceeds expected move. "
+        "Verify actual P&L in your broker terminal."
+    )
+    st.divider()
+
+    # ── ACTIVE TRADES ─────────────────────────────────────────────────────────
+    st.markdown("#### 🟢 Active Trades")
+
+    if not _active_trades:
+        st.info(
+            "No active trades yet. Go to the **🎯 Trade** tab → load options intel → "
+            "find a strategy → press **📋 LOG Trade** to snapshot it here."
+        )
+    else:
+        for _te in list(st.session_state.opt_tradebook):
+            if _te.get("status") != "ACTIVE":
+                continue
+            _pnl_est  = _estimate_trade_pnl(_te, _live_spot_tb)
+            _pnl_pct  = (_pnl_est / max(float(_te.get("pos_size_rs", 1) or 1), 1)) * 100
+            _pnl_col  = "#00d084" if _pnl_est >= 0 else "#ff3b3b"
+            _pnl_sign = "+" if _pnl_est >= 0 else ""
+            _spot_e   = float(_te.get("spot_entry", 0) or 0)
+            _spot_c   = float(_te.get("spot_current", _spot_e) or _spot_e)
+            _sdelta   = _spot_c - _spot_e
+            _sdel_col = "#00d084" if _sdelta >= 0 else "#ff3b3b"
+            _sdel_sgn = "+" if _sdelta >= 0 else ""
+            _bc_te    = ("#00d084" if "BULL" in str(_te.get("bias",""))
+                         else "#ff3b3b" if "BEAR" in str(_te.get("bias",""))
+                         else "#ffb347")
+            _iv_e     = float(_te.get("atm_iv_entry", 0) or 0)
+            _iv_c     = float(_te.get("atm_iv_current", _iv_e) or _iv_e)
+            _iv_chg   = _iv_c - _iv_e
+            _iv_col   = "#ff3b3b" if _iv_chg > 0.005 else "#1e90ff" if _iv_chg < -0.005 else "#888"
+
+            st.markdown(f"""
+<div style="background:#0d0d0d;border:1px solid #2a2a2a;border-left:4px solid {_pnl_col};
+padding:14px 18px;margin-bottom:4px;font-family:'IBM Plex Mono',monospace;">
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:6px;margin-bottom:10px;">
+    <div>
+      <span style="color:#ff8c00;font-size:0.72rem;font-weight:700;letter-spacing:.1em;">ACTIVE</span>
+      &nbsp;·&nbsp;<span style="color:#555;font-size:0.72rem;">{_te.get('logged_at','—')}</span>
+      &nbsp;·&nbsp;<span style="color:#888;font-size:0.72rem;">{_te.get('symbol','—')} · {_te.get('expiry','—')} · DTE@entry {_te.get('dte_at_entry','—')}</span>
+    </div>
+    <div style="text-align:right;">
+      <span style="color:{_pnl_col};font-size:1.1rem;font-weight:700;">{_pnl_sign}₹{_pnl_est:,.0f}</span>
+      <span style="color:{_pnl_col};font-size:0.78rem;margin-left:6px;">({_pnl_sign}{_pnl_pct:.1f}%)</span>
+      <div style="color:#555;font-size:0.68rem;">Est. Unrealised PnL</div>
+    </div>
+  </div>
+  <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:10px;">
+    <div>
+      <div style="color:#555;font-size:0.70rem;">STRATEGY</div>
+      <div style="color:#e8e8e8;font-size:0.88rem;font-weight:700;">{_te.get('strategy','—')}</div>
+      <div style="color:#777;font-size:0.70rem;">{_te.get('strategy_type','—')}</div>
+    </div>
+    <div>
+      <div style="color:#555;font-size:0.70rem;">SIGNAL CLASS</div>
+      <div style="color:#7ec8e3;font-size:0.84rem;font-weight:600;">{_te.get('strategy_class','—')}</div>
+      <div style="color:#777;font-size:0.70rem;">EV Score {_te.get('ev_score',0)}</div>
+    </div>
+    <div>
+      <div style="color:#555;font-size:0.70rem;">DIRECTION @ ENTRY</div>
+      <div style="color:{_bc_te};font-size:0.88rem;font-weight:700;">{_te.get('bias','—')}</div>
+      <div style="color:#777;font-size:0.70rem;">P(↑) {_te.get('prob_up',0.5)*100:.1f}% · Score {_te.get('raw_score',0):+.3f}</div>
+    </div>
+    <div>
+      <div style="color:#555;font-size:0.70rem;">POSITION SIZE</div>
+      <div style="color:#ff8c00;font-size:0.88rem;font-weight:700;">₹{float(_te.get('pos_size_rs',0) or 0):,.0f}</div>
+      <div style="color:#777;font-size:0.70rem;">{float(_te.get('kelly_pct',0) or 0):.1f}% Kelly</div>
+    </div>
+  </div>
+  <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-bottom:10px;
+  background:#080808;border:1px solid #1a1a1a;padding:8px 10px;">
+    <div><div style="color:#555;font-size:0.68rem;">SPOT ENTRY</div>
+         <div style="color:#e8e8e8;font-size:0.84rem;font-weight:700;">₹{_spot_e:,.1f}</div></div>
+    <div><div style="color:#555;font-size:0.68rem;">SPOT NOW</div>
+         <div style="color:{_sdel_col};font-size:0.84rem;font-weight:700;">₹{_spot_c:,.1f}</div></div>
+    <div><div style="color:#555;font-size:0.68rem;">SPOT Δ</div>
+         <div style="color:{_sdel_col};font-size:0.84rem;font-weight:700;">{_sdel_sgn}₹{_sdelta:,.1f}</div></div>
+    <div><div style="color:#555;font-size:0.68rem;">ATM IV @ ENTRY</div>
+         <div style="color:#888;font-size:0.84rem;">{_iv_e*100:.1f}%</div></div>
+    <div><div style="color:#555;font-size:0.68rem;">IV Δ</div>
+         <div style="color:{_iv_col};font-size:0.84rem;">{'+'if _iv_chg>=0 else ''}{_iv_chg*100:.2f}pp</div></div>
+  </div>
+  <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:8px;">
+    <div><div style="color:#555;font-size:0.68rem;">MAX RISK</div>
+         <div style="color:#ffb347;font-size:0.80rem;">{_te.get('max_risk','—')}</div></div>
+    <div><div style="color:#555;font-size:0.68rem;">MAX REWARD</div>
+         <div style="color:#00d084;font-size:0.80rem;">{_te.get('max_reward','—')}</div></div>
+    <div><div style="color:#555;font-size:0.68rem;">POP @ ENTRY</div>
+         <div style="color:#7ec8e3;font-size:0.80rem;">{float(_te.get('pop',0.5) or 0.5)*100:.1f}%</div></div>
+    <div><div style="color:#555;font-size:0.68rem;">SAFETY RATIO</div>
+         <div style="color:#888;font-size:0.80rem;">{float(_te.get('safety_ratio',0) or 0):.2f}× EM</div></div>
+  </div>
+  <div style="color:#444;font-size:0.72rem;line-height:1.5;border-top:1px solid #1a1a1a;padding-top:7px;">
+    LEGS: <span style="color:#7ec8e3;">{_te.get('legs','—')}</span>
+    &nbsp;·&nbsp; Vol Edge: <span style="color:#e8e8e8;">{_te.get('vol_edge','—')}</span>
+    &nbsp;·&nbsp; Regime: <span style="color:#e8e8e8;">{_te.get('regime','—')}</span>
+    &nbsp;·&nbsp; Flow: {float(_te.get('flow_score',0) or 0):+.3f}
+    &nbsp;·&nbsp; Max Pain: ₹{float(_te.get('max_pain',0) or 0):,.0f}
+    &nbsp;·&nbsp; Call Wall: ₹{float(_te.get('call_wall',0) or 0):,.0f}
+    &nbsp;·&nbsp; Put Wall: ₹{float(_te.get('put_wall',0) or 0):,.0f}
+  </div>
+  <div style="color:#333;font-size:0.70rem;margin-top:4px;line-height:1.4;">{_te.get('dynamic_rationale','—')}</div>
+</div>""", unsafe_allow_html=True)
+
+            _btn1, _btn2, _btn3 = st.columns([1, 1.6, 4])
+            with _btn1:
+                if st.button("🗑 Delete", key=f"del_{_te['id']}",
+                             help="Remove from Tradebook without recording PnL."):
+                    st.session_state.opt_tradebook = [
+                        t for t in st.session_state.opt_tradebook if t["id"] != _te["id"]
+                    ]
+                    _save_tradebook(st.session_state.opt_tradebook)
+                    st.rerun()
+            with _btn2:
+                if st.button("📁 → Historical PnL", key=f"close_{_te['id']}",
+                             help="Lock in current PnL and move to Historical."):
+                    _closed = dict(_te)
+                    _closed["status"]           = "HISTORICAL"
+                    _closed["closed_at"]        = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    _closed["spot_close"]       = float(_live_spot_tb or _spot_c)
+                    _closed["realised_pnl"]     = float(_pnl_est)
+                    _closed["realised_pnl_pct"] = float(_pnl_pct)
+                    _hp = st.session_state.opt_hist_pnl
+                    _hp.append(_closed)
+                    st.session_state.opt_hist_pnl = _hp
+                    _save_hist_pnl(_hp)
+                    st.session_state.opt_tradebook = [
+                        t for t in st.session_state.opt_tradebook if t["id"] != _te["id"]
+                    ]
+                    _save_tradebook(st.session_state.opt_tradebook)
+                    st.success(f"Trade closed. Realised PnL locked: {'+'if _pnl_est>=0 else ''}₹{_pnl_est:,.0f}")
+                    st.rerun()
+
+    st.divider()
+
+    # ── HISTORICAL PnL ────────────────────────────────────────────────────────
+    st.markdown("#### 📁 Historical PnL — Closed Trades")
+    if not _hist_trades:
+        st.info("No closed trades yet. Press **📁 → Historical PnL** on an active trade to record results.")
+    else:
+        _pnl_arr  = [float(t.get("realised_pnl", 0) or 0) for t in _hist_trades]
+        _wins     = sum(1 for p in _pnl_arr if p > 0)
+        _losses   = len(_pnl_arr) - _wins
+        _wr       = _wins / len(_pnl_arr) * 100
+        _avg_w    = float(np.mean([p for p in _pnl_arr if p > 0])) if _wins else 0
+        _avg_l    = float(np.mean([p for p in _pnl_arr if p <= 0])) if _losses else 0
+        _total_r  = float(np.sum(_pnl_arr))
+        _rr       = abs(_avg_w / _avg_l) if _avg_l != 0 else float("inf")
+
+        _sc1, _sc2, _sc3, _sc4, _sc5 = st.columns(5)
+        _sc1.metric("Closed Trades", str(len(_pnl_arr)))
+        _sc2.metric("Win Rate", f"{_wr:.1f}%", delta=f"{_wins}W / {_losses}L")
+        _sc3.metric("Avg Win",  f"₹{_avg_w:,.0f}")
+        _sc4.metric("Avg Loss", f"₹{_avg_l:,.0f}")
+        _sc5.metric("Total Realised", f"{'+'if _total_r>=0 else ''}₹{_total_r:,.0f}",
+                    delta=f"R:R {_rr:.2f}" if _avg_l != 0 else "R:R ∞")
+
+        # Equity curve
+        if len(_pnl_arr) >= 2:
+            _cumul  = list(np.cumsum(_pnl_arr))
+            _eq_c   = ["#00d084" if p >= 0 else "#ff3b3b" for p in _pnl_arr]
+            _fig_eq = go.Figure()
+            _fig_eq.add_trace(go.Scatter(
+                x=list(range(1, len(_cumul)+1)), y=_cumul,
+                mode="lines+markers", name="Cumulative PnL",
+                line=dict(color="#ff8c00", width=2),
+                marker=dict(color=_eq_c, size=8),
+                text=[f"Trade {i+1}: {'+'if p>=0 else ''}₹{p:,.0f}<br>{_hist_trades[i].get('closed_at','—')}"
+                      for i, p in enumerate(_pnl_arr)],
+                hovertemplate="%{text}<extra></extra>",
+            ))
+            _fig_eq.add_hline(y=0, line=dict(color="#333", dash="dot", width=1))
+            _fig_eq.update_layout(
+                height=220, plot_bgcolor="#000", paper_bgcolor="#000",
+                font=dict(color="#e8e8e8", family="IBM Plex Mono", size=9),
+                margin=dict(t=20, b=20, l=40, r=10),
+                xaxis=dict(gridcolor="#111", title="Trade #"),
+                yaxis=dict(gridcolor="#111", title="Cumulative ₹ PnL"),
+                showlegend=False,
+            )
+            st.plotly_chart(_fig_eq, use_container_width=True)
+
+        st.divider()
+        for _hidx, _ht in enumerate(reversed(_hist_trades)):
+            _rp     = float(_ht.get("realised_pnl", 0) or 0)
+            _rp_pct = float(_ht.get("realised_pnl_pct", 0) or 0)
+            _rp_col = "#00d084" if _rp >= 0 else "#ff3b3b"
+            _rp_sgn = "+" if _rp >= 0 else ""
+            with st.expander(
+                f"{'✅' if _rp>=0 else '❌'}  "
+                f"{_ht.get('symbol','—')} · {_ht.get('strategy','—')} · "
+                f"{_rp_sgn}₹{_rp:,.0f} ({_rp_sgn}{_rp_pct:.1f}%) · "
+                f"Closed {_ht.get('closed_at','—')}",
+                expanded=False
+            ):
+                _hc1,_hc2,_hc3,_hc4 = st.columns(4)
+                _hc1.metric("Realised PnL",   f"{_rp_sgn}₹{_rp:,.0f}")
+                _hc2.metric("Return %",        f"{_rp_sgn}{_rp_pct:.1f}%")
+                _hc3.metric("Strategy",        _ht.get("strategy","—"))
+                _hc4.metric("Bias @ Entry",    _ht.get("bias","—"))
+                _hd1,_hd2,_hd3,_hd4 = st.columns(4)
+                _hd1.metric("Spot Entry",  f"₹{float(_ht.get('spot_entry',0) or 0):,.1f}")
+                _hd2.metric("Spot Close",  f"₹{float(_ht.get('spot_close',0) or 0):,.1f}")
+                _hd3.metric("IV @ Entry",  f"{float(_ht.get('atm_iv_entry',0) or 0)*100:.1f}%")
+                _hd4.metric("IVR @ Entry", f"{float(_ht.get('ivr_entry',0) or 0):.0f}")
+                st.markdown(f"""
+<div style="font-family:'IBM Plex Mono',monospace;font-size:0.76rem;color:#555;padding:8px 0;line-height:1.7;">
+  <span style="color:#888;">LEGS:</span> <span style="color:#7ec8e3;">{_ht.get('legs','—')}</span>
+  &nbsp;·&nbsp; P(↑): {float(_ht.get('prob_up',0.5) or 0.5)*100:.1f}%
+  &nbsp;·&nbsp; POP: {float(_ht.get('pop',0.5) or 0.5)*100:.1f}%
+  &nbsp;·&nbsp; EV Score: {_ht.get('ev_score',0)}
+  &nbsp;·&nbsp; Size: ₹{float(_ht.get('pos_size_rs',0) or 0):,.0f}
+  &nbsp;·&nbsp; Expiry: {_ht.get('expiry','—')} (DTE {_ht.get('dte_at_entry','—')} @ entry)
+  &nbsp;·&nbsp; Logged: {_ht.get('logged_at','—')}
+</div>""", unsafe_allow_html=True)
+                if st.button("🗑 Delete from Historical", key=f"dh_{_ht['id']}_{_hidx}"):
+                    st.session_state.opt_hist_pnl = [
+                        t for t in st.session_state.opt_hist_pnl if t["id"] != _ht["id"]
+                    ]
+                    _save_hist_pnl(st.session_state.opt_hist_pnl)
+                    st.rerun()
+
     st.markdown("""
+<div style="font-family:'IBM Plex Mono',monospace;font-size:0.74rem;color:#444;
+border-top:1px solid #1a1a1a;padding-top:10px;margin-top:8px;line-height:1.7;">
+  <span style="color:#ff8c00;font-weight:700;">HOW LIVE PnL WORKS</span><br/>
+  PnL auto-updates each time you reload options intel (⚡ LOAD) — spot price refreshes all active trades.<br/>
+  Directional trades: (spot_now − spot_entry) / spot_entry × position size.<br/>
+  Neutral strategies (condor/straddle): negative PnL when spot moves beyond expected move.<br/>
+  <span style="color:#ff3b3b;">Approximation only — check your broker for actual leg-level P&L.</span><br/><br/>
+  <span style="color:#ff8c00;font-weight:700;">WORKFLOW</span><br/>
+  🎯 Trade tab → press <b>📋 LOG Trade</b> → appears as Active Trade here →
+  reload to update PnL → <b>📁 → Historical PnL</b> to close.
+</div>""", unsafe_allow_html=True)
+
+# ── Gate all remaining content on opt_loaded ──────────────────────────────────
+if not st.session_state.opt_loaded:
+    with t_signal:
+        st.markdown("""
 <div style="background:#0d0d0d;border:1px solid #2a2a2a;padding:32px 24px;
 font-family:'IBM Plex Mono',monospace;text-align:center;margin-top:20px;">
   <div style="color:#ff8c00;font-size:1.0rem;font-weight:700;letter-spacing:.15em;">
@@ -6930,7 +7251,7 @@ def _compute_edge_metrics(log: list, sym: str) -> dict:
     return {k: v for k, v in groups.items() if v is not None}
 
 
-# ── TABS — 7 focused tabs matching the trader's decision workflow ──
+# ── TABS — aliases (tabs were already created before the load gate above) ──────
 # ⚡ Signal    — What is the market doing?
 # 🎯 Trade    — What should I do?
 # 📋 Chain    — Raw data
@@ -6938,16 +7259,6 @@ def _compute_edge_metrics(log: list, sym: str) -> dict:
 # 📐 Reference — Reference
 # 🔬 Edge Audit — Does the signal actually have edge?
 # 📒 Tradebook  — Logged trades with live PnL
-t_signal, t_trade, t_chain, t_structure, t_reference, t_edge, t_prob, t_tradebook = st.tabs([
-    "⚡ Signal",
-    "🎯 Trade",
-    "📋 Chain & Data",
-    "📅 Structure",
-    "📐 Reference",
-    "🔬 Edge Audit",
-    "🎲 Probability Engine",
-    "📒 Tradebook",
-])
 
 # Alias old tab names to new tabs so all existing rendering code works unchanged
 t_ov       = t_signal    # Overview → Signal
@@ -7967,63 +8278,64 @@ padding:12px 16px;margin-bottom:7px;font-family:'IBM Plex Mono',monospace;">
   <div style="color:#555;font-size:0.77rem;margin-top:5px;line-height:1.5;">{_dynamic_rationale}</div>
   {chr(10).join(f'<div style="color:#ffb347;font-size:0.74rem;margin-top:3px;">{w}</div>' for w in _warnings) if _warnings else ''}
 </div>""", unsafe_allow_html=True)
-            # ── LOG button for this strategy card ─────────────────────────
-            _log_key = f"log_trade_{i}_{hash(s['Strategy'])}"
-            if st.button(f"📋 LOG Trade #{i+1} — {s['Strategy']}", key=_log_key,
-                         help="Snapshot this signal + strategy into the Tradebook. Live PnL will update on each reload."):
-                _trade_entry = {
-                    "id":            f"{int(time.time()*1000)}_{i}",
-                    "logged_at":     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "symbol":        sym,
-                    "expiry":        expiry,
-                    "dte_at_entry":  dte,
-                    "strategy":      s["Strategy"],
-                    "strategy_type": s.get("Type", "—"),
-                    "legs":          s.get("Legs", "—"),
-                    "rank":          i + 1,
-                    "ev_score":      sc,
-                    "ev_rs":         float(ev_raw),
-                    "pop":           float(pop_val),
-                    "max_risk":      s.get("Max Risk", "—"),
-                    "max_reward":    s.get("Max Reward", "—"),
-                    "ideal_dte":     s.get("Ideal DTE", "—"),
-                    "safety_ratio":  float(sr),
-                    "kelly_pct":     float(_kelly_pct_s),
-                    "pos_size_rs":   float(_pos_size_rs),
-                    # Market snapshot at log time
-                    "spot_entry":    float(spot),
-                    "atm_k":         float(atm_k),
-                    "atm_iv_entry":  float(atm_iv),
-                    "hv20_entry":    float(hv20),
-                    "ivr_entry":     float(ivr),
-                    "bias":          bias,
-                    "bias_score":    int(bias_score),
-                    "prob_up":       float(prob_score.get("prob_up", 0.5)),
-                    "prob_down":     float(prob_score.get("prob_down", 0.5)),
-                    "raw_score":     float(prob_score.get("raw_score", 0.0)),
-                    "vol_edge":      prob_score.get("vol_edge", "—"),
-                    "strategy_class":_s7_rec,
-                    "expected_move": float(prob_score.get("expected_move", 0.0)),
-                    "exp_move_pct":  float(prob_score.get("expected_move_pct", 0.0)),
-                    "max_pain":      float(oi_d.get("max_pain", spot) if oi_d else spot),
-                    "call_wall":     float(oi_d.get("call_wall", 0) if oi_d else 0),
-                    "put_wall":      float(oi_d.get("put_wall", 0) if oi_d else 0),
-                    "pcr_oi":        float(oi_d.get("pcr_oi", 1.0) if oi_d else 1.0),
-                    "flow_score":    float(prob_score.get("feature_scores", {}).get("flow_score", 0.0)),
-                    "flow_magnitude":float(prob_score.get("flow_magnitude", 0.0)),
-                    "regime":        regime_d.get("label", "—"),
-                    "dynamic_rationale": _dynamic_rationale,
-                    # Live tracking — updated on each rerender
-                    "spot_current":  float(spot),   # will be refreshed in Tradebook tab
-                    "atm_iv_current":float(atm_iv),
-                    "status":        "ACTIVE",       # ACTIVE | HISTORICAL
-                }
-                tb = st.session_state.opt_tradebook
-                tb.append(_trade_entry)
-                st.session_state.opt_tradebook = tb
-                _save_tradebook(tb)
-                st.success(f"✅ Trade logged! View in 📒 Tradebook tab. ({len(tb)} active)")
-                st.rerun()
+
+            # ── LOG button: snapshot this strategy into the Tradebook ────────
+            _log_col, _log_spacer = st.columns([1, 5])
+            with _log_col:
+                if st.button(f"📋 LOG Trade", key=f"log_strat_{i}_{s.get('Strategy','x')}",
+                             help="Snapshot this signal + strategy into the Tradebook tab. Live PnL will update on each reload."):
+                    _trade_entry = {
+                        "id":               f"{int(time.time()*1000)}_{i}",
+                        "logged_at":        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "symbol":           sym,
+                        "expiry":           expiry,
+                        "dte_at_entry":     dte,
+                        "strategy":         s.get("Strategy", "—"),
+                        "strategy_type":    s.get("Type", "—"),
+                        "legs":             s.get("Legs", "—"),
+                        "rank":             i + 1,
+                        "ev_score":         int(sc),
+                        "ev_rs":            float(ev_raw),
+                        "pop":              float(pop_val),
+                        "max_risk":         s.get("Max Risk", "—"),
+                        "max_reward":       s.get("Max Reward", "—"),
+                        "ideal_dte":        s.get("Ideal DTE", "—"),
+                        "safety_ratio":     float(sr),
+                        "kelly_pct":        float(_kelly_pct_s),
+                        "pos_size_rs":      float(_pos_size_rs),
+                        # Market snapshot at log time
+                        "spot_entry":       float(spot),
+                        "spot_current":     float(spot),
+                        "atm_k":            float(atm_k),
+                        "atm_iv_entry":     float(atm_iv),
+                        "atm_iv_current":   float(atm_iv),
+                        "hv20_entry":       float(hv20),
+                        "ivr_entry":        float(ivr),
+                        "bias":             bias,
+                        "bias_score":       int(bias_score),
+                        "prob_up":          float(prob_score.get("prob_up", 0.5)),
+                        "prob_down":        float(prob_score.get("prob_down", 0.5)),
+                        "raw_score":        float(prob_score.get("raw_score", 0.0)),
+                        "vol_edge":         prob_score.get("vol_edge", "—"),
+                        "strategy_class":   _s7_rec,
+                        "expected_move":    float(prob_score.get("expected_move", 0.0)),
+                        "exp_move_pct":     float(prob_score.get("expected_move_pct", 0.0)),
+                        "max_pain":         float(oi_d.get("max_pain", spot) if oi_d else spot),
+                        "call_wall":        float(oi_d.get("call_wall", 0) if oi_d else 0),
+                        "put_wall":         float(oi_d.get("put_wall", 0) if oi_d else 0),
+                        "pcr_oi":           float(oi_d.get("pcr_oi", 1.0) if oi_d else 1.0),
+                        "flow_score":       float(prob_score.get("feature_scores", {}).get("flow_score", 0.0)),
+                        "flow_magnitude":   float(prob_score.get("flow_magnitude", 0.0)),
+                        "regime":           regime_d.get("label", regime_d.get("trend", "—")),
+                        "dynamic_rationale":_dynamic_rationale,
+                        "status":           "ACTIVE",
+                    }
+                    _tb = st.session_state.opt_tradebook
+                    _tb.append(_trade_entry)
+                    st.session_state.opt_tradebook = _tb
+                    _save_tradebook(_tb)
+                    st.success(f"✅ Logged! '{s.get('Strategy')}' → Tradebook ({len(_tb)} active). Switch to 📒 Tradebook tab.")
+                    st.rerun()
 
     else:
         st.info("Load options intel to generate EV-ranked strategy recommendations.")
@@ -11947,383 +12259,3 @@ with t_prob:
         "It becomes a real calibrated probability after 50+ resolved observations "
         "accumulate in the Brier score section above."
     )
-
-# ══════════════════════════════════════════════════════════════
-# TAB — TRADEBOOK
-# Logged trades with live PnL tracking.
-# Each trade is snapshotted from the Trade tab via the LOG button.
-# Live PnL = (spot_current − spot_entry) × directional_multiplier × lot × pos_size_rs / spot_entry
-# User can Delete a trade or Send it to Historical PnL.
-# ══════════════════════════════════════════════════════════════
-with t_tradebook:
-    st.markdown("### 📒 Tradebook — Active Trades & Historical PnL")
-
-    # ── Live-update spot price for all active trades in the tradebook ──────────
-    # Each time this tab renders, refresh spot_current and atm_iv_current
-    # from the loaded session state so PnL is always live.
-    _tb_updated = False
-    _tb_live    = st.session_state.opt_tradebook
-    for _te in _tb_live:
-        if _te.get("status") == "ACTIVE":
-            _te["spot_current"]    = float(spot)
-            _te["atm_iv_current"]  = float(atm_iv)
-            _tb_updated = True
-    if _tb_updated:
-        st.session_state.opt_tradebook = _tb_live
-        _save_tradebook(_tb_live)
-
-    # ── Header metrics ─────────────────────────────────────────────────────────
-    _active_trades = [t for t in st.session_state.opt_tradebook if t.get("status") == "ACTIVE"]
-    _hist_trades   = st.session_state.opt_hist_pnl
-
-    _hm1, _hm2, _hm3, _hm4 = st.columns(4)
-    _hm1.metric("Active Trades",    str(len(_active_trades)))
-    _hm2.metric("Historical (PnL)", str(len(_hist_trades)))
-
-    # Compute total estimated unrealised PnL across active trades
-    def _estimate_pnl(te: dict) -> float:
-        """
-        Estimate directional PnL for a trade entry.
-        For directional strategies (bull/bear): (spot_current - spot_entry) / spot_entry × pos_size_rs
-        For neutral strategies (condor/straddle): penalise by abs move (negative directional PnL)
-        This is an approximation — actual PnL depends on exact legs and premiums.
-        """
-        spot_e = float(te.get("spot_entry", 0) or 0)
-        spot_c = float(te.get("spot_current", spot_e) or spot_e)
-        pos    = float(te.get("pos_size_rs", 0) or 0)
-        if spot_e <= 0 or pos <= 0:
-            return 0.0
-        pct_move = (spot_c - spot_e) / spot_e
-        stype = (te.get("strategy_type") or "").lower()
-        strat = (te.get("strategy")      or "").lower()
-        # Determine directional multiplier
-        if any(x in strat for x in ["call", "bull", "put spread", "put sell"]):
-            mult = 1.0   # long delta
-        elif any(x in strat for x in ["put buy", "bear", "call sell", "call spread"]):
-            mult = -1.0  # short delta
-        elif any(x in strat for x in ["condor", "strangle", "straddle", "calendar", "butterfly"]):
-            # Neutral: benefit when move < expected_move; lose when move > expected_move
-            em_pct = float(te.get("exp_move_pct", 2.0) or 2.0) / 100.0
-            excess = abs(pct_move) - em_pct
-            mult   = -1.0 if excess > 0 else 1.0
-            pct_move = abs(pct_move)
-        else:
-            mult = 1.0 if te.get("bias", "NEUTRAL") in ("STRONG BULL", "BULL") else -1.0
-        return round(pct_move * mult * pos, 2)
-
-    _total_unrealised = sum(_estimate_pnl(t) for t in _active_trades)
-    _hist_realised    = sum(float(t.get("realised_pnl", 0) or 0) for t in _hist_trades)
-    _total_col = "#00d084" if _total_unrealised >= 0 else "#ff3b3b"
-    _hist_col  = "#00d084" if _hist_realised  >= 0 else "#ff3b3b"
-    _hm3.metric("Est. Unrealised PnL",
-                f"{'+'if _total_unrealised>=0 else ''}₹{_total_unrealised:,.0f}",
-                delta=None)
-    _hm4.metric("Realised PnL (Hist)",
-                f"{'+'if _hist_realised>=0 else ''}₹{_hist_realised:,.0f}",
-                delta=None)
-
-    st.caption(
-        "⚠ PnL estimates are directional approximations based on spot move × position size. "
-        "They do NOT account for option time value, IV change, or spread legs individually. "
-        "Use as a directional P&L guide only. Verify actual P&L in your broker terminal."
-    )
-
-    st.divider()
-
-    # ══════════════════════════════════════════════════════
-    # SECTION 1 — ACTIVE TRADES
-    # ══════════════════════════════════════════════════════
-    st.markdown("#### 🟢 Active Trades")
-
-    if not _active_trades:
-        st.info(
-            "No active trades logged yet. Go to the **🎯 Trade** tab, find a strategy signal, "
-            "and press the **📋 LOG Trade** button to snapshot it here."
-        )
-    else:
-        for _idx, _te in enumerate(st.session_state.opt_tradebook):
-            if _te.get("status") != "ACTIVE":
-                continue
-
-            _pnl_est     = _estimate_pnl(_te)
-            _pnl_pct     = (_pnl_est / max(_te.get("pos_size_rs", 1), 1)) * 100
-            _pnl_col     = "#00d084" if _pnl_est >= 0 else "#ff3b3b"
-            _pnl_sign    = "+" if _pnl_est >= 0 else ""
-            _spot_e      = float(_te.get("spot_entry", 0))
-            _spot_c      = float(_te.get("spot_current", _spot_e))
-            _spot_delta  = _spot_c - _spot_e
-            _spot_sign   = "+" if _spot_delta >= 0 else ""
-            _spot_col    = "#00d084" if _spot_delta >= 0 else "#ff3b3b"
-            _bc_te       = ("#00d084" if _te.get("bias","") in ("STRONG BULL","BULL")
-                            else "#ff3b3b" if _te.get("bias","") in ("STRONG BEAR","BEAR")
-                            else "#ffb347")
-            _iv_chg      = float(_te.get("atm_iv_current", _te.get("atm_iv_entry", 0))) - float(_te.get("atm_iv_entry", 0))
-            _iv_chg_col  = "#ff3b3b" if _iv_chg > 0.005 else "#1e90ff" if _iv_chg < -0.005 else "#888"
-            _sc_col_te   = "#00d084" if _te.get("ev_score",0) >= 70 else "#ffb347" if _te.get("ev_score",0) >= 50 else "#666"
-
-            st.markdown(f"""
-<div style="background:#0d0d0d;border:1px solid #2a2a2a;border-left:4px solid {_pnl_col};
-padding:14px 18px;margin-bottom:10px;font-family:'IBM Plex Mono',monospace;">
-
-  <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:6px;margin-bottom:10px;">
-    <div>
-      <span style="color:#ff8c00;font-size:0.72rem;font-weight:700;letter-spacing:.1em;">ACTIVE TRADE #{_idx+1}</span>
-      &nbsp;·&nbsp;
-      <span style="color:#555;font-size:0.72rem;">{_te.get('logged_at','—')}</span>
-      &nbsp;·&nbsp;
-      <span style="color:#888;font-size:0.72rem;">{_te.get('symbol','—')} {_te.get('expiry','—')} DTE@entry:{_te.get('dte_at_entry','—')}</span>
-    </div>
-    <div style="text-align:right;">
-      <span style="color:{_pnl_col};font-size:1.1rem;font-weight:700;">
-        {_pnl_sign}₹{_pnl_est:,.0f}
-      </span>
-      <span style="color:{_pnl_col};font-size:0.78rem;margin-left:6px;">({_pnl_sign}{_pnl_pct:.1f}%)</span>
-      <div style="color:#555;font-size:0.68rem;margin-top:1px;">Est. Unrealised PnL</div>
-    </div>
-  </div>
-
-  <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:10px;">
-    <div>
-      <div style="color:#555;font-size:0.70rem;margin-bottom:2px;">STRATEGY</div>
-      <div style="color:#e8e8e8;font-size:0.88rem;font-weight:700;">{_te.get('strategy','—')}</div>
-      <div style="color:#777;font-size:0.70rem;">{_te.get('strategy_type','—')}</div>
-    </div>
-    <div>
-      <div style="color:#555;font-size:0.70rem;margin-bottom:2px;">SIGNAL CLASS</div>
-      <div style="color:#7ec8e3;font-size:0.82rem;font-weight:600;">{_te.get('strategy_class','—')}</div>
-      <div style="color:#777;font-size:0.70rem;">EV Score {_te.get('ev_score',0)}</div>
-    </div>
-    <div>
-      <div style="color:#555;font-size:0.70rem;margin-bottom:2px;">DIRECTION @ ENTRY</div>
-      <div style="color:{_bc_te};font-size:0.88rem;font-weight:700;">{_te.get('bias','—')}</div>
-      <div style="color:#777;font-size:0.70rem;">P(↑) {_te.get('prob_up',0.5)*100:.1f}% · Score {_te.get('raw_score',0):+.3f}</div>
-    </div>
-    <div>
-      <div style="color:#555;font-size:0.70rem;margin-bottom:2px;">POSITION SIZE</div>
-      <div style="color:#ff8c00;font-size:0.88rem;font-weight:700;">₹{_te.get('pos_size_rs',0):,.0f}</div>
-      <div style="color:#777;font-size:0.70rem;">{_te.get('kelly_pct',0):.1f}% Kelly</div>
-    </div>
-  </div>
-
-  <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-bottom:10px;
-  background:#080808;border:1px solid #1a1a1a;padding:8px 10px;">
-    <div>
-      <div style="color:#555;font-size:0.68rem;">SPOT ENTRY</div>
-      <div style="color:#e8e8e8;font-size:0.84rem;font-weight:700;">₹{_spot_e:,.1f}</div>
-    </div>
-    <div>
-      <div style="color:#555;font-size:0.68rem;">SPOT NOW</div>
-      <div style="color:{_spot_col};font-size:0.84rem;font-weight:700;">₹{_spot_c:,.1f}</div>
-    </div>
-    <div>
-      <div style="color:#555;font-size:0.68rem;">SPOT Δ</div>
-      <div style="color:{_spot_col};font-size:0.84rem;font-weight:700;">{_spot_sign}₹{_spot_delta:,.1f}</div>
-    </div>
-    <div>
-      <div style="color:#555;font-size:0.68rem;">ATM IV @ ENTRY</div>
-      <div style="color:#888;font-size:0.84rem;">{_te.get('atm_iv_entry',0)*100:.1f}%</div>
-    </div>
-    <div>
-      <div style="color:#555;font-size:0.68rem;">IV Δ (now)</div>
-      <div style="color:{_iv_chg_col};font-size:0.84rem;">{'+'if _iv_chg>=0 else ''}{_iv_chg*100:.2f}pp</div>
-    </div>
-  </div>
-
-  <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:10px;">
-    <div>
-      <div style="color:#555;font-size:0.68rem;">MAX RISK</div>
-      <div style="color:#ffb347;font-size:0.80rem;">{_te.get('max_risk','—')}</div>
-    </div>
-    <div>
-      <div style="color:#555;font-size:0.68rem;">MAX REWARD</div>
-      <div style="color:#00d084;font-size:0.80rem;">{_te.get('max_reward','—')}</div>
-    </div>
-    <div>
-      <div style="color:#555;font-size:0.68rem;">POP @ ENTRY</div>
-      <div style="color:#7ec8e3;font-size:0.80rem;">{_te.get('pop',0.5)*100:.1f}%</div>
-    </div>
-    <div>
-      <div style="color:#555;font-size:0.68rem;">SAFETY RATIO</div>
-      <div style="color:#888;font-size:0.80rem;">{_te.get('safety_ratio',0):.2f}× EM</div>
-    </div>
-  </div>
-
-  <div style="color:#444;font-size:0.72rem;line-height:1.5;border-top:1px solid #1a1a1a;
-  padding-top:7px;margin-top:4px;">
-    LEGS: <span style="color:#7ec8e3;">{_te.get('legs','—')}</span>
-    &nbsp;·&nbsp; Vol Edge: <span style="color:#e8e8e8;">{_te.get('vol_edge','—')}</span>
-    &nbsp;·&nbsp; Regime: <span style="color:#e8e8e8;">{_te.get('regime','—')}</span>
-    &nbsp;·&nbsp; Flow: {_te.get('flow_score',0):+.3f}
-    &nbsp;·&nbsp; Max Pain: ₹{_te.get('max_pain',0):,.0f}
-    &nbsp;·&nbsp; Call Wall: ₹{_te.get('call_wall',0):,.0f}
-    &nbsp;·&nbsp; Put Wall: ₹{_te.get('put_wall',0):,.0f}
-  </div>
-  <div style="color:#333;font-size:0.70rem;margin-top:5px;line-height:1.4;">
-    {_te.get('dynamic_rationale','—')}
-  </div>
-
-</div>""", unsafe_allow_html=True)
-
-            # ── Action buttons ──────────────────────────────────────────────────
-            _btn_col1, _btn_col2, _btn_col3 = st.columns([1, 1, 4])
-
-            with _btn_col1:
-                if st.button(f"🗑 Delete", key=f"del_trade_{_te['id']}",
-                             help="Remove this trade from the Tradebook permanently."):
-                    st.session_state.opt_tradebook = [
-                        t for t in st.session_state.opt_tradebook if t["id"] != _te["id"]
-                    ]
-                    _save_tradebook(st.session_state.opt_tradebook)
-                    st.rerun()
-
-            with _btn_col2:
-                if st.button(f"📁 → Historical PnL", key=f"hist_trade_{_te['id']}",
-                             help="Close this trade and move it to Historical PnL with the current estimated P&L locked in."):
-                    # Lock PnL and move to historical
-                    _closed = dict(_te)
-                    _closed["status"]         = "HISTORICAL"
-                    _closed["closed_at"]      = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    _closed["spot_close"]     = float(spot)
-                    _closed["realised_pnl"]   = float(_pnl_est)
-                    _closed["realised_pnl_pct"] = float(_pnl_pct)
-                    # Add to hist PnL store
-                    _hp = st.session_state.opt_hist_pnl
-                    _hp.append(_closed)
-                    st.session_state.opt_hist_pnl = _hp
-                    _save_hist_pnl(_hp)
-                    # Remove from active tradebook
-                    st.session_state.opt_tradebook = [
-                        t for t in st.session_state.opt_tradebook if t["id"] != _te["id"]
-                    ]
-                    _save_tradebook(st.session_state.opt_tradebook)
-                    st.success(f"Trade closed. Realised PnL: {'+'if _pnl_est>=0 else ''}₹{_pnl_est:,.0f} locked in Historical PnL.")
-                    st.rerun()
-
-    st.divider()
-
-    # ══════════════════════════════════════════════════════
-    # SECTION 2 — HISTORICAL PnL
-    # ══════════════════════════════════════════════════════
-    st.markdown("#### 📁 Historical PnL — Closed Trades")
-
-    if not _hist_trades:
-        st.info("No closed trades yet. Use **→ Historical PnL** on an active trade to lock in results.")
-    else:
-        # Summary stats
-        _n_hist    = len(_hist_trades)
-        _pnl_arr   = [float(t.get("realised_pnl", 0) or 0) for t in _hist_trades]
-        _wins      = sum(1 for p in _pnl_arr if p > 0)
-        _losses    = sum(1 for p in _pnl_arr if p <= 0)
-        _win_rate  = _wins / _n_hist * 100 if _n_hist > 0 else 0
-        _avg_win   = float(np.mean([p for p in _pnl_arr if p > 0])) if _wins > 0 else 0
-        _avg_loss  = float(np.mean([p for p in _pnl_arr if p <= 0])) if _losses > 0 else 0
-        _total_r   = float(np.sum(_pnl_arr))
-        _rr_ratio  = abs(_avg_win / _avg_loss) if _avg_loss != 0 else float("inf")
-
-        _hs1, _hs2, _hs3, _hs4, _hs5 = st.columns(5)
-        _hs1.metric("Closed Trades",  str(_n_hist))
-        _hs2.metric("Win Rate",       f"{_win_rate:.1f}%", delta=f"{_wins}W / {_losses}L")
-        _hs3.metric("Avg Win",        f"₹{_avg_win:,.0f}")
-        _hs4.metric("Avg Loss",       f"₹{_avg_loss:,.0f}")
-        _hs5.metric("Total Realised", f"{'+'if _total_r>=0 else ''}₹{_total_r:,.0f}",
-                    delta=f"R:R {_rr_ratio:.2f}" if _avg_loss != 0 else "R:R ∞")
-
-        # Equity curve
-        if len(_pnl_arr) >= 2:
-            _cumulative = list(np.cumsum(_pnl_arr))
-            _eq_dates   = [t.get("closed_at", f"Trade {i+1}") for i, t in enumerate(_hist_trades)]
-            _eq_cols    = ["#00d084" if p >= 0 else "#ff3b3b" for p in _pnl_arr]
-            _fig_eq = go.Figure()
-            _fig_eq.add_trace(go.Scatter(
-                x=list(range(1, len(_cumulative)+1)),
-                y=_cumulative,
-                mode="lines+markers",
-                name="Cumulative PnL",
-                line=dict(color="#ff8c00", width=2),
-                marker=dict(color=_eq_cols, size=8),
-                text=[f"Trade {i+1}: {'+' if p>=0 else ''}₹{p:,.0f}<br>{_eq_dates[i]}"
-                      for i, p in enumerate(_pnl_arr)],
-                hovertemplate="%{text}<extra></extra>",
-            ))
-            _fig_eq.add_hline(y=0, line=dict(color="#333", dash="dot", width=1))
-            _fig_eq.update_layout(
-                height=220, plot_bgcolor="#000", paper_bgcolor="#000",
-                font=dict(color="#e8e8e8", family="IBM Plex Mono", size=9),
-                margin=dict(t=20, b=20, l=40, r=10),
-                xaxis=dict(gridcolor="#111", title="Trade #"),
-                yaxis=dict(gridcolor="#111", title="Cumulative ₹ PnL"),
-                showlegend=False,
-            )
-            st.plotly_chart(_fig_eq, use_container_width=True)
-
-        st.divider()
-
-        # Individual closed trade rows (most recent first)
-        for _hidx, _ht in enumerate(reversed(_hist_trades)):
-            _rp      = float(_ht.get("realised_pnl", 0) or 0)
-            _rp_pct  = float(_ht.get("realised_pnl_pct", 0) or 0)
-            _rp_col  = "#00d084" if _rp >= 0 else "#ff3b3b"
-            _rp_sign = "+" if _rp >= 0 else ""
-            _bc_ht   = ("#00d084" if _ht.get("bias","") in ("STRONG BULL","BULL")
-                        else "#ff3b3b" if _ht.get("bias","") in ("STRONG BEAR","BEAR")
-                        else "#ffb347")
-
-            with st.expander(
-                f"{'✅' if _rp>=0 else '❌'} "
-                f"{_ht.get('symbol','—')} · {_ht.get('strategy','—')} · "
-                f"{_rp_sign}₹{_rp:,.0f} ({_rp_sign}{_rp_pct:.1f}%) · "
-                f"Closed: {_ht.get('closed_at','—')}",
-                expanded=False
-            ):
-                _hc1, _hc2, _hc3, _hc4 = st.columns(4)
-                _hc1.metric("Realised PnL",    f"{_rp_sign}₹{_rp:,.0f}")
-                _hc2.metric("Return %",         f"{_rp_sign}{_rp_pct:.1f}%")
-                _hc3.metric("Strategy",         _ht.get("strategy", "—"))
-                _hc4.metric("Direction@Entry",  _ht.get("bias", "—"))
-
-                _hd1, _hd2, _hd3, _hd4 = st.columns(4)
-                _hd1.metric("Spot Entry",   f"₹{_ht.get('spot_entry',0):,.1f}")
-                _hd2.metric("Spot Close",   f"₹{_ht.get('spot_close', _ht.get('spot_entry',0)):,.1f}")
-                _hd3.metric("IV @ Entry",   f"{_ht.get('atm_iv_entry',0)*100:.1f}%")
-                _hd4.metric("IVR @ Entry",  f"{_ht.get('ivr_entry',0):.0f}")
-
-                st.markdown(f"""
-<div style="font-family:'IBM Plex Mono',monospace;font-size:0.76rem;color:#555;
-padding:8px 0;line-height:1.7;">
-  <span style="color:#888;">LEGS:</span> <span style="color:#7ec8e3;">{_ht.get('legs','—')}</span>
-  &nbsp;·&nbsp; <span style="color:#888;">Signal Class:</span> {_ht.get('strategy_class','—')}
-  &nbsp;·&nbsp; <span style="color:#888;">P(↑) @ Entry:</span> {_ht.get('prob_up',0.5)*100:.1f}%
-  &nbsp;·&nbsp; <span style="color:#888;">Score:</span> {_ht.get('raw_score',0):+.3f}
-  &nbsp;·&nbsp; <span style="color:#888;">POP:</span> {_ht.get('pop',0.5)*100:.1f}%
-  &nbsp;·&nbsp; <span style="color:#888;">EV Score:</span> {_ht.get('ev_score',0)}
-  &nbsp;·&nbsp; <span style="color:#888;">Position Size:</span> ₹{_ht.get('pos_size_rs',0):,.0f}
-  &nbsp;·&nbsp; <span style="color:#888;">Expiry:</span> {_ht.get('expiry','—')} (DTE {_ht.get('dte_at_entry','—')} @ entry)
-  &nbsp;·&nbsp; <span style="color:#888;">Logged:</span> {_ht.get('logged_at','—')}
-</div>""", unsafe_allow_html=True)
-
-                # Delete from historical PnL
-                if st.button(f"🗑 Delete from Historical PnL", key=f"del_hist_{_ht['id']}_{_hidx}",
-                             help="Permanently remove this trade from Historical PnL."):
-                    _real_id = _ht["id"]
-                    st.session_state.opt_hist_pnl = [
-                        t for t in st.session_state.opt_hist_pnl if t["id"] != _real_id
-                    ]
-                    _save_hist_pnl(st.session_state.opt_hist_pnl)
-                    st.rerun()
-
-    st.divider()
-
-    # ── Info footer ────────────────────────────────────────────────────────────
-    st.markdown("""
-<div style="font-family:'IBM Plex Mono',monospace;font-size:0.74rem;color:#444;
-line-height:1.7;border-top:1px solid #1a1a1a;padding-top:10px;margin-top:8px;">
-  <span style="color:#ff8c00;font-weight:700;">HOW LIVE PnL WORKS</span><br/>
-  Each time you reload options intel (⚡ LOAD), spot price updates automatically in all active trades.<br/>
-  PnL is directional: (spot_now − spot_entry) / spot_entry × position size, adjusted for strategy direction.<br/>
-  Neutral strategies (condor/straddle) show negative PnL when spot moves beyond the expected move.<br/>
-  <span style="color:#ff3b3b;">This is an approximation. Check your broker for real P&L on individual legs.</span><br/><br/>
-  <span style="color:#ff8c00;font-weight:700;">WORKFLOW</span><br/>
-  🎯 Trade tab → signal generated → press <b>📋 LOG</b> → appears here as Active Trade.<br/>
-  Live PnL updates on every reload. Press <b>📁 → Historical PnL</b> to close the trade.<br/>
-  Press <b>🗑 Delete</b> to remove a mistaken entry without recording it as closed.
-</div>""", unsafe_allow_html=True)
