@@ -5278,6 +5278,41 @@ border-left:4px solid {_ev_col};padding:10px 14px;font-family:'IBM Plex Mono',mo
     _calib_status  = (f"LIVE — {_n_real} real outcomes · {_pending_n} pending"
                       if _n_real >= _CALIB_MIN_OBS
                       else f"WARMING UP — {_n_real}/{_CALIB_MIN_OBS} real outcomes needed")
+
+    # ── Always-visible compact calibration progress bar ───────────────────────
+    _pct_cal_bar  = min(100, int(_n_real / max(_CALIB_MIN_OBS, 1) * 100))
+    _flow_pcr_n   = len(st.session_state.get("_flow_pcr_hist", []))
+    _flow_pct_bar = min(100, int(_flow_pcr_n / 10 * 100))   # 10 loads = full flow history
+    _bar_bg       = "#00d084" if _pct_cal_bar >= 100 else ("#ffb347" if _pct_cal_bar >= 50 else "#ff3b3b")
+    _flow_bg      = "#00d084" if _flow_pct_bar >= 100 else ("#ffb347" if _flow_pct_bar >= 30 else "#ff3b3b")
+    _hist_saved   = "✔ saved" if os.path.exists(_HIST_FILE) else "not saved yet"
+    st.markdown(f"""
+<div style="background:#0d0d0d;border:1px solid #2a2a2a;padding:8px 14px;
+font-family:'IBM Plex Mono',monospace;font-size:0.76rem;margin-bottom:6px;">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px;">
+    <span style="color:#555;letter-spacing:.06em;">⚙ ADAPTIVE ENGINE</span>
+    <span style="color:{_calib_color};font-weight:700;">{_calib_status}</span>
+    <span style="color:#444;font-size:0.70rem;">hist {_hist_saved}</span>
+  </div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;">
+    <div>
+      <div style="color:#555;font-size:0.70rem;margin-bottom:2px;">
+        CALIBRATION  {_n_real}/{_CALIB_MIN_OBS} real outcomes
+      </div>
+      <div style="background:#1a1a1a;height:6px;border-radius:2px;overflow:hidden;">
+        <div style="width:{_pct_cal_bar}%;height:100%;background:{_bar_bg};border-radius:2px;"></div>
+      </div>
+    </div>
+    <div>
+      <div style="color:#555;font-size:0.70rem;margin-bottom:2px;">
+        FLOW HISTORY  {_flow_pcr_n}/10 loads · {_pending_n} pending outcomes
+      </div>
+      <div style="background:#1a1a1a;height:6px;border-radius:2px;overflow:hidden;">
+        <div style="width:{_flow_pct_bar}%;height:100%;background:{_flow_bg};border-radius:2px;"></div>
+      </div>
+    </div>
+  </div>
+</div>""", unsafe_allow_html=True)
     _hist_exists   = os.path.exists(_HIST_FILE)
     _hist_kb       = round(os.path.getsize(_HIST_FILE) / 1024, 1) if _hist_exists else 0
 
@@ -5610,7 +5645,7 @@ with t_dir:
     # Feature scores table — leading indicators first
     _fs = prob_score.get("feature_scores", {})
 
-    # Flow warmup notice — flow signals need 3+ loads to accumulate history
+    # Flow history status — always visible, not just during warmup
     _flow_pcr_len = len(st.session_state.get("_flow_pcr_hist", []))
     _flow_oi_len  = len(st.session_state.get("_flow_oi_hist",  []))
     _flow_loads   = min(_flow_pcr_len, _flow_oi_len)
