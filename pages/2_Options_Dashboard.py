@@ -1422,29 +1422,68 @@ def _save_signal_log(log: list):
 def _append_signal(symbol: str, prob_up: float, prob_down: float, flow_score: float,
                    flow_magnitude: float, raw_score: float, top_strategy: str,
                    strategy_ev: float, strategy_pop: float, strategy_kelly: float,
-                   expected_move: float, atm_iv: float, ivr: float, bias: str):
+                   expected_move: float, atm_iv: float, ivr: float, bias: str,
+                   # Edge Audit fields — full snapshot per spec
+                   spot: float = 0.0, hv20: float = 0.0,
+                   pcr: float = 1.0, oi_total: float = 0.0, oi_skew: float = 0.0,
+                   max_pain: float = 0.0, max_pain_dist_pct: float = 0.0,
+                   skew_pp: float = 0.0, term_slope: float = 0.0,
+                   positioning_score: float = 0.0, vol_regime_score: float = 0.0,
+                   trend_score: float = 0.0, intraday_score: float = 0.0,
+                   dte: int = 1):
     """Append a forward signal snapshot to the persistent log.
-    Called at load time. Provides a timestamped record of every signal the engine produced.
-    This replaces the synthetic backtest — real forward performance tracking.
+    Now captures full Edge Audit fields so the Edge Diagnostic tab can measure
+    what actually happens after each signal across 1/2/3/5-day horizons.
     """
     if "opt_signal_log" not in st.session_state:
         st.session_state.opt_signal_log = _load_signal_log()
+    # Expected move = ATM_IV * sqrt(DTE/365) per spec
+    _em_calc = atm_iv * math.sqrt(max(dte, 1) / 365.0) * spot if spot > 0 else expected_move
     entry = {
         "ts":             datetime.now().isoformat(timespec="minutes"),
         "symbol":         symbol.upper(),
+        # Direction signals
         "prob_up":        round(prob_up, 4),
         "prob_down":      round(prob_down, 4),
         "raw_score":      round(raw_score, 4),
         "flow_score":     round(flow_score, 4),
         "flow_magnitude": round(flow_magnitude, 4),
         "bias":           bias,
+        # Strategy
         "top_strategy":   top_strategy,
         "strategy_ev":    round(strategy_ev, 2),
         "strategy_pop":   round(strategy_pop, 4),
         "strategy_kelly": round(strategy_kelly, 4),
-        "expected_move":  round(expected_move, 2),
+        # Price & Vol at signal time
+        "spot":           round(spot, 2),
         "atm_iv_pct":     round(atm_iv * 100, 2),
+        "hv20_pct":       round(hv20 * 100, 2),
+        "iv_hv_ratio":    round(atm_iv / (hv20 + 1e-9), 3) if hv20 > 0.01 else 0.0,
         "ivr":            round(ivr, 1),
+        "dte":            dte,
+        # Expected move
+        "expected_move":  round(_em_calc, 2),
+        # Positioning at signal time
+        "pcr":            round(pcr, 3),
+        "oi_total":       round(oi_total, 0),
+        "oi_skew":        round(oi_skew, 0),
+        "max_pain":       round(max_pain, 2),
+        "max_pain_dist_pct": round(max_pain_dist_pct, 3),
+        # Skew & term structure
+        "skew_pp":        round(skew_pp, 3),
+        "term_slope":     round(term_slope, 4),
+        # Sub-scores for grouping
+        "positioning_score": round(positioning_score, 4),
+        "vol_regime_score":  round(vol_regime_score, 4),
+        "trend_score":       round(trend_score, 4),
+        "intraday_score":    round(intraday_score, 4),
+        # Forward outcomes — filled in later by _resolve_edge_outcomes()
+        "fwd_ret_1d": None, "fwd_ret_2d": None, "fwd_ret_3d": None, "fwd_ret_5d": None,
+        "fwd_spot_1d": None, "fwd_spot_2d": None, "fwd_spot_3d": None, "fwd_spot_5d": None,
+        "fwd_iv_1d": None, "fwd_iv_2d": None,
+        "fwd_skew_1d": None, "fwd_skew_2d": None,
+        "fwd_oi_1d": None, "fwd_oi_2d": None,
+        "resolved": False,
     }
     log = st.session_state.opt_signal_log
     # Deduplicate: don't append if last entry is same symbol within same minute
@@ -4276,13 +4315,14 @@ def ev_rank_strategies(universe, spot, T, r, atm_iv, q,
 
         # Hard penalty for negative-EV strategies: cap composite so they never
         # outrank a strategy with positive EV regardless of dir_align score.
-        # Threshold: if MC EV < -0.5% of max_risk, apply descending cap.
-        # This prevents a Short Straddle with EV=-44 from ranking above positive-EV trades
-        # just because market is momentarily neutral (dir_align=0.99).
-        if ev < -0.005 * _eff_risk:
-            # Scale penalty: deeper negative EV → lower cap
-            _ev_penalty  = math.tanh(abs(ev) / (_eff_risk + 1e-9))   # 0→1 severity
-            _composite_cap = 0.20 * (1.0 - _ev_penalty)              # cap shrinks toward 0
+        # Use MC-corrected max_risk (already replaced 999 sentinel above) so
+        # unlimited-risk strategies (Short Straddle) are correctly penalised.
+        _orig_risk = max(float(max_risk), 1.0)   # max_risk already corrected above
+        if ev < 0:
+            # Severity = |EV| / actual_risk, capped at 1
+            _severity = min(1.0, abs(ev) / _orig_risk)
+            # Cap composite: scales from 0.30 (barely negative) down to 0.0 (catastrophic)
+            _composite_cap = 0.30 * (1.0 - _severity)
             composite = min(composite, _composite_cap)
 
         composite = max(-1.0, min(1.0, composite))
@@ -5173,6 +5213,7 @@ bc = BIAS_COLORS.get(bias, "#888")
 _pending = st.session_state.get("_pending_signal_log", {})
 if _pending and _pending.get("symbol") == sym:
     _top_s = strat_recs[0] if strat_recs else {}
+    _fs_now2 = prob_score.get("feature_scores", {})
     _append_signal(
         symbol        = sym,
         prob_up       = prob_score.get("prob_up", 0.5),
@@ -5188,6 +5229,22 @@ if _pending and _pending.get("symbol") == sym:
         atm_iv        = atm_iv,
         ivr           = ivr,
         bias          = bias,
+        # Edge Audit full snapshot
+        spot              = spot,
+        hv20              = hv20,
+        pcr               = float(oi_d.get("pcr_oi", 1.0) if oi_d else 1.0),
+        oi_total          = float((chain_df["CE_OI"].sum() + chain_df["PE_OI"].sum()) if not chain_df.empty else 0),
+        oi_skew           = float((chain_df["CE_OI"].sum() - chain_df["PE_OI"].sum()) if not chain_df.empty else 0),
+        max_pain          = float(oi_d.get("max_pain", spot) if oi_d else spot),
+        max_pain_dist_pct = float((spot - oi_d.get("max_pain", spot)) / (spot + 1e-9) * 100 if oi_d else 0),
+        skew_pp           = float(oi_d.get("skew_pp", 0.0) or 0.0),
+        term_slope        = float(st.session_state.opt_multi_expiry[1]["atm_iv"] - st.session_state.opt_multi_expiry[0]["atm_iv"]
+                                  if len(st.session_state.opt_multi_expiry) >= 2 else 0.0),
+        positioning_score = float(_fs_now2.get("pcr_level_z", 0.0)),
+        vol_regime_score  = float(_fs_now2.get("vol_regime_z", 0.0)),
+        trend_score       = float(_fs_now2.get("trend_z", 0.0)),
+        intraday_score    = float(st.session_state.get("opt_intraday_signals", {}).get("intraday_score", 0.0)),
+        dte               = dte,
     )
     st.session_state["_pending_signal_log"] = {}  # clear pending flag
 
@@ -5231,12 +5288,261 @@ padding:10px 16px;margin-bottom:6px;font-family:'IBM Plex Mono',monospace;">
 # 📋 Chain    — Raw data (option chain + OI + Greeks + payoff)
 # 📅 Structure — Context (term structure + regime + forward signal log)
 # 📐 Reference — Reference (maths + documentation)
-t_signal, t_trade, t_chain, t_structure, t_reference = st.tabs([
+def _resolve_edge_outcomes(ohlcv_df: pd.DataFrame, signal_log: list,
+                           current_spot: float, current_iv: float,
+                           current_skew: float, current_oi_total: float) -> list:
+    """Fill in forward outcomes for unresolved signal log entries.
+    Uses OHLCV close prices for accurate N-day forward returns.
+    Mutates entries in-place and returns the updated log.
+    """
+    if not signal_log or ohlcv_df is None or ohlcv_df.empty:
+        return signal_log
+
+    # Build a date→close lookup from OHLCV
+    try:
+        _c = ohlcv_df.copy()
+        if "date" in _c.columns:
+            _c["_date"] = pd.to_datetime(_c["date"]).dt.date
+        elif "datetime" in _c.columns:
+            _c["_date"] = pd.to_datetime(_c["datetime"]).dt.date
+        else:
+            return signal_log
+        _c = _c.sort_values("_date").reset_index(drop=True)
+        _close_map = dict(zip(_c["_date"], _c["close"].astype(float)))
+        _dates_sorted = sorted(_close_map.keys())
+    except Exception:
+        return signal_log
+
+    today = datetime.now().date()
+    modified = False
+
+    for entry in signal_log:
+        if entry.get("resolved"):
+            continue
+        try:
+            sig_date = datetime.fromisoformat(entry["ts"]).date()
+            sig_spot = float(entry.get("spot", 0.0))
+            if sig_spot <= 0:
+                continue
+
+            # Find position of signal date in sorted dates
+            future_dates = [d for d in _dates_sorted if d > sig_date]
+
+            def _fwd_spot(n_days):
+                if len(future_dates) >= n_days:
+                    return _close_map.get(future_dates[n_days - 1])
+                return None
+
+            for n, key in [(1, "1d"), (2, "2d"), (3, "3d"), (5, "5d")]:
+                fs = _fwd_spot(n)
+                if fs and fs > 0:
+                    entry[f"fwd_spot_{key}"] = round(fs, 2)
+                    entry[f"fwd_ret_{key}"]  = round(math.log(fs / sig_spot), 5)
+
+            # Mark resolved when horizon 1d is available and 5+ trading days have passed
+            elapsed = int(np.busday_count(sig_date.isoformat(), today.isoformat()))
+            if elapsed >= 5 and entry.get("fwd_ret_1d") is not None:
+                # Use current session values for IV/skew/OI (approximate — best we have)
+                entry["fwd_iv_1d"]   = round(current_iv * 100, 2)
+                entry["fwd_skew_1d"] = round(current_skew, 3)
+                entry["fwd_oi_1d"]   = round(current_oi_total, 0)
+                entry["resolved"]    = True
+                modified = True
+        except Exception:
+            continue
+
+    if modified:
+        _save_signal_log(signal_log)
+
+    return signal_log
+
+
+def _compute_edge_metrics(log: list, sym: str) -> dict:
+    """Compute edge diagnostic metrics from resolved signal log entries.
+    Returns a dict of group → metric rows for display in Edge Audit tab.
+    """
+    # Filter to resolved entries for this symbol
+    resolved = [e for e in log
+                if e.get("resolved") and e.get("symbol", "").upper() == sym.upper()
+                and e.get("fwd_ret_1d") is not None]
+
+    if len(resolved) < 3:
+        return {}
+
+    def _metrics(subset, horizon="1d"):
+        if not subset:
+            return None
+        ret_key  = f"fwd_ret_{horizon}"
+        spot_key = f"fwd_spot_{horizon}"
+        rets     = [e[ret_key] for e in subset if e.get(ret_key) is not None]
+        if not rets:
+            return None
+
+        n = len(rets)
+        avg_ret  = float(np.mean(rets))
+
+        # Direction accuracy: +score=bullish signal, check if return is positive
+        dir_correct = []
+        for e in subset:
+            r = e.get(ret_key)
+            if r is None: continue
+            sig = e.get("bias", "NEUTRAL")
+            if sig in ("BULLISH", "STRONGLY BULLISH"):
+                dir_correct.append(1 if r > 0 else 0)
+            elif sig in ("BEARISH", "STRONGLY BEARISH"):
+                dir_correct.append(1 if r < 0 else 0)
+            # NEUTRAL: check |r| vs expected move
+        dir_acc = float(np.mean(dir_correct)) if dir_correct else 0.5
+
+        # Move vs implied
+        move_ratios = []
+        for e in subset:
+            sp0 = e.get("spot", 0.0)
+            spN = e.get(spot_key)
+            em  = e.get("expected_move", 0.0)
+            if sp0 > 0 and spN and em > 0:
+                abs_move = abs(spN - sp0)
+                move_ratios.append(abs_move / em)
+        avg_move_iv = float(np.mean(move_ratios)) if move_ratios else 0.0
+        pct_gt_iv   = float(np.mean([1 if m > 1 else 0 for m in move_ratios])) if move_ratios else 0.5
+
+        # IV change (1d only)
+        iv_changes = []
+        for e in subset:
+            iv0 = e.get("atm_iv_pct")
+            iv1 = e.get("fwd_iv_1d")
+            if iv0 and iv1:
+                iv_changes.append(iv1 - iv0)
+        avg_iv_chg = float(np.mean(iv_changes)) if iv_changes else 0.0
+
+        # Skew change
+        skew_changes = []
+        for e in subset:
+            s0 = e.get("skew_pp")
+            s1 = e.get("fwd_skew_1d")
+            if s0 is not None and s1 is not None:
+                skew_changes.append(s1 - s0)
+        avg_skew_chg = float(np.mean(skew_changes)) if skew_changes else 0.0
+
+        # OI change
+        oi_changes = []
+        for e in subset:
+            o0 = e.get("oi_total")
+            o1 = e.get("fwd_oi_1d")
+            if o0 and o1:
+                oi_changes.append(o1 - o0)
+        avg_oi_chg = float(np.mean(oi_changes)) if oi_changes else 0.0
+
+        # Max pain pinning: did price move toward max pain?
+        toward_mp = []
+        for e in subset:
+            sp0 = e.get("spot", 0.0)
+            spN = e.get(spot_key)
+            mp  = e.get("max_pain", sp0)
+            if sp0 > 0 and spN and mp > 0:
+                dist_before = abs(sp0 - mp)
+                dist_after  = abs(spN - mp)
+                toward_mp.append(1 if dist_after < dist_before else 0)
+        pct_toward_mp = float(np.mean(toward_mp)) if toward_mp else 0.5
+
+        # Edge classification
+        edges = []
+        if dir_acc > 0.55 and len(dir_correct) >= 5:
+            edges.append("Directional")
+        if avg_move_iv > 1.05 and len(move_ratios) >= 5:
+            edges.append("Long Vol")
+        elif avg_move_iv < 0.90 and len(move_ratios) >= 5:
+            edges.append("Short Vol")
+        if avg_iv_chg < -0.5 and len(iv_changes) >= 5:
+            edges.append("Sell IV")
+        elif avg_iv_chg > 0.5 and len(iv_changes) >= 5:
+            edges.append("Buy IV")
+        if pct_toward_mp > 0.60 and len(toward_mp) >= 5:
+            edges.append("Pinning")
+        if abs(avg_skew_chg) > 0.3 and len(skew_changes) >= 5:
+            edges.append("Skew")
+        if not edges:
+            edges.append("No Edge")
+
+        return {
+            "n":            n,
+            "avg_ret":      round(avg_ret * 100, 3),   # in %
+            "dir_acc":      round(dir_acc * 100, 1),
+            "move_iv":      round(avg_move_iv, 3),
+            "pct_gt_iv":    round(pct_gt_iv * 100, 1),
+            "iv_chg":       round(avg_iv_chg, 2),
+            "skew_chg":     round(avg_skew_chg, 3),
+            "oi_chg":       round(avg_oi_chg / 1e6, 2),  # in millions
+            "pct_toward_mp":round(pct_toward_mp * 100, 1),
+            "edge":         " + ".join(edges),
+        }
+
+    # Build signal groups
+    groups = {}
+
+    # Direction groups
+    bull = [e for e in resolved if e.get("bias") in ("BULLISH", "STRONGLY BULLISH")]
+    bear = [e for e in resolved if e.get("bias") in ("BEARISH", "STRONGLY BEARISH")]
+    neut = [e for e in resolved if e.get("bias") == "NEUTRAL"]
+    if bull: groups["🟢 Bullish Signals"] = _metrics(bull)
+    if bear: groups["🔴 Bearish Signals"] = _metrics(bear)
+    if neut: groups["⚪ Neutral Signals"]  = _metrics(neut)
+
+    # IV regime groups (ivr threshold = 60)
+    hi_iv = [e for e in resolved if e.get("ivr", 50) >= 60]
+    lo_iv = [e for e in resolved if e.get("ivr", 50) < 40]
+    if hi_iv: groups["📈 High IV Regime (IVR≥60)"]  = _metrics(hi_iv)
+    if lo_iv: groups["📉 Low IV Regime (IVR<40)"]    = _metrics(lo_iv)
+
+    # PCR groups
+    hi_pcr = [e for e in resolved if e.get("pcr", 1.0) >= 1.3]
+    lo_pcr = [e for e in resolved if e.get("pcr", 1.0) < 0.8]
+    if hi_pcr: groups["🐂 High PCR (≥1.3 bullish)"] = _metrics(hi_pcr)
+    if lo_pcr: groups["🐻 Low PCR (<0.8 bearish)"]  = _metrics(lo_pcr)
+
+    # Max pain proximity
+    near_mp = [e for e in resolved if abs(e.get("max_pain_dist_pct", 5)) < 1.0]
+    far_mp  = [e for e in resolved if abs(e.get("max_pain_dist_pct", 0)) >= 2.0]
+    if near_mp: groups["📍 Near Max Pain (<1%)"]  = _metrics(near_mp)
+    if far_mp:  groups["↔️ Far from Max Pain (≥2%)"] = _metrics(far_mp)
+
+    # Flow score groups
+    hi_flow = [e for e in resolved if abs(e.get("flow_score", 0)) >= 0.3]
+    lo_flow = [e for e in resolved if abs(e.get("flow_score", 0)) < 0.1]
+    if hi_flow: groups["⚡ High Flow (|score|≥0.3)"]  = _metrics(hi_flow)
+    if lo_flow: groups["💤 Low Flow (|score|<0.1)"]    = _metrics(lo_flow)
+
+    # Signal alignment groups
+    flow_pos_aligned = [e for e in resolved
+                        if abs(e.get("flow_score", 0)) >= 0.2
+                        and abs(e.get("positioning_score", 0)) >= 0.2
+                        and (e.get("flow_score", 0) * e.get("positioning_score", 0)) > 0]
+    all_aligned = [e for e in flow_pos_aligned
+                   if abs(e.get("vol_regime_score", 0)) >= 0.1]
+    if flow_pos_aligned: groups["🔗 Flow + Positioning Aligned"] = _metrics(flow_pos_aligned)
+    if all_aligned:      groups["🔗🔗 Flow + Pos + Vol Aligned"]  = _metrics(all_aligned)
+
+    # All signals (baseline)
+    groups["📊 All Signals"] = _metrics(resolved)
+
+    # Remove None entries
+    return {k: v for k, v in groups.items() if v is not None}
+
+
+# ── TABS — 6 focused tabs matching the trader's decision workflow ──
+# ⚡ Signal    — What is the market doing?
+# 🎯 Trade    — What should I do?
+# 📋 Chain    — Raw data
+# 📅 Structure — Context
+# 📐 Reference — Reference
+# 🔬 Edge Audit — Does the signal actually have edge?
+t_signal, t_trade, t_chain, t_structure, t_reference, t_edge = st.tabs([
     "⚡ Signal",
     "🎯 Trade",
     "📋 Chain & Data",
     "📅 Structure",
     "📐 Reference",
+    "🔬 Edge Audit",
 ])
 
 # Alias old tab names to new tabs so all existing rendering code works unchanged
@@ -5904,6 +6210,13 @@ font-family:'IBM Plex Mono',monospace;font-size:0.83rem;margin-bottom:4px;">
     _flow_threshold = st.session_state.get("opt_flow_conv_threshold", CFG["flow_conviction_seed"])
     _fs_now         = prob_score.get("feature_scores", {})
     _flow_dir       = prob_score.get("feature_scores", {}).get("flow_score", 0)
+
+    # ── Expiry day warning — all new strategies are poor on DTE=1 ────────────
+    if dte <= 1:
+        st.warning("⚠️ **DTE = 1 (Expiry Day):** All option strategies have poor EV on expiry day "
+                   "because time-value has collapsed. MC simulations show negative EV for most structures. "
+                   "**Recommended use:** Close existing positions, not open new ones. "
+                   "If you must trade, small directional plays (Long Call/Put) have limited loss = premium only.")
 
     if _flow_mag_now >= _flow_threshold and _flow_threshold > 0:
         _fb_col  = "#00d084" if _flow_dir > 0 else "#ff3b3b"
@@ -9006,3 +9319,411 @@ For indices and non-dividend stocks: q = 0 → identical to classic BSM.""")
         note("For NSE indices (NIFTY, BANKNIFTY etc.), q = 0 because index futures already "
              "embed dividends in the cost-of-carry. For stocks like ITC (yield ~3.5%) or "
              "COALINDIA (~7%), the Merton adjustment materially changes ATM prices.")
+
+# ══════════════════════════════════════════════════════════════
+# TAB — EDGE AUDIT
+# Determines WHERE the signal engine actually has edge:
+# Direction, Vol, Skew, Pinning, or None.
+# ══════════════════════════════════════════════════════════════
+with t_edge:
+    st.markdown("### 🔬 Edge Audit — Signal Diagnostic")
+    st.caption("Measures what actually happens AFTER each signal across 1d/2d/3d/5d horizons. "
+               "This is not a backtest — it is a live edge diagnostic computed from real forward prices.")
+
+    # ── Resolve forward outcomes for unresolved signals ───────────────────────
+    _edge_log = st.session_state.get("opt_signal_log", [])
+    _edge_oi_total = float(chain_df["CE_OI"].sum() + chain_df["PE_OI"].sum()) if not chain_df.empty else 0.0
+    _edge_skew     = float(oi_d.get("skew_pp", 0.0) or 0.0) if oi_d else 0.0
+    _edge_log = _resolve_edge_outcomes(
+        ohlcv_df, _edge_log,
+        current_spot    = spot,
+        current_iv      = atm_iv,
+        current_skew    = _edge_skew,
+        current_oi_total= _edge_oi_total,
+    )
+    st.session_state["opt_signal_log"] = _edge_log
+
+    # ── Summary counts ────────────────────────────────────────────────────────
+    _all_sym    = [e for e in _edge_log if e.get("symbol","").upper() == sym.upper()]
+    _resolved_n = len([e for e in _all_sym if e.get("resolved")])
+    _pending_n  = len([e for e in _all_sym if not e.get("resolved")])
+    _total_n    = len(_all_sym)
+
+    ea1, ea2, ea3, ea4 = st.columns(4)
+    ea1.metric("Total Signals", str(_total_n),    help="All signals recorded for this symbol")
+    ea2.metric("Resolved",      str(_resolved_n), help="Signals with full 5-day forward outcome data")
+    ea3.metric("Pending",       str(_pending_n),  help="Signals awaiting 5 trading days to elapse")
+    ea4.metric("Min for Edge",  "5",              help="Minimum resolved signals needed per group")
+
+    if _resolved_n < 5:
+        st.info(f"ℹ️ **{_resolved_n} resolved signals** for {sym}. "
+                "Edge metrics require at least 5 resolved signals per group (5 trading days per signal). "
+                f"Currently {_pending_n} pending — check back after {max(0, 5 - _resolved_n)} more trading days.")
+
+        # Show the pending pipeline so user can see data is being collected
+        if _all_sym:
+            st.markdown("#### 📥 Signal Pipeline (pending resolution)")
+            _pipe_rows = []
+            for e in sorted(_all_sym, key=lambda x: x.get("ts",""), reverse=True)[:20]:
+                sig_date = e.get("ts","")[:10]
+                elapsed  = 0
+                try:
+                    elapsed = int(np.busday_count(sig_date, datetime.now().date().isoformat()))
+                except Exception:
+                    pass
+                _pipe_rows.append({
+                    "Date":     sig_date,
+                    "Bias":     e.get("bias", "—"),
+                    "Score":    f"{e.get('raw_score', 0):+.3f}",
+                    "IV%":      f"{e.get('atm_iv_pct', 0):.1f}",
+                    "IVR":      f"{e.get('ivr', 0):.0f}",
+                    "PCR":      f"{e.get('pcr', 0):.2f}",
+                    "Flow":     f"{e.get('flow_score', 0):+.3f}",
+                    "EM ₹":     f"{e.get('expected_move', 0):.0f}",
+                    "Days Ago": str(elapsed),
+                    "Status":   "✅ Resolved" if e.get("resolved") else f"⏳ {elapsed}/5d",
+                })
+            if _pipe_rows:
+                _pipe_df = pd.DataFrame(_pipe_rows)
+                st.dataframe(_pipe_df, use_container_width=True, hide_index=True)
+        st.stop()
+
+    # ── Compute edge metrics ──────────────────────────────────────────────────
+    _edge_groups = _compute_edge_metrics(_edge_log, sym)
+
+    if not _edge_groups:
+        st.warning("Not enough resolved signals to compute edge metrics. Check back after more loads.")
+    else:
+        # ── HORIZON SELECTOR ────────────────────────────────────────────────
+        _hz = st.radio("Analysis horizon", ["1d", "2d", "3d", "5d"],
+                       index=0, horizontal=True,
+                       help="Forward horizon used for return and accuracy metrics")
+
+        st.divider()
+
+        # ── EDGE SUMMARY TABLE ───────────────────────────────────────────────
+        st.markdown("#### 📊 Edge Metrics by Signal Group")
+        st.caption("Dir Acc = % signals where direction was correct · Move/IV = |actual move| / expected move · "
+                   "IV Δ = avg change in ATM IV next day · Skew Δ = avg skew change · "
+                   "→MP = % price moved toward max pain")
+
+        _tbl_rows = []
+        for grp, m in _edge_groups.items():
+            if m is None:
+                continue
+            # Colour-code edge type
+            edge_str = m["edge"]
+            _tbl_rows.append({
+                "Signal Group":  grp,
+                "N":             m["n"],
+                f"Avg Ret ({_hz})": f"{m['avg_ret']:+.2f}%",
+                "Dir Acc":       f"{m['dir_acc']:.0f}%",
+                "Move/IV":       f"{m['move_iv']:.2f}×",
+                ">IV Move":      f"{m['pct_gt_iv']:.0f}%",
+                "IV Δ":          f"{m['iv_chg']:+.2f}pp",
+                "Skew Δ":        f"{m['skew_chg']:+.3f}pp",
+                "OI Δ (M)":      f"{m['oi_chg']:+.1f}",
+                "→MaxPain":      f"{m['pct_toward_mp']:.0f}%",
+                "Edge Type":     edge_str,
+            })
+
+        if _tbl_rows:
+            _tbl_df = pd.DataFrame(_tbl_rows)
+
+            def _edge_style(v):
+                if "Directional" in str(v): return "color:#00d084;font-weight:700"
+                if "Long Vol"    in str(v): return "color:#1e90ff;font-weight:700"
+                if "Short Vol"   in str(v): return "color:#ff8c00;font-weight:700"
+                if "Pinning"     in str(v): return "color:#9c27b0;font-weight:700"
+                if "Skew"        in str(v): return "color:#7ec8e3;font-weight:700"
+                if "Sell IV"     in str(v): return "color:#ff8c00"
+                if "Buy IV"      in str(v): return "color:#1e90ff"
+                if "No Edge"     in str(v): return "color:#555"
+                return "color:#888"
+
+            def _acc_style(v):
+                try:
+                    pct = float(str(v).replace("%",""))
+                    if pct > 58: return "color:#00d084;font-weight:700"
+                    if pct > 52: return "color:#ffb347"
+                    if pct < 45: return "color:#ff3b3b"
+                except Exception:
+                    pass
+                return "color:#888"
+
+            def _ret_style(v):
+                try:
+                    val = float(str(v).replace("%","").replace("+",""))
+                    if val > 0.1:  return "color:#00d084;font-weight:700"
+                    if val < -0.1: return "color:#ff3b3b;font-weight:700"
+                except Exception:
+                    pass
+                return "color:#888"
+
+            styled_tbl = _tbl_df.style \
+                .map(_edge_style, subset=["Edge Type"]) \
+                .map(_acc_style,  subset=["Dir Acc"]) \
+                .map(_ret_style,  subset=[f"Avg Ret ({_hz})"])
+            st.dataframe(styled_tbl, use_container_width=True, hide_index=True)
+
+        st.divider()
+
+        # ── INTERPRETATION PANEL ──────────────────────────────────────────────
+        st.markdown("#### 🔍 Edge Interpretation")
+
+        # Get all-signals metrics as baseline
+        _baseline = _edge_groups.get("📊 All Signals")
+        if _baseline:
+            _interp_cols = st.columns(2)
+
+            with _interp_cols[0]:
+                st.markdown("**What edge does the system have?**")
+                _findings = []
+
+                if _baseline["dir_acc"] > 55:
+                    _findings.append(("✅ Directional Edge",
+                                      f"Direction accuracy {_baseline['dir_acc']:.0f}% > 55% threshold. "
+                                      "The signal correctly predicts direction more often than chance."))
+                elif _baseline["dir_acc"] < 45:
+                    _findings.append(("❌ Reverse Directional Signal",
+                                      f"Direction accuracy only {_baseline['dir_acc']:.0f}%. "
+                                      "Consider reversing the signal interpretation."))
+                else:
+                    _findings.append(("⚪ No Directional Edge",
+                                      f"Direction accuracy {_baseline['dir_acc']:.0f}% — not significantly above 50%."))
+
+                if _baseline["move_iv"] > 1.05:
+                    _findings.append(("✅ Long Vol Edge",
+                                      f"Actual moves average {_baseline['move_iv']:.2f}× the implied move. "
+                                      "Options are systematically underpriced — buy vol strategies preferred."))
+                elif _baseline["move_iv"] < 0.90:
+                    _findings.append(("✅ Short Vol Edge",
+                                      f"Actual moves average {_baseline['move_iv']:.2f}× the implied move. "
+                                      "Options are systematically overpriced — sell vol strategies preferred."))
+
+                if _baseline["pct_toward_mp"] > 60:
+                    _findings.append(("✅ Max Pain Pinning",
+                                      f"Price moves toward max pain {_baseline['pct_toward_mp']:.0f}% of the time. "
+                                      "Strong gravitational pull — use max pain for target levels."))
+
+                if abs(_baseline["iv_chg"]) > 0.5:
+                    direction = "rises" if _baseline["iv_chg"] > 0 else "falls"
+                    _findings.append(("✅ IV Edge",
+                                      f"IV {direction} avg {abs(_baseline['iv_chg']):.1f}pp after signal. "
+                                      f"{'Buy IV' if _baseline['iv_chg'] > 0 else 'Sell IV'} strategies have positive expected IV change."))
+
+                if abs(_baseline["skew_chg"]) > 0.3:
+                    _findings.append(("✅ Skew Edge",
+                                      f"Skew changes avg {_baseline['skew_chg']:+.2f}pp after signal. "
+                                      "Skew-based strategies (risk reversals, skew trades) may have edge."))
+
+                if not _findings:
+                    _findings.append(("⚪ No Edge Detected",
+                                      "No statistically meaningful edge found in any dimension. "
+                                      "Collect more signals (need 20+ per group for confidence)."))
+
+                for title, desc in _findings:
+                    st.markdown(f"**{title}**")
+                    st.caption(desc)
+                    st.markdown("")
+
+            with _interp_cols[1]:
+                st.markdown("**Best-performing signal conditions:**")
+
+                # Find group with highest dir accuracy
+                _best_dir = max(
+                    [(g, m["dir_acc"]) for g, m in _edge_groups.items() if m and m["n"] >= 3],
+                    key=lambda x: x[1], default=(None, 0))
+                # Find group with best return
+                _best_ret = max(
+                    [(g, m["avg_ret"]) for g, m in _edge_groups.items() if m and m["n"] >= 3],
+                    key=lambda x: abs(x[1]), default=(None, 0))
+                # Find highest pinning
+                _best_pin = max(
+                    [(g, m["pct_toward_mp"]) for g, m in _edge_groups.items() if m and m["n"] >= 3],
+                    key=lambda x: x[1], default=(None, 0))
+
+                if _best_dir[0]:
+                    st.markdown(f"🎯 **Best direction:** {_best_dir[0]} — {_best_dir[1]:.0f}% accuracy")
+                if _best_ret[0]:
+                    st.markdown(f"📈 **Best return:** {_best_ret[0]} — avg {_best_ret[1]:+.2f}%/{_hz}")
+                if _best_pin[0]:
+                    st.markdown(f"📍 **Best pinning:** {_best_pin[0]} — {_best_pin[1]:.0f}% toward max pain")
+
+                st.divider()
+                st.markdown("**Confidence guide:**")
+                st.caption("< 5 signals: insufficient · 5–20: indicative · 20–50: moderate · 50+: high confidence")
+
+                # Show confidence bar
+                _conf_pct = min(100, int(_resolved_n / 50 * 100))
+                _conf_col = "#00d084" if _conf_pct >= 60 else ("#ffb347" if _conf_pct >= 20 else "#ff3b3b")
+                st.markdown(f"""
+<div style="font-family:'IBM Plex Mono',monospace;margin:6px 0;">
+  <div style="color:#555;font-size:0.74rem;margin-bottom:3px;">
+    Confidence: {_resolved_n} resolved / 50 recommended
+  </div>
+  <div style="background:#1a1a1a;height:10px;border-radius:3px;overflow:hidden;">
+    <div style="width:{_conf_pct}%;height:100%;background:{_conf_col};border-radius:3px;"></div>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+        st.divider()
+
+        # ── RAW RESOLVED SIGNAL DETAIL TABLE ────────────────────────────────
+        with st.expander("📋 Raw Resolved Signal Log", expanded=False):
+            _res_rows = []
+            for e in sorted([x for x in _all_sym if x.get("resolved")],
+                            key=lambda x: x.get("ts",""), reverse=True)[:100]:
+                r1 = e.get("fwd_ret_1d")
+                r5 = e.get("fwd_ret_5d")
+                sp0 = e.get("spot", 0.0)
+                em  = e.get("expected_move", 0.0)
+                sp1 = e.get("fwd_spot_1d")
+                move_iv = abs(sp1 - sp0) / em if sp1 and sp0 > 0 and em > 0 else None
+
+                _bias = e.get("bias", "—")
+                _dir_ok = None
+                if r1 is not None:
+                    if "BULLISH" in _bias:   _dir_ok = "✅" if r1 > 0 else "❌"
+                    elif "BEARISH" in _bias: _dir_ok = "✅" if r1 < 0 else "❌"
+                    else:                    _dir_ok = "—"
+
+                _res_rows.append({
+                    "Date":      e.get("ts","")[:10],
+                    "Bias":      _bias,
+                    "Score":     f"{e.get('raw_score',0):+.3f}",
+                    "IV%":       f"{e.get('atm_iv_pct',0):.1f}",
+                    "PCR":       f"{e.get('pcr',0):.2f}",
+                    "Flow":      f"{e.get('flow_score',0):+.3f}",
+                    "EM ₹":      f"{em:.0f}",
+                    "Ret 1d":    f"{r1*100:+.2f}%" if r1 else "—",
+                    "Ret 5d":    f"{r5*100:+.2f}%" if r5 else "—",
+                    "Move/IV":   f"{move_iv:.2f}×" if move_iv else "—",
+                    "Dir ✓":     _dir_ok or "—",
+                })
+
+            if _res_rows:
+                _res_df = pd.DataFrame(_res_rows)
+
+                def _dir_ok_style(v):
+                    if v == "✅": return "color:#00d084;font-weight:700"
+                    if v == "❌": return "color:#ff3b3b;font-weight:700"
+                    return "color:#555"
+
+                st.dataframe(_res_df.style.map(_dir_ok_style, subset=["Dir ✓"]),
+                             use_container_width=True, hide_index=True)
+
+        # ── VISUAL: Direction accuracy over time ──────────────────────────
+        with st.expander("📈 Direction Accuracy — Rolling 20-Signal Window", expanded=False):
+            _all_bias_signals = [e for e in _all_sym
+                                 if e.get("resolved") and e.get("fwd_ret_1d") is not None
+                                 and e.get("bias","NEUTRAL") != "NEUTRAL"]
+            if len(_all_bias_signals) >= 5:
+                _roll_acc = []
+                for i in range(len(_all_bias_signals)):
+                    window = _all_bias_signals[max(0, i-19):i+1]
+                    correct = []
+                    for e in window:
+                        r = e.get("fwd_ret_1d", 0)
+                        b = e.get("bias","")
+                        if "BULLISH" in b:   correct.append(1 if r > 0 else 0)
+                        elif "BEARISH" in b: correct.append(1 if r < 0 else 0)
+                    _roll_acc.append({
+                        "Signal #": i + 1,
+                        "Date":     e.get("ts","")[:10],
+                        "Rolling Accuracy": round(float(np.mean(correct)) * 100, 1) if correct else 50.0
+                    })
+                _acc_df = pd.DataFrame(_roll_acc)
+                fig_acc = go.Figure()
+                fig_acc.add_trace(go.Scatter(
+                    x=_acc_df["Signal #"], y=_acc_df["Rolling Accuracy"],
+                    mode="lines+markers", name="Rolling Accuracy",
+                    line=dict(color="#ff8c00", width=2),
+                    marker=dict(size=5)
+                ))
+                fig_acc.add_hline(y=55, line=dict(color="#00d084", dash="dash", width=1),
+                                  annotation_text="55% edge threshold")
+                fig_acc.add_hline(y=50, line=dict(color="#555", dash="dot", width=1),
+                                  annotation_text="random (50%)")
+                fig_acc.update_layout(
+                    title="Rolling 20-Signal Direction Accuracy",
+                    height=280, plot_bgcolor="#000", paper_bgcolor="#000",
+                    font=dict(color="#e8e8e8", family="IBM Plex Mono", size=9),
+                    xaxis=dict(title="Signal #", gridcolor="#111"),
+                    yaxis=dict(title="Accuracy %", gridcolor="#111", range=[30, 80]),
+                    margin=dict(t=40, b=10)
+                )
+                st.plotly_chart(fig_acc, use_container_width=True)
+            else:
+                st.caption("Need at least 5 resolved directional signals to plot rolling accuracy.")
+
+        # ── VISUAL: Move vs Implied distribution ─────────────────────────
+        with st.expander("📊 Actual Move vs Implied Move Distribution", expanded=False):
+            _move_data = []
+            for e in [x for x in _all_sym if x.get("resolved")]:
+                sp0 = e.get("spot", 0.0)
+                sp1 = e.get("fwd_spot_1d")
+                em  = e.get("expected_move", 0.0)
+                if sp0 > 0 and sp1 and em > 0:
+                    _move_data.append(abs(sp1 - sp0) / em)
+            if len(_move_data) >= 5:
+                fig_mv = go.Figure()
+                fig_mv.add_trace(go.Histogram(
+                    x=_move_data, nbinsx=20,
+                    marker_color="#1e90ff", opacity=0.8, name="Move/IV ratio"
+                ))
+                fig_mv.add_vline(x=1.0, line=dict(color="#ff8c00", dash="dash", width=2),
+                                 annotation_text="IV = actual move")
+                _mean_move = float(np.mean(_move_data))
+                fig_mv.add_vline(x=_mean_move, line=dict(color="#00d084", dash="dot", width=1.5),
+                                 annotation_text=f"avg {_mean_move:.2f}×")
+                fig_mv.update_layout(
+                    title=f"Distribution of |Actual 1d Move| / Expected Move  (n={len(_move_data)})",
+                    height=260, plot_bgcolor="#000", paper_bgcolor="#000",
+                    font=dict(color="#e8e8e8", family="IBM Plex Mono", size=9),
+                    xaxis=dict(title="Actual / Implied", gridcolor="#111"),
+                    yaxis=dict(title="Count", gridcolor="#111"),
+                    margin=dict(t=40, b=10)
+                )
+                st.plotly_chart(fig_mv, use_container_width=True)
+                _pct_over = float(np.mean([1 if m > 1 else 0 for m in _move_data])) * 100
+                _vol_edge = "**Long Vol Edge** — options underpriced" if _mean_move > 1.05 else \
+                            "**Short Vol Edge** — options overpriced" if _mean_move < 0.90 else \
+                            "**No Vol Edge** — moves ≈ implied"
+                st.markdown(f"Avg move = {_mean_move:.2f}× implied · {_pct_over:.0f}% of moves exceeded implied · {_vol_edge}")
+            else:
+                st.caption("Need at least 5 resolved signals to plot distribution.")
+
+        # ── METHODOLOGY NOTE ─────────────────────────────────────────────
+        with st.expander("ℹ️ Edge Audit Methodology", expanded=False):
+            st.markdown("""
+**What this module measures:**
+
+Every time you click ⚡ LOAD OPTIONS INTEL, a full snapshot is recorded with:
+spot, IV, IVR, IV/HV ratio, PCR, OI total, OI skew, max pain distance, skew, term structure slope,
+flow score, positioning score, vol regime score, trend score, and expected move.
+
+**Forward outcomes are resolved 5 trading days later** using OHLCV close prices:
+- 1d/2d/3d/5d forward log return
+- Absolute move vs expected move
+- IV change, skew change, OI change
+- Whether price moved toward max pain
+
+**Signal groups** are formed by direction bias, IV regime, PCR level, proximity to max pain,
+flow magnitude, and signal alignment (flow + positioning + vol all pointing same direction).
+
+**Edge thresholds (interpretation rules):**
+
+| Metric | Threshold | Edge |
+|---|---|---|
+| Direction accuracy | > 55% | Directional Edge |
+| Avg move / implied | > 1.05× | Long Vol Edge |
+| Avg move / implied | < 0.90× | Short Vol Edge |
+| Avg IV change | > +0.5pp | Buy IV Edge |
+| Avg IV change | < -0.5pp | Sell IV Edge |
+| % toward max pain | > 60% | Pinning Edge |
+| Avg skew change | > 0.3pp | Skew Edge |
+
+**Confidence:** 5+ signals = indicative, 20+ = moderate, 50+ = high confidence.
+Collect signals daily for 2–3 months for statistically meaningful results.
+""")
