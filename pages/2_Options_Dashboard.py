@@ -3974,6 +3974,35 @@ def compute_probabilistic_score(
     except Exception:
         pass
 
+    # ── STEP 4: Implied probability from IV ──────────────────────────────────
+    # expected_move_iv = spot * atm_iv * sqrt(DTE/252)  (spec formula)
+    _dte_days = max(T * CFG["ann_days"], 1.0)
+    em_iv_spec = spot * atm_iv * math.sqrt(_dte_days / 252.0)   # spec: sqrt(DTE/252)
+    # Implied prob of up move from options pricing
+    # implied_prob_up ≈ 0.50 + (expected_move / spot) / 2
+    implied_prob_up = min(0.90, max(0.10, 0.50 + (em_iv_spec / (spot + 1e-9)) / 2.0))
+
+    # ── STEP 5: Directional edge ──────────────────────────────────────────────
+    # direction_edge = model prob_up − market implied prob_up
+    direction_edge = round(prob_up - implied_prob_up, 4)
+    # Positive edge → model more bullish than options imply
+    # Negative edge → model more bearish than options imply
+    edge_label = ("Bullish Edge" if direction_edge > 0.03
+                  else "Bearish Edge" if direction_edge < -0.03
+                  else "No Edge")
+
+    # ── STEP 3: Signal strength label ────────────────────────────────────────
+    _pu_for_label = prob_up
+    if _pu_for_label > 0.75:   signal_strength = "Very Strong Bullish"
+    elif _pu_for_label > 0.65: signal_strength = "Strong Bullish"
+    elif _pu_for_label > 0.60: signal_strength = "Moderate Bullish"
+    elif _pu_for_label > 0.55: signal_strength = "Weak Bullish"
+    elif _pu_for_label < 0.25: signal_strength = "Very Strong Bearish"
+    elif _pu_for_label < 0.35: signal_strength = "Strong Bearish"
+    elif _pu_for_label < 0.40: signal_strength = "Moderate Bearish"
+    elif _pu_for_label < 0.45: signal_strength = "Weak Bearish"
+    else:                      signal_strength = "No Edge"
+
     return {
         "raw_score":         round(raw_score, 4),
         "prob_up":           round(prob_up, 4),
@@ -3985,10 +4014,16 @@ def compute_probabilistic_score(
         "pcr_pct":           round(pcr_pct, 4),
         "rsi":               round(rsi_v, 1),
         "atr":               round(atrv, 2),
-        "flow_magnitude":    round(flow_mag, 3),   # conviction level 0-1
-        "factor_weights":    {k: round(v, 4) for k, v in fw.items()},  # learned weights
-        "mc_direction":      round(_mc_direction, 4),   # MC directional signal [-1,+1]
+        "flow_magnitude":    round(flow_mag, 3),
+        "factor_weights":    {k: round(v, 4) for k, v in fw.items()},
+        "mc_direction":      round(_mc_direction, 4),
         "mc_expected_move":  round(_mc_expected_move, 2),
+        # Steps 3-5 additions
+        "implied_prob_up":   round(implied_prob_up, 4),
+        "implied_move_pct":  round(em_iv_spec / (spot + 1e-9) * 100, 2),
+        "direction_edge":    direction_edge,
+        "edge_label":        edge_label,
+        "signal_strength":   signal_strength,
     }
 
 
@@ -5588,6 +5623,49 @@ with t_ov:
                    f"Gap between them is normal when historical IV had outlier spikes.")
     p7.metric("DTE",         str(dte))
 
+    # ── Steps 3-6: Probability Engine Panel ──────────────────────────────────
+    _imp_pu   = prob_score.get("implied_prob_up", 0.5)
+    _imp_mv   = prob_score.get("implied_move_pct", _emp)
+    _dir_edge = prob_score.get("direction_edge", 0.0)
+    _sig_str  = prob_score.get("signal_strength", "No Edge")
+    _edg_lbl  = prob_score.get("edge_label", "No Edge")
+
+    _ss_col  = ("#00d084" if "Bullish" in _sig_str
+                else "#ff3b3b" if "Bearish" in _sig_str else "#888")
+    _de_col  = ("#00d084" if _dir_edge > 0.03
+                else "#ff3b3b" if _dir_edge < -0.03 else "#888")
+    _de_sign = "+" if _dir_edge >= 0 else ""
+
+    st.markdown(f"""
+<div style="background:#0d0d0d;border:1px solid #2a2a2a;border-left:3px solid {_ss_col};
+padding:10px 16px;margin:6px 0 4px;font-family:'IBM Plex Mono',monospace;
+display:flex;gap:32px;align-items:center;flex-wrap:wrap;">
+  <div>
+    <div style="color:#555;font-size:0.72rem;letter-spacing:.06em;">SIGNAL STRENGTH</div>
+    <div style="color:{_ss_col};font-size:0.96rem;font-weight:700;">{_sig_str}</div>
+  </div>
+  <div>
+    <div style="color:#555;font-size:0.72rem;letter-spacing:.06em;">MODEL P(↑)</div>
+    <div style="color:{_pu_col};font-size:0.96rem;font-weight:700;">{_pu*100:.1f}%</div>
+  </div>
+  <div>
+    <div style="color:#555;font-size:0.72rem;letter-spacing:.06em;">IMPLIED P(↑)</div>
+    <div style="color:#888;font-size:0.96rem;font-weight:700;">{_imp_pu*100:.1f}%</div>
+  </div>
+  <div>
+    <div style="color:#555;font-size:0.72rem;letter-spacing:.06em;">DIR EDGE</div>
+    <div style="color:{_de_col};font-size:0.96rem;font-weight:700;">{_de_sign}{_dir_edge*100:.1f}pp &nbsp;·&nbsp; {_edg_lbl}</div>
+  </div>
+  <div>
+    <div style="color:#555;font-size:0.72rem;letter-spacing:.06em;">IMPLIED MOVE</div>
+    <div style="color:#888;font-size:0.96rem;font-weight:700;">±{_imp_mv:.1f}%</div>
+  </div>
+  <div style="margin-left:auto;">
+    <div style="color:#555;font-size:0.70rem;">Model P(↑) − Implied P(↑)</div>
+    <div style="color:#444;font-size:0.70rem;">Positive = model more bullish than options imply</div>
+  </div>
+</div>""", unsafe_allow_html=True)
+
     # ── Probability bar ───────────────────────────────────────────────────
     _bar_up   = int(_pu * 100)
     _bar_down = 100 - _bar_up
@@ -6204,6 +6282,107 @@ font-family:'IBM Plex Mono',monospace;font-size:0.83rem;margin-bottom:4px;">
   &nbsp;·&nbsp; {_ivr_label}{_ivr_warn}
   &nbsp;·&nbsp; DTE {dte} &nbsp;·&nbsp; Capital ₹{_capital:,.0f}
 </div>""", unsafe_allow_html=True)
+
+    # ── Step 7: Probability × IV Regime Strategy Mapping ─────────────────────
+    # Show the recommended strategy class based on prob_up and IV regime
+    _s7_pu    = _pu_s
+    _s7_ivr   = ivr
+    _s7_str   = prob_score.get("signal_strength", "No Edge")
+    _s7_edge  = prob_score.get("edge_label", "No Edge")
+    _s7_de    = prob_score.get("direction_edge", 0.0)
+    _s7_imp   = prob_score.get("implied_move_pct", 0.0)
+
+    # Determine recommended strategy class
+    _high_prob = _s7_pu > 0.60
+    _low_prob  = _s7_pu < 0.40
+    _high_iv   = _s7_ivr >= 60
+    _low_iv    = _s7_ivr < 40
+
+    if _high_prob and _low_iv:
+        _s7_rec = "Buy Calls / Call Spread"
+        _s7_rec_col = "#00d084"
+        _s7_rec_why = "Model bullish + IV cheap → buy direction"
+    elif _high_prob and _high_iv:
+        _s7_rec = "Sell Puts / Put Spread"
+        _s7_rec_col = "#00d084"
+        _s7_rec_why = "Model bullish + IV rich → sell downside premium"
+    elif _low_prob and _high_iv:
+        _s7_rec = "Sell Calls / Call Spread"
+        _s7_rec_col = "#ff3b3b"
+        _s7_rec_why = "Model bearish + IV rich → sell upside premium"
+    elif _low_prob and _low_iv:
+        _s7_rec = "Buy Puts / Put Spread"
+        _s7_rec_col = "#ff3b3b"
+        _s7_rec_why = "Model bearish + IV cheap → buy direction"
+    elif _high_iv:
+        _s7_rec = "Iron Condor / Short Strangle"
+        _s7_rec_col = "#ff8c00"
+        _s7_rec_why = "Neutral signal + IV rich → sell premium both sides"
+    else:
+        _s7_rec = "Calendar Spread"
+        _s7_rec_col = "#1e90ff"
+        _s7_rec_why = "Neutral signal + IV cheap → buy vol via calendar"
+
+    st.markdown(f"""
+<div style="background:#0d0d0d;border:1px solid #2a2a2a;border-left:3px solid {_s7_rec_col};
+padding:8px 16px;margin-bottom:6px;font-family:'IBM Plex Mono',monospace;
+display:flex;gap:24px;align-items:center;flex-wrap:wrap;font-size:0.80rem;">
+  <div>
+    <span style="color:#555;font-size:0.70rem;letter-spacing:.06em;">STRATEGY CLASS</span><br/>
+    <span style="color:{_s7_rec_col};font-weight:700;font-size:0.92rem;">{_s7_rec}</span>
+  </div>
+  <div>
+    <span style="color:#555;font-size:0.70rem;">Signal: </span>
+    <span style="color:#e8e8e8;">{_s7_str}</span>
+  </div>
+  <div>
+    <span style="color:#555;font-size:0.70rem;">Dir Edge: </span>
+    <span style="color:{'#00d084' if _s7_de>0 else '#ff3b3b' if _s7_de<0 else '#888'};">
+      {'+' if _s7_de>=0 else ''}{_s7_de*100:.1f}pp ({_s7_edge})</span>
+  </div>
+  <div>
+    <span style="color:#555;font-size:0.70rem;">Implied Move: </span>
+    <span style="color:#888;">±{_s7_imp:.1f}%</span>
+  </div>
+  <div style="margin-left:auto;color:#555;font-size:0.72rem;">{_s7_rec_why}</div>
+</div>""", unsafe_allow_html=True)
+
+    # ── Step 7: Full matrix table (expandable) ────────────────────────────────
+    with st.expander("📋 Full Probability × IV Regime Matrix", expanded=False):
+        _matrix_rows = [
+            {"P(↑)": "> 60%",  "IV Regime": "Low (IVR < 40)",  "Strategy": "Buy Calls / Call Spread",
+             "Logic": "Strong bullish signal, options cheap — buy direction"},
+            {"P(↑)": "> 60%",  "IV Regime": "High (IVR ≥ 60)", "Strategy": "Sell Puts / Put Spread",
+             "Logic": "Strong bullish signal, options expensive — sell downside vol"},
+            {"P(↑)": "< 40%",  "IV Regime": "High (IVR ≥ 60)", "Strategy": "Sell Calls / Bear Call Spread",
+             "Logic": "Strong bearish signal, options expensive — sell upside vol"},
+            {"P(↑)": "< 40%",  "IV Regime": "Low (IVR < 40)",  "Strategy": "Buy Puts / Put Spread",
+             "Logic": "Strong bearish signal, options cheap — buy direction"},
+            {"P(↑)": "45–55%", "IV Regime": "High (IVR ≥ 60)", "Strategy": "Iron Condor",
+             "Logic": "Neutral, options rich — sell vol both sides"},
+            {"P(↑)": "45–55%", "IV Regime": "Low (IVR < 40)",  "Strategy": "Calendar Spread",
+             "Logic": "Neutral, vol cheap — buy term structure"},
+        ]
+        _mat_df = pd.DataFrame(_matrix_rows)
+
+        def _mat_style(v):
+            if "Buy" in str(v) and "Sell" not in str(v): return "color:#00d084"
+            if "Sell" in str(v) and "Buy" not in str(v): return "color:#ff8c00"
+            if "Condor" in str(v) or "Calendar" in str(v): return "color:#1e90ff"
+            return "color:#e8e8e8"
+
+        # Highlight current row
+        def _highlight_current(row):
+            if row["Strategy"] == _s7_rec:
+                return ["background-color:#1a1400;font-weight:700"] * len(row)
+            return [""] * len(row)
+
+        st.dataframe(
+            _mat_df.style
+                .map(_mat_style, subset=["Strategy"])
+                .apply(_highlight_current, axis=1),
+            use_container_width=True, hide_index=True
+        )
 
     # ── Flow Alert Banner — fires only when flow magnitude exceeds adaptive threshold ──
     _flow_mag_now   = prob_score.get("flow_magnitude", 0.0)
