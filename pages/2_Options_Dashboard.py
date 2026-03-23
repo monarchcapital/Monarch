@@ -1597,22 +1597,26 @@ def parse_chain(raw_data, spot, step=50):
         pe_iv  = _iv(pe)
 
         ce_oi      = float(_md(ce, "oi", "open_interest") or 0)
-        ce_prev_oi = float(_md(ce, "prev_oi", "oi_day_change") or 0)
         pe_oi      = float(_md(pe, "oi", "open_interest") or 0)
-        pe_prev_oi = float(_md(pe, "prev_oi", "oi_day_change") or 0)
+
+        # ΔOI: Upstox v2 /option/chain does NOT return prev_oi in the response.
+        # We use net_change from market_data if available, otherwise 0.
+        # True ΔOI tracking is done in session state between consecutive loads.
+        ce_oic = float(_md(ce, "net_change", "oi_change", "oi_day_change") or 0)
+        pe_oic = float(_md(pe, "net_change", "oi_change", "oi_day_change") or 0)
 
         rows.append({
             "Strike":  strike,
             "CE_LTP":  ce_ltp,
             "CE_OI":   ce_oi,
-            "CE_OIC":  ce_oi - ce_prev_oi,   # actual day change = oi − prev_oi
+            "CE_OIC":  ce_oic,
             "CE_Vol":  float(_md(ce, "volume", "vol") or 0),
             "CE_IV":   ce_iv,
             "CE_Bid":  float(_md(ce, "bid_price", "bid") or 0),
             "CE_Ask":  float(_md(ce, "ask_price", "ask") or 0),
             "PE_LTP":  pe_ltp,
             "PE_OI":   pe_oi,
-            "PE_OIC":  pe_oi - pe_prev_oi,   # actual day change = oi − prev_oi
+            "PE_OIC":  pe_oic,
             "PE_Vol":  float(_md(pe, "volume", "vol") or 0),
             "PE_IV":   pe_iv,
             "PE_Bid":  float(_md(pe, "bid_price", "bid") or 0),
@@ -4511,6 +4515,26 @@ if load_btn:
         st.session_state["_chain_has_live"] = _chain_has_live
         st.session_state["_market_open"]    = _market_open
 
+        # ── ΔOI tracking between loads ─────────────────────────────────────────
+        # Upstox /option/chain doesn't return prev_oi. We track OI ourselves:
+        # store the previous chain snapshot keyed by (symbol, expiry) and compute
+        # ΔOI = current_oi − prev_oi on each load. This gives true intraday OI change.
+        _oi_snap_key = f"_oi_snap_{sym_sel.upper()}_{expiry_sel}"
+        _prev_snap   = st.session_state.get(_oi_snap_key, {})
+        if _chain_has_live and not chain_df.empty and _prev_snap:
+            chain_df = chain_df.copy()
+            for idx, row in chain_df.iterrows():
+                k = row["Strike"]
+                chain_df.at[idx, "CE_OIC"] = row["CE_OI"] - _prev_snap.get(f"ce_{k}", row["CE_OI"])
+                chain_df.at[idx, "PE_OIC"] = row["PE_OI"] - _prev_snap.get(f"pe_{k}", row["PE_OI"])
+        # Save current snapshot for next load
+        if _chain_has_live and not chain_df.empty:
+            st.session_state[_oi_snap_key] = {
+                f"ce_{row['Strike']}": row["CE_OI"] for _, row in chain_df.iterrows()
+            } | {
+                f"pe_{row['Strike']}": row["PE_OI"] for _, row in chain_df.iterrows()
+            }
+
         # 4b. Compute intraday signals from live 5-min candles + OI change data
         _intra_sigs = compute_intraday_signals(intraday_df, chain_df, spot)
         st.session_state["opt_intraday_signals"] = _intra_sigs
@@ -5823,6 +5847,13 @@ with t_chain:
 
         sigs = disp_c.apply(row_signal, axis=1)
         disp_c = pd.concat([disp_c, sigs], axis=1)
+
+        # DTE context note — on expiry day (DTE=1) all IVs are elevated vs HV which
+        # is a 20-day measure; "SELL rich" across the board is expected and not a signal.
+        if dte <= 1:
+            st.info("ℹ️ **DTE = 1 (expiry day):** IV/HV ratios are elevated across all strikes "
+                    "because annualised IV reflects same-day optionality, not 20-day realised vol. "
+                    "IV Sig 'SELL rich' on expiry day is structural, not a tradeable edge.")
 
         chain_show = disp_c[[
             "Strike","Moneyness",
