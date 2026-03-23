@@ -1698,9 +1698,13 @@ def fetch_upstox_candles(_token: str, instrument_key: str,
         hdrs    = {"Authorization": f"Bearer {_token}", "Accept": "application/json"}
         r       = requests.get(url, headers=hdrs, timeout=15)
         if r.status_code != 200:
+            st.warning(f"⚠️ OHLCV fetch failed (status {r.status_code}) for {instrument_key[:40]}. "
+                       f"Falling back to yfinance. EMA/HV may lag by 1 day.")
             return pd.DataFrame()
         candles = r.json().get("data", {}).get("candles", [])
         if not candles:
+            st.warning(f"⚠️ Upstox returned empty OHLCV candles for {instrument_key[:40]}. "
+                       f"Falling back to yfinance.")
             return pd.DataFrame()
         # Each candle: [timestamp, open, high, low, close, volume, oi]
         rows = []
@@ -1719,8 +1723,15 @@ def fetch_upstox_candles(_token: str, instrument_key: str,
         if not rows:
             return pd.DataFrame()
         df = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
+        # Validate: last candle should be recent (within 5 trading days)
+        last_date = df["date"].iloc[-1]
+        days_ago  = (datetime.now().date() - last_date).days
+        if days_ago > 5:
+            st.warning(f"⚠️ Upstox OHLCV last candle is {days_ago} days old ({last_date}). "
+                       f"Data may be stale — EMAs/HV will lag current price.")
         return df
-    except Exception:
+    except Exception as e:
+        st.warning(f"⚠️ fetch_upstox_candles failed: {e}. Falling back to yfinance.")
         return pd.DataFrame()
 
 
@@ -1789,9 +1800,25 @@ def get_ohlcv(symbol: str, token: str, master_df=None) -> pd.DataFrame:
             d.columns = [c[0].lower() if isinstance(c, tuple) else c.lower() for c in d.columns]
             d = d.reset_index()
             d.columns = [c.lower() for c in d.columns]
+            # FIX: yfinance lags by 1 day during market hours — no today's candle yet.
+            # Append a synthetic today row using live spot so EMAs/HV are current.
+            _live_spot = st.session_state.get("opt_spot", 0.0)
+            _today     = datetime.now().date()
+            if "date" in d.columns:
+                _last_d = pd.to_datetime(d["date"].iloc[-1]).date()
+            elif "datetime" in d.columns:
+                _last_d = pd.to_datetime(d["datetime"].iloc[-1]).date()
+            else:
+                _last_d = _today
+            if _live_spot > 0 and _last_d < _today:
+                _today_row = pd.DataFrame([{
+                    "date": _today, "open": _live_spot, "high": _live_spot,
+                    "low": _live_spot, "close": _live_spot, "volume": 0.0,
+                }])
+                d = pd.concat([d, _today_row], ignore_index=True)
             return d
-    except Exception:
-        pass
+    except Exception as e:
+        st.warning(f"⚠️ yfinance OHLCV failed for {symbol} ({yftick}): {e}")
     return pd.DataFrame()
 
 
@@ -2367,7 +2394,12 @@ def directional_bias(df, ltp, chain_df=None):
         skew_hist.append(float(oi_skew_val))
         if len(skew_hist) > 30: skew_hist = skew_hist[-30:]
         st.session_state["_flow_skew_oi_hist"] = skew_hist
-        oi_skew_z = _zscore_clamp(skew_hist, float(oi_skew_val), clamp=2.0) / 2.0
+        # FIX: use tanh of raw value when history < 3 (z-score would be 0 with 1 sample)
+        if len(skew_hist) >= 3:
+            oi_skew_z = _zscore_clamp(skew_hist, float(oi_skew_val), clamp=2.0) / 2.0
+        else:
+            # Raw skew ∈ [-1,+1] already (it's a ratio). Amplify via tanh for signal.
+            oi_skew_z = math.tanh(oi_skew_val * 3.0)
 
         # Max pain proximity: distance normalised by expected move (not % of spot)
         oi_d = st.session_state.get("opt_oi", {})
@@ -3512,7 +3544,11 @@ def compute_probabilistic_score(
         oi_skew_hist.append(float(oi_skew_val))
         if len(oi_skew_hist) > 30: oi_skew_hist = oi_skew_hist[-30:]
         st.session_state["_flow_skew_oi_hist"] = oi_skew_hist
-        oi_skew_z = _zscore_clamp(oi_skew_hist, float(oi_skew_val), clamp=2.0) / 2.0
+        # FIX: tanh of raw value when history < 3 (z-score is 0 with single sample)
+        if len(oi_skew_hist) >= 3:
+            oi_skew_z = _zscore_clamp(oi_skew_hist, float(oi_skew_val), clamp=2.0) / 2.0
+        else:
+            oi_skew_z = math.tanh(oi_skew_val * 3.0)
     else:
         pcr_level_z = 0.0; oi_skew_z = 0.0; pcr_pct = 0.5; pcr_v = 1.0
 
@@ -4083,8 +4119,12 @@ def ev_rank_strategies(universe, spot, T, r, atm_iv, q,
             ts_factor = 1.0 + 0.5 * math.tanh(ts_slope * _calib("ts_tanh_scale"))
 
         # ── EV-adjusted score — calibrated ev_tanh_scale ─────────────────────
+        # FIX: max_risk can be near-zero on expiry day (DTE=1) when premiums collapse.
+        # Floor at 1% of spot (≈ ₹226 for Nifty at 22600) to prevent tanh overflow → score=1 for all.
+        _min_risk = max(spot * 0.005, sum(abs(leg["premium"]) for leg in s["legs"]) * 0.5, 1.0)
+        _eff_risk = max(float(max_risk), _min_risk)
         ev_sign  = 1.0 if ev >= 0 else -1.0
-        ev_norm  = math.tanh(abs(ev) / (max(max_risk, 1.0) * _calib("ev_tanh_scale")))
+        ev_norm  = math.tanh(abs(ev) / (_eff_risk * _calib("ev_tanh_scale")))
         ev_score = ev_norm * pop * dte_align * safety_factor * ts_factor * ev_sign
         ev_score = max(-1.0, min(1.0, ev_score))
 
@@ -5465,6 +5505,17 @@ with t_dir:
 
     # Feature scores table — leading indicators first
     _fs = prob_score.get("feature_scores", {})
+
+    # Flow warmup notice — flow signals need 3+ loads to accumulate history
+    _flow_pcr_len = len(st.session_state.get("_flow_pcr_hist", []))
+    _flow_oi_len  = len(st.session_state.get("_flow_oi_hist",  []))
+    _flow_loads   = min(_flow_pcr_len, _flow_oi_len)
+    if _flow_loads < 3:
+        st.info(f"ℹ️ **Flow signals warming up** ({_flow_loads}/3 loads). "
+                "ΔPCR, ΔIV, ΔOI, ΔSkew, ΔGEX are *change* signals — they need at least 3 "
+                "consecutive loads to build a history baseline. "
+                "Click **⚡ LOAD OPTIONS INTEL** 2-3 more times to activate them.")
+
     if _fs:
         _fs_rows = [
             # ── LEADING ──────────────────────────────────────────────────
