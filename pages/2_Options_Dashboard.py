@@ -1601,12 +1601,12 @@ def parse_chain(raw_data, spot, step=50):
         ce_oi      = float(_md(ce, "oi", "open_interest") or 0)
         pe_oi      = float(_md(pe, "oi", "open_interest") or 0)
 
-        # prev_oi IS returned by Upstox v2 inside market_data.
-        # ΔOI = current oi − prev_oi (session-state tracking as secondary fallback).
-        ce_prev_oi = float(_md(ce, "prev_oi") or 0)
-        pe_prev_oi = float(_md(pe, "prev_oi") or 0)
-        ce_oic = (ce_oi - ce_prev_oi) if ce_prev_oi > 0 else float(_md(ce, "net_change", "oi_change") or 0)
-        pe_oic = (pe_oi - pe_prev_oi) if pe_prev_oi > 0 else float(_md(pe, "net_change", "oi_change") or 0)
+        # ΔOI from API: use prev_oi if available in market_data, else 0.
+        # Session-state tracking between loads will fill this in on subsequent clicks.
+        _ce_prev   = _md(ce, "prev_oi")
+        _pe_prev   = _md(pe, "prev_oi")
+        ce_oic     = (ce_oi - float(_ce_prev)) if _ce_prev else 0.0
+        pe_oic     = (pe_oi - float(_pe_prev)) if _pe_prev else 0.0
 
         rows.append({
             "Strike":  strike,
@@ -4537,24 +4537,30 @@ if load_btn:
         st.session_state["_market_open"]    = _market_open
 
         # ── ΔOI tracking between loads ─────────────────────────────────────────
-        # Upstox /option/chain doesn't return prev_oi. We track OI ourselves:
-        # store the previous chain snapshot keyed by (symbol, expiry) and compute
-        # ΔOI = current_oi − prev_oi on each load. This gives true intraday OI change.
+        # Upstox /option/chain may or may not return prev_oi.
+        # We always track OI in session state between loads for reliable ΔOI.
+        # Key uses int(strike) to avoid float precision mismatches (22600.0 vs 22600.000000004).
         _oi_snap_key = f"_oi_snap_{sym_sel.upper()}_{expiry_sel}"
         _prev_snap   = st.session_state.get(_oi_snap_key, {})
         if _chain_has_live and not chain_df.empty and _prev_snap:
             chain_df = chain_df.copy()
             for idx, row in chain_df.iterrows():
-                k = row["Strike"]
-                chain_df.at[idx, "CE_OIC"] = row["CE_OI"] - _prev_snap.get(f"ce_{k}", row["CE_OI"])
-                chain_df.at[idx, "PE_OIC"] = row["PE_OI"] - _prev_snap.get(f"pe_{k}", row["PE_OI"])
-        # Save current snapshot for next load
+                k = int(round(row["Strike"]))
+                prev_ce = _prev_snap.get(f"ce_{k}", None)
+                prev_pe = _prev_snap.get(f"pe_{k}", None)
+                # Only override if prev_oi from API is zero/missing
+                if prev_ce is not None and float(row.get("CE_OIC", 0)) == 0:
+                    chain_df.at[idx, "CE_OIC"] = row["CE_OI"] - prev_ce
+                if prev_pe is not None and float(row.get("PE_OIC", 0)) == 0:
+                    chain_df.at[idx, "PE_OIC"] = row["PE_OI"] - prev_pe
+        # Save current OI snapshot for next load (Python 3.8-compatible merge)
         if _chain_has_live and not chain_df.empty:
-            st.session_state[_oi_snap_key] = {
-                f"ce_{row['Strike']}": row["CE_OI"] for _, row in chain_df.iterrows()
-            } | {
-                f"pe_{row['Strike']}": row["PE_OI"] for _, row in chain_df.iterrows()
-            }
+            _new_snap = {}
+            for _, _r in chain_df.iterrows():
+                _k = int(round(_r["Strike"]))
+                _new_snap[f"ce_{_k}"] = float(_r["CE_OI"])
+                _new_snap[f"pe_{_k}"] = float(_r["PE_OI"])
+            st.session_state[_oi_snap_key] = _new_snap
 
         # 4b. Compute intraday signals from live 5-min candles + OI change data
         _intra_sigs = compute_intraday_signals(intraday_df, chain_df, spot)
@@ -5888,6 +5894,20 @@ with t_chain:
             "PCR",
             "PE Signal","PE IV Sig","PE ΔOI","PE Vol","PE OI","PE IV","PE LTP"
         ]
+
+        # Format numeric columns cleanly — no trailing .000000
+        chain_show["Strike"]  = chain_show["Strike"].astype(int)
+        chain_show["CE OI"]   = chain_show["CE OI"].astype(int)
+        chain_show["PE OI"]   = chain_show["PE OI"].astype(int)
+        chain_show["CE Vol"]  = chain_show["CE Vol"].astype(int)
+        chain_show["PE Vol"]  = chain_show["PE Vol"].astype(int)
+        chain_show["CE ΔOI"]  = chain_show["CE ΔOI"].astype(int)
+        chain_show["PE ΔOI"]  = chain_show["PE ΔOI"].astype(int)
+        chain_show["CE LTP"]  = chain_show["CE LTP"].round(2)
+        chain_show["PE LTP"]  = chain_show["PE LTP"].round(2)
+        chain_show["CE IV"]   = chain_show["CE IV"].round(2)
+        chain_show["PE IV"]   = chain_show["PE IV"].round(2)
+        chain_show["PCR"]     = chain_show["PCR"].round(3)
 
         def sig_style(v):
             if v == "BUY":        return "background-color:#1a3300;color:#00d084;font-weight:700"
