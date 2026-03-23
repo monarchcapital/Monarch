@@ -11564,352 +11564,285 @@ Collect signals daily for 2–3 months for statistically meaningful results.
 # chain_df, oi_d, atm_iv, hv20, dte, spot, etc.)
 # ══════════════════════════════════════════════════════════════
 with t_prob:
-    _pe_loaded  = st.session_state.get("opt_loaded", False)
-    _pe_ps      = st.session_state.get("opt_prob_score", {})
-    _pe_spot    = float(st.session_state.get("opt_spot", 0.0))
-    _pe_iv      = float(st.session_state.get("opt_atm_iv", 0.20))
-    _pe_hv      = float(st.session_state.get("opt_hv20") or CFG["hv_fallback"])
-    _pe_dte     = int(st.session_state.get("opt_dte", 7))
-    _pe_sym     = str(st.session_state.get("opt_symbol", ""))
-    _pe_step    = int(st.session_state.get("opt_step", 50))
-    _pe_T       = float(st.session_state.get("opt_T", max(int(st.session_state.get("opt_dte", 7)), 1) / 252.0))
-    _pe_r       = float(st.session_state.get("opt_rfr", 0.065))
-    _pe_dy      = st.session_state.get("opt_div_yield", {})
-    _pe_q       = float(_pe_dy.get(_pe_sym.upper(), 0.0)) if isinstance(_pe_dy, dict) else 0.0
+    # Read from session_state only - never from module-level vars
+    _pe_loaded = st.session_state.get("opt_loaded", False)
+    _pe_ps     = st.session_state.get("opt_prob_score", {})
+    _pe_spot   = float(st.session_state.get("opt_spot", 0.0))
+    _pe_iv     = float(st.session_state.get("opt_atm_iv", 0.20))
+    _pe_hv     = float(st.session_state.get("opt_hv20") or 0.15)
+    _pe_dte    = max(int(st.session_state.get("opt_dte", 7)), 1)
+    _pe_sym    = str(st.session_state.get("opt_symbol", ""))
 
-    st.markdown("### \U0001f3b2 Probability Engine \u2014 Decision Dashboard")
-    st.caption("Signals \u2192 Score \u2192 Probability \u2192 Move Edge \u2192 Strategy. "
-               "Data accumulates with each Load \u2014 more history = sharper calibration.")
+    st.markdown("### Probability Engine")
 
     if not _pe_loaded or _pe_spot <= 0:
-        st.info("\u26a0\ufe0f Load a symbol first \u2014 press LOAD OPTIONS INTEL in the sidebar.")
-    else:
-        _pe_pu    = float(_pe_ps.get("prob_up",   0.5))
-        _pe_pd    = float(_pe_ps.get("prob_down", 0.5))
-        _pe_rs    = float(_pe_ps.get("raw_score", 0.0))
-        _pe_dir_e = _pe_pu - 0.50
+        st.warning("Load a symbol first — press LOAD OPTIONS INTEL in the sidebar.")
+        st.stop()
 
-        def _pc(v):
-            if v >= 0.60: return "#00d084"
-            if v >= 0.55: return "#7dca84"
-            if v <= 0.40: return "#ff3b3b"
-            if v <= 0.45: return "#ff7777"
-            return "#ffb347"
+    # Pull values from prob_score
+    _pe_pu   = float(_pe_ps.get("prob_up",   0.50))
+    _pe_pd   = float(_pe_ps.get("prob_down", 0.50))
+    _pe_rs   = float(_pe_ps.get("raw_score", 0.0))
+    _pe_edge = _pe_pu - 0.50
+    _pe_str  = str(_pe_ps.get("signal_strength", "No Edge"))
+    _pe_iv_pct = _pe_iv * 100.0
+    _pe_hv_pct = _pe_hv * 100.0
+    _pe_ivhv   = _pe_iv / (_pe_hv + 1e-9)
 
-        _pu_col       = _pc(_pe_pu)
-        _dir_edge_col = "#00d084" if _pe_dir_e > 0.05 else "#ff3b3b" if _pe_dir_e < -0.05 else "#888"
-        _dir_edge_lbl = ("Bullish Edge"  if _pe_dir_e >  0.05 else
-                         "Bearish Edge"  if _pe_dir_e < -0.05 else "Neutral")
+    # Implied move: spot * IV * sqrt(DTE/252)
+    _pe_impl_pct = _pe_iv * math.sqrt(_pe_dte / 252.0) * 100.0
+    _pe_impl_rs  = _pe_spot * _pe_impl_pct / 100.0
 
-        _pe_ns          = _pe_sym.upper() + ":_calib"
-        _pe_prob_hist   = (st.session_state.get(_pe_ns + "_prob_up_hist",   []) or
-                           st.session_state.get("_calib_prob_up_hist",   []))
-        _pe_actual_hist = (st.session_state.get(_pe_ns + "_actual_up_hist", []) or
-                           st.session_state.get("_calib_actual_up_hist", []))
-        _pe_mvi_hist    = (st.session_state.get(_pe_ns + "_move_vs_iv_hist", []) or
-                           st.session_state.get("_calib_move_vs_iv_hist", []))
-        _pe_score_hist  = (st.session_state.get(_pe_ns + "_raw_score_hist", []) or
-                           st.session_state.get("_calib_raw_score_hist",  []))
-        _pe_ret_hist    = (st.session_state.get(_pe_ns + "_realised_ret_hist", []) or
-                           st.session_state.get("_calib_realised_ret_hist", []))
-        _pe_n_obs       = min(len(_pe_prob_hist), len(_pe_actual_hist))
-        _pe_avg_mvi     = float(np.mean(_pe_mvi_hist[-50:])) if len(_pe_mvi_hist) >= 3 else None
+    # Colours
+    _pe_pu_col  = "#00d084" if _pe_pu >= 0.60 else "#ff3b3b" if _pe_pu <= 0.40 else "#ffb347"
+    _pe_edg_col = "#00d084" if _pe_edge > 0.05 else "#ff3b3b" if _pe_edge < -0.05 else "#888"
+    _pe_edg_lbl = "Bullish Edge" if _pe_edge > 0.05 else "Bearish Edge" if _pe_edge < -0.05 else "Neutral"
 
-        if _pe_avg_mvi is not None:
-            _pe_vol_edge = "BUY" if _pe_avg_mvi > 1.05 else "SELL" if _pe_avg_mvi < 0.90 else "NEUTRAL"
-        else:
-            _pe_vol_edge = str(_pe_ps.get("vol_edge", "NEUTRAL"))
+    # ── SECTION 1: PROBABILITIES ──────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("#### Section 1 — Model Probabilities")
 
-        _brier = None
-        _brier_skill = None
-        _brier_label = "---"
-        _ve_col2 = "#888"
-        _ve_lbl2 = "No Vol Edge"
-        _pe_trade = "WAIT"
-        _pe_trade_col = "#888"
+    _s1a, _s1b, _s1c, _s1d = st.columns(4)
+    _s1a.metric("Prob Up",       f"{_pe_pu*100:.1f}%",
+                delta=f"score {_pe_rs:+.3f}", delta_color="normal")
+    _s1b.metric("Prob Down",     f"{_pe_pd*100:.1f}%")
+    _s1c.metric("Direction Edge",f"{_pe_edge*100:+.1f}pp")
+    _s1d.metric("Signal",        _pe_str)
 
-        # == DATA-DRIVEN EXPECTED MOVE ==
-        _SBKTS = [(0.00,0.25,"0.00-0.25"),(0.25,0.50,"0.25-0.50"),
-                  (0.50,0.75,"0.50-0.75"),(0.75,1.00,"0.75-1.00"),
-                  (1.00,1.50,"1.00-1.50"),(1.50,99.0,"1.50+")]
-        _pe_model_move_pct = None
-        _pe_bucket_stats   = []
+    # Simple progress bars using st.progress (always works)
+    st.caption(f"Bull {_pe_pu*100:.0f}% vs Bear {_pe_pd*100:.0f}% | {_pe_edg_lbl}")
+    st.progress(min(int(_pe_pu * 100), 100),
+                text=f"Prob Up: {_pe_pu*100:.1f}%  |  Edge: {_pe_edge*100:+.1f}pp")
 
-        if len(_pe_score_hist) >= 5 and len(_pe_ret_hist) >= 5:
-            _sc_a = np.array(_pe_score_hist, dtype=float)
-            _rt_a = np.array(_pe_ret_hist,   dtype=float)
-            _n_al = min(len(_sc_a), len(_rt_a))
-            _sc_a = _sc_a[-_n_al:]
-            _rt_a = _rt_a[-_n_al:]
-            _mv_a = np.abs(np.exp(_rt_a) - 1.0) * 100
-            for _blo, _bhi, _blbl in _SBKTS:
-                _msk = (np.abs(_sc_a) >= _blo) & (np.abs(_sc_a) < _bhi)
-                _cnt = int(_msk.sum())
-                if _cnt == 0: continue
-                _avg_m = float(np.mean(_mv_a[_msk]))
-                _std_m = float(np.std(_mv_a[_msk]))
-                _pe_bucket_stats.append({"Score Bucket": _blbl, "Count": _cnt,
-                                         "Avg Move %": f"{_avg_m:.2f}%",
-                                         "Std Move %": f"{_std_m:.2f}%"})
-                if _pe_model_move_pct is None:
-                    _abs_s = abs(_pe_rs)
-                    if _blo <= _abs_s < _bhi:
-                        _pe_model_move_pct = _avg_m
-            if _pe_model_move_pct is None and _pe_bucket_stats:
-                _pe_model_move_pct = float(_pe_bucket_stats[-1]["Avg Move %"].replace("%",""))
+    with st.expander("How to read probabilities", expanded=False):
+        st.markdown("""
+| Prob Up | Meaning |
+|---------|---------|
+| > 65% | Strong Bullish |
+| 55-65% | Mild Bullish |
+| 45-55% | Neutral — vol trade only |
+| 35-45% | Mild Bearish |
+| < 35% | Strong Bearish |
+        """)
 
-        _pe_impl_pct = float(_pe_iv * math.sqrt(max(_pe_dte,1) / 252.0) * 100)
-        _pe_impl_rs  = _pe_spot * _pe_impl_pct / 100
-        _pe_mdl_rs   = (_pe_spot * _pe_model_move_pct / 100 if _pe_model_move_pct else _pe_impl_rs)
-        _pe_me_pct   = (_pe_model_move_pct - _pe_impl_pct if _pe_model_move_pct else None)
+    # ── SECTION 2: MOVE COMPARISON ────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("#### Section 2 — Move vs Implied Move")
 
-        # == SECTION 1: PROBABILITIES ==
-        st.markdown("---")
-        st.markdown("#### S1 - Model Probabilities")
-        _c1,_c2,_c3,_c4 = st.columns(4)
-        _c1.metric("Prob Up", f"{_pe_pu*100:.1f}%", delta=f"score {_pe_rs:+.3f}")
-        _c2.metric("Prob Down", f"{_pe_pd*100:.1f}%")
-        _c3.metric("Dir Edge", f"{_pe_dir_e*100:+.1f}pp")
-        _c4.metric("Strength", _pe_ps.get("signal_strength","---"))
-        st.markdown(f"""<div style="font-family:monospace;margin:10px 0;">
-  <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">
-    <span style="color:#ff3b3b;font-size:.76rem;width:70px;text-align:right;">BEAR {_pe_pd*100:.0f}%</span>
-    <div style="flex:1;height:16px;background:#1a1a1a;border-radius:2px;overflow:hidden;display:flex;">
-      <div style="width:{_pe_pd*100:.1f}%;background:#ff3b3b;"></div>
-      <div style="width:{_pe_pu*100:.1f}%;background:#00d084;"></div>
-    </div>
-    <span style="color:#00d084;font-size:.76rem;width:70px;">BULL {_pe_pu*100:.0f}%</span>
-  </div>
-  <div style="text-align:center;font-size:.80rem;color:{_dir_edge_col};font-weight:700;">
-    {_dir_edge_lbl} &nbsp;/&nbsp; Edge = {_pe_dir_e*100:+.1f}pp
-  </div></div>""", unsafe_allow_html=True)
+    # Calibration histories
+    _sym_pfx   = _pe_sym.upper()
+    _prob_hist = (st.session_state.get(f"{_sym_pfx}:_calib_prob_up_hist",   []) or
+                  st.session_state.get("_calib_prob_up_hist",   []))
+    _act_hist  = (st.session_state.get(f"{_sym_pfx}:_calib_actual_up_hist", []) or
+                  st.session_state.get("_calib_actual_up_hist", []))
+    _sc_hist   = (st.session_state.get(f"{_sym_pfx}:_calib_raw_score_hist", []) or
+                  st.session_state.get("_calib_raw_score_hist",  []))
+    _ret_hist  = (st.session_state.get(f"{_sym_pfx}:_calib_realised_ret_hist", []) or
+                  st.session_state.get("_calib_realised_ret_hist", []))
+    _mvi_hist  = (st.session_state.get(f"{_sym_pfx}:_calib_move_vs_iv_hist", []) or
+                  st.session_state.get("_calib_move_vs_iv_hist", []))
+    _n_obs     = min(len(_prob_hist), len(_act_hist))
 
-        # == SECTION 2: MOVE vs IMPLIED ==
-        st.markdown("---")
-        st.markdown("#### S2 - Move vs Implied Move (Data-Driven)")
-        _m1,_m2,_m3,_m4 = st.columns(4)
-        _m1.metric("Implied Move", f"Rs{_pe_impl_rs:,.0f}", delta=f"+-{_pe_impl_pct:.2f}%")
-        _m2.metric("Model Move", f"Rs{_pe_mdl_rs:,.0f}",
-                   delta=f"+-{_pe_model_move_pct:.2f}%" if _pe_model_move_pct else "heuristic",
+    # Model move from score buckets (data-driven) or fallback to implied
+    _model_move_pct  = None
+    _buckets = [(0.00,0.25,"0-0.25"),(0.25,0.50,"0.25-0.50"),
+                (0.50,0.75,"0.50-0.75"),(0.75,1.00,"0.75-1.00"),
+                (1.00,1.50,"1.00-1.50"),(1.50,99.0,"1.50+")]
+
+    if len(_sc_hist) >= 5 and len(_ret_hist) >= 5:
+        _sc_arr = np.array(_sc_hist[-min(len(_sc_hist),len(_ret_hist)):], dtype=float)
+        _rt_arr = np.array(_ret_hist[-min(len(_sc_hist),len(_ret_hist)):], dtype=float)
+        _mv_arr = np.abs(np.exp(_rt_arr) - 1.0) * 100.0
+        _abs_rs = abs(_pe_rs)
+        for _blo, _bhi, _ in _buckets:
+            _msk = (np.abs(_sc_arr) >= _blo) & (np.abs(_sc_arr) < _bhi)
+            if _msk.sum() > 0 and _blo <= _abs_rs < _bhi:
+                _model_move_pct = float(np.mean(_mv_arr[_msk]))
+                break
+
+    _mdl_pct = _model_move_pct if _model_move_pct else _pe_impl_pct
+    _mdl_rs  = _pe_spot * _mdl_pct / 100.0
+    _me_pct  = _mdl_pct - _pe_impl_pct if _model_move_pct else None
+
+    # Vol edge from avg move vs IV history
+    _avg_mvi   = float(np.mean(_mvi_hist[-50:])) if len(_mvi_hist) >= 3 else None
+    _vol_edge  = ("BUY"  if _avg_mvi and _avg_mvi > 1.05 else
+                  "SELL" if _avg_mvi and _avg_mvi < 0.90 else
+                  str(_pe_ps.get("vol_edge", "NEUTRAL")))
+    if _me_pct is not None:
+        if _me_pct > 0.3:  _vol_edge = "BUY"
+        elif _me_pct < -0.3: _vol_edge = "SELL"
+
+    _m1, _m2, _m3, _m4 = st.columns(4)
+    _m1.metric("Implied Move", f"Rs{_pe_impl_rs:,.0f}",
+               delta=f"+-{_pe_impl_pct:.2f}%")
+    _m2.metric("Model Move",   f"Rs{_mdl_rs:,.0f}",
+               delta=f"+-{_mdl_pct:.2f}%", delta_color="off")
+    _m3.metric("IV / HV",      f"{_pe_ivhv:.2f}x",
+               delta=f"IV {_pe_iv_pct:.1f}% HV {_pe_hv_pct:.1f}%", delta_color="off")
+    if _me_pct is not None:
+        _me_lbl = "Underpriced" if _me_pct > 0.3 else "Overpriced" if _me_pct < -0.3 else "Fair"
+        _m4.metric("Move Edge", f"{_me_pct:+.2f}pp", delta=_me_lbl, delta_color="off")
+    elif _avg_mvi:
+        _m4.metric("Avg Move/IV", f"{_avg_mvi:.2f}x",
+                   delta="Long vol" if _avg_mvi > 1.05 else "Short vol" if _avg_mvi < 0.90 else "Fair",
                    delta_color="off")
-        _m3.metric("IV/HV", f"{(_pe_iv/(_pe_hv+1e-9)):.2f}x",
-                   delta=f"IV {_pe_iv*100:.1f}% HV {_pe_hv*100:.1f}%", delta_color="off")
-        if _pe_me_pct is not None:
-            _pe_vol_edge = "BUY" if _pe_me_pct > 0.3 else "SELL" if _pe_me_pct < -0.3 else "NEUTRAL"
-            _m4.metric("Move Edge", f"{_pe_me_pct:+.2f}pp",
-                       delta="Underpriced" if _pe_me_pct > 0.3 else "Overpriced" if _pe_me_pct < -0.3 else "Fair",
-                       delta_color="off")
-        else:
-            _m4.metric("Move Edge", "< 5 obs")
+    else:
+        _m4.metric("Move Edge", "< 3 obs")
 
-        if _pe_bucket_stats:
-            st.caption("Historical Realised Move by Signal Strength (data-driven model move)")
-            st.dataframe(pd.DataFrame(_pe_bucket_stats), use_container_width=True, hide_index=True)
-        else:
-            st.caption(f"Score-bucket table: needs 5+ resolved observations (currently {len(_pe_score_hist)}).")
+    st.caption(f"Observations for data-driven move: {len(_sc_hist)} score / {len(_ret_hist)} return / {len(_mvi_hist)} move-vs-IV")
 
-        if len(_pe_mvi_hist) >= 5:
-            _mvi_s = _pe_mvi_hist[-60:]
-            _fig_mvi = go.Figure()
-            _fig_mvi.add_trace(go.Bar(x=list(range(len(_mvi_s))), y=_mvi_s,
-                marker_color=["#00d084" if v>1 else "#ff3b3b" for v in _mvi_s]))
-            _fig_mvi.add_hline(y=1.0, line=dict(color="#ff8c00",dash="dash",width=1.5))
-            if _pe_avg_mvi:
-                _fig_mvi.add_hline(y=_pe_avg_mvi, line=dict(color="#1e90ff",dash="dot",width=1))
-            _fig_mvi.update_layout(height=170, plot_bgcolor="#000", paper_bgcolor="#000",
-                font=dict(color="#e8e8e8",size=9),
-                xaxis=dict(gridcolor="#111"), yaxis=dict(gridcolor="#111",range=[0,3]),
-                margin=dict(t=8,b=8,l=40,r=10), showlegend=False)
-            st.plotly_chart(_fig_mvi, use_container_width=True)
-            _pct_ov = float(np.mean([1 if v>1 else 0 for v in _pe_mvi_hist]))*100
-            _avg_mv_v = _pe_avg_mvi or 1.0
-            st.caption(f"Avg = {_avg_mv_v:.2f}x implied | {_pct_ov:.0f}% of moves exceeded implied")
-        else:
-            st.caption(f"Move/IV chart: needs {max(0,5-len(_pe_mvi_hist))} more resolved observations.")
+    # ── SECTION 3: CALIBRATION TABLE ─────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("#### Section 3 — Probability Calibration")
+    st.caption(f"Observations: {_n_obs} (needs 5 to show table, 20+ for reliability)")
 
-        # == SECTION 3: CALIBRATION TABLE ==
-        st.markdown("---")
-        st.markdown("#### S3 - Probability Calibration Table")
-        if _pe_n_obs >= 5:
-            _ph  = np.array(_pe_prob_hist[-_pe_n_obs:], dtype=float)
-            _ah  = np.array(_pe_actual_hist[-_pe_n_obs:], dtype=float)
-            _bkts3 = [(0.20,0.30,"0.20-0.30 Bear"),(0.30,0.40,"0.30-0.40"),
-                      (0.40,0.50,"0.40-0.50"),(0.50,0.55,"0.50-0.55"),
-                      (0.55,0.60,"0.55-0.60"),(0.60,0.65,"0.60-0.65"),
-                      (0.65,0.70,"0.65-0.70"),(0.70,0.80,"0.70-0.80"),
-                      (0.80,1.01,"0.80-1.00 Bull")]
-            _cal_rows = []
-            for _bl,_bh,_blbl in _bkts3:
-                _msk = (_ph>=_bl)&(_ph<_bh)
-                _cnt = int(_msk.sum())
-                if _cnt == 0: continue
-                _ap = float(_ph[_msk].mean()); _af = float(_ah[_msk].mean())
-                _gap = _ap - _af
-                _cal_rows.append({"Bucket":_blbl,"Avg Model":f"{_ap*100:.1f}%",
-                    "Actual Up":f"{_af*100:.1f}%","Count":_cnt,
-                    "Gap":(f"+{_gap*100:.1f}pp over" if _gap>0.05
-                           else f"{_gap*100:.1f}pp under" if _gap<-0.05
-                           else f"{_gap*100:+.1f}pp ok")})
-            if _cal_rows:
-                _cdf = pd.DataFrame(_cal_rows)
-                def _gs(v):
-                    if "over"  in str(v): return "color:#ff7777"
-                    if "under" in str(v): return "color:#1e90ff"
-                    return "color:#00d084;font-weight:700"
-                st.dataframe(_cdf.style.map(_gs, subset=["Gap"]),
-                             use_container_width=True, hide_index=True)
-                if len(_cal_rows) >= 3:
-                    _xp=[float(r["Avg Model"].replace("%",""))/100 for r in _cal_rows]
-                    _yp=[float(r["Actual Up"].replace("%",""))/100 for r in _cal_rows]
-                    _npts=[r["Count"] for r in _cal_rows]
-                    _fig_c = go.Figure()
-                    _fig_c.add_trace(go.Scatter(x=[20,90],y=[20,90],mode="lines",
-                        line=dict(color="#555",dash="dash",width=1),name="Perfect"))
-                    _fig_c.add_trace(go.Scatter(
-                        x=[v*100 for v in _xp],y=[v*100 for v in _yp],
-                        mode="markers+lines",
-                        marker=dict(size=[max(7,min(22,n)) for n in _npts],color="#ff8c00"),
-                        line=dict(color="#ff8c00",width=1.5),
-                        text=[f"n={n}" for n in _npts],
-                        hovertemplate="Pred:%{x:.1f}%<br>Act:%{y:.1f}%<br>%{text}<extra></extra>",
-                        name="Model"))
-                    _fig_c.update_layout(height=230,plot_bgcolor="#000",paper_bgcolor="#000",
-                        font=dict(color="#e8e8e8",size=9),
-                        xaxis=dict(title="Model Prob %",gridcolor="#111",range=[20,90]),
-                        yaxis=dict(title="Actual Up %",gridcolor="#111",range=[20,90]),
-                        margin=dict(t=20,b=10),legend=dict(x=0.02,y=0.98,font=dict(size=8)))
-                    st.plotly_chart(_fig_c, use_container_width=True)
-        else:
-            st.info(f"Calibration table needs 5 observations (currently {_pe_n_obs}).")
+    if _n_obs >= 5:
+        _ph = np.array(_prob_hist[-_n_obs:], dtype=float)
+        _ah = np.array(_act_hist[-_n_obs:],  dtype=float)
+        _cal_rows = []
+        for _bl, _bh, _blbl in [(0.20,0.40,"0.20-0.40 Bearish"),(0.40,0.50,"0.40-0.50"),
+                                  (0.50,0.60,"0.50-0.60"),(0.60,0.80,"0.60-0.80 Bullish"),
+                                  (0.80,1.01,"0.80+ Strong Bull")]:
+            _msk = (_ph >= _bl) & (_ph < _bh)
+            _cnt = int(_msk.sum())
+            if _cnt == 0: continue
+            _ap = float(_ph[_msk].mean())
+            _af = float(_ah[_msk].mean())
+            _gap = _ap - _af
+            _cal_rows.append({
+                "Bucket": _blbl,
+                "Model Prob": f"{_ap*100:.1f}%",
+                "Actual Up":  f"{_af*100:.1f}%",
+                "Count":      _cnt,
+                "Gap":        f"{_gap*100:+.1f}pp"
+            })
+        if _cal_rows:
+            st.dataframe(pd.DataFrame(_cal_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info(f"Calibration table needs 5 resolved observations. Currently: {_n_obs}. "
+                "Observations accumulate automatically — each Load + 4 trading days = 1 observation.")
 
-        # == SECTION 4: BRIER SCORE ==
-        st.markdown("---")
-        st.markdown("#### S4 - Model Accuracy (Brier Score)")
-        if _pe_n_obs >= 5:
-            _ph_b = np.array(_pe_prob_hist[-_pe_n_obs:], dtype=float)
-            _ah_b = np.array(_pe_actual_hist[-_pe_n_obs:], dtype=float)
-            _brier = float(np.mean((_ph_b - _ah_b)**2))
-            _brier_skill = 1.0 - _brier / 0.25
-            _brier_label = ("Very Strong" if _brier < 0.12 else "Strong" if _brier < 0.15
-                            else "Tradable" if _brier < 0.18 else "Weak" if _brier < 0.20
-                            else "Near Random" if _brier < 0.23 else "Below Random")
-            _bc_col = ("#00d084" if _brier<0.15 else "#7dca84" if _brier<0.18
-                       else "#ffb347" if _brier<0.20 else "#ff7777" if _brier<0.23 else "#ff3b3b")
-            _brier_bar = max(0, min(100, (0.25-_brier)/0.25*100))
-            _b1,_b2,_b3,_b4 = st.columns(4)
-            _b1.metric("Brier Score",  f"{_brier:.4f}", help="Lower = better. Random = 0.25")
-            _b2.metric("Brier Skill",  f"{_brier_skill*100:.1f}%")
-            _b3.metric("Assessment",   _brier_label)
-            _b4.metric("Observations", str(_pe_n_obs))
-            st.markdown(f"""<div style="font-family:monospace;margin:8px 0;">
-  <div style="display:flex;align-items:center;gap:8px;">
-    <span style="color:#888;font-size:.74rem;width:80px;">Random 0.25</span>
-    <div style="flex:1;height:13px;background:#1a1a1a;border-radius:2px;overflow:hidden;">
-      <div style="width:{_brier_bar:.1f}%;background:{_bc_col};"></div>
-    </div>
-    <span style="color:{_bc_col};font-size:.74rem;font-weight:700;width:110px;">
-      {_brier:.4f} ({_brier_bar:.0f}% skill)
-    </span>
-  </div>
-  <div style="display:flex;justify-content:space-between;font-size:.68rem;color:#555;margin-top:2px;">
-    <span>Worse 0.25</span><span style="color:#ffb347">0.20 weak</span>
-    <span style="color:#7dca84">0.18 tradable</span><span style="color:#00d084">0.15 strong</span>
-  </div></div>""", unsafe_allow_html=True)
-        else:
-            st.info(f"Brier score needs 5 observations (currently {_pe_n_obs}).")
+    # ── SECTION 4: BRIER SCORE ────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("#### Section 4 — Model Accuracy (Brier Score)")
 
-        # == SECTION 5: EDGE + RECOMMENDATION ==
-        st.markdown("---")
-        st.markdown("#### S5 - Edge Interpretation and Trade Recommendation")
-        _pe_is_bull    = _pe_pu > 0.60
-        _pe_is_bear    = _pe_pu < 0.40
-        _pe_long_vol   = (_pe_vol_edge == "BUY")
-        _pe_short_vol  = (_pe_vol_edge == "SELL")
-        _pe_neutral    = not _pe_is_bull and not _pe_is_bear
+    if _n_obs >= 5:
+        _ph_b  = np.array(_prob_hist[-_n_obs:], dtype=float)
+        _ah_b  = np.array(_act_hist[-_n_obs:],  dtype=float)
+        _brier = float(np.mean((_ph_b - _ah_b) ** 2))
+        _skill = 1.0 - _brier / 0.25
+        _blbl  = ("Very Strong" if _brier < 0.12 else "Strong"    if _brier < 0.15 else
+                  "Tradable"    if _brier < 0.18 else "Weak"       if _brier < 0.20 else
+                  "Near Random" if _brier < 0.23 else "Below Random")
 
-        if   _pe_is_bull and _pe_long_vol:    _pe_trade = "BUY CALLS"
-        elif _pe_is_bull and _pe_short_vol:   _pe_trade = "SELL PUT SPREAD"
-        elif _pe_is_bull:                      _pe_trade = "BUY CALLS (small)"
-        elif _pe_is_bear and _pe_long_vol:    _pe_trade = "BUY PUTS"
-        elif _pe_is_bear and _pe_short_vol:   _pe_trade = "SELL CALL SPREAD"
-        elif _pe_is_bear:                      _pe_trade = "BUY PUTS (small)"
-        elif _pe_neutral and _pe_short_vol:   _pe_trade = "IRON CONDOR"
-        elif _pe_neutral and _pe_long_vol:    _pe_trade = "STRADDLE"
-        else:                                  _pe_trade = "WAIT - no clear edge"
+        _b1, _b2, _b3, _b4 = st.columns(4)
+        _b1.metric("Brier Score",   f"{_brier:.4f}",
+                   help="Lower = better. Random = 0.25, Perfect = 0.00")
+        _b2.metric("Brier Skill",   f"{_skill*100:.1f}%",
+                   help="% improvement over random baseline")
+        _b3.metric("Assessment",    _blbl)
+        _b4.metric("Observations",  str(_n_obs))
 
-        _pe_trade_col = ("#00d084" if "BUY CALL" in _pe_trade else
-                         "#7dca84" if "PUT SPREAD" in _pe_trade else
-                         "#ff3b3b" if "BUY PUT" in _pe_trade else
-                         "#ff7777" if "CALL SPREAD" in _pe_trade else
-                         "#1e90ff" if "CONDOR" in _pe_trade else
-                         "#9b59b6" if "STRADDLE" in _pe_trade else "#888")
-        _ve_col2 = "#1e90ff" if _pe_long_vol else "#ff8c00" if _pe_short_vol else "#888"
-        _ve_lbl2 = "Long Vol - Buy options" if _pe_long_vol else "Short Vol - Sell options" if _pe_short_vol else "No Vol Edge"
-        _mvi_d   = f"{_pe_avg_mvi:.2f}x" if _pe_avg_mvi else "n/a"
+        _bar_pct = max(0, min(100, int((0.25 - _brier) / 0.25 * 100)))
+        st.progress(_bar_pct,
+                    text=f"Brier: {_brier:.4f} | Skill: {_skill*100:.0f}% | {_blbl}")
+        st.caption("Reference: 0.25 = random  |  0.20 = weak  |  0.18 = tradable  |  0.15 = strong  |  0.12 = very strong")
+    else:
+        st.info(f"Brier score needs 5 observations (currently {_n_obs}). "
+                "Each Load click followed by market close adds one observation after ~4 trading days.")
 
-        _e1, _e2 = st.columns(2)
-        with _e1:
-            st.metric("Direction", _dir_edge_lbl, delta=f"P-up {_pe_pu*100:.1f}%")
-            st.metric("Vol Edge",  _ve_lbl2,
-                      delta=f"Avg Move/IV = {_mvi_d}", delta_color="off")
-        with _e2:
-            st.markdown(f"""<div style="font-family:monospace;background:#0d0d0d;
-     border:2px solid {_pe_trade_col};padding:20px;text-align:center;border-radius:4px;">
-  <div style="font-size:1.4rem;color:{_pe_trade_col};font-weight:700;">{_pe_trade}</div>
-  <div style="color:#888;font-size:.74rem;margin-top:6px;">P-up {_pe_pu*100:.1f}% | Vol: {_pe_vol_edge}</div>
-</div>""", unsafe_allow_html=True)
+    # ── SECTION 5: EDGE + RECOMMENDATION ─────────────────────────────────────
+    st.markdown("---")
+    st.markdown("#### Section 5 — Edge and Trade Recommendation")
 
-        # == SECTION 6: DASHBOARD ==
-        st.markdown("---")
-        st.markdown("#### S6 - Complete Decision Dashboard")
-        _pe_bd = ("f{_brier:.4f} (" + _brier_label + ")" if _brier is not None
-                  else "< 5 obs")
-        if _brier is not None:
-            _pe_bd = f"{_brier:.4f} ({_brier_label})"
+    _is_bull    = _pe_pu > 0.60
+    _is_bear    = _pe_pu < 0.40
+    _is_neutral = not _is_bull and not _is_bear
+    _long_vol   = _vol_edge == "BUY"
+    _short_vol  = _vol_edge == "SELL"
 
-        _pe_mmi = f"+-{_pe_model_move_pct:.2f}% (Rs{_pe_mdl_rs:,.0f})" if _pe_model_move_pct else f"+-{_pe_impl_pct:.2f}% (implied)"
-        _pe_mei = (f"{_pe_me_pct:+.2f}pp" + (" Buy options" if _pe_me_pct>0.3 else " Sell options" if _pe_me_pct<-0.3 else " Fair")
-                   if _pe_me_pct is not None else "< 5 obs")
-        _cal_l  = "< 5 obs"
-        if _pe_n_obs >= 5:
-            _rpa = np.array(_pe_prob_hist[-20:], dtype=float)
-            _raa = np.array(_pe_actual_hist[-20:], dtype=float)
-            _cacc = float(np.mean((_rpa>0.5)==(_raa>0.5)))*100
-            _cal_l = f"{'OK' if _cacc>=55 else 'needs data'} ({_cacc:.0f}% dir accuracy)"
+    if   _is_bull  and _long_vol:   _trade = "BUY CALLS"
+    elif _is_bull  and _short_vol:  _trade = "SELL PUT SPREAD"
+    elif _is_bull:                   _trade = "BUY CALLS (small)"
+    elif _is_bear  and _long_vol:   _trade = "BUY PUTS"
+    elif _is_bear  and _short_vol:  _trade = "SELL CALL SPREAD"
+    elif _is_bear:                   _trade = "BUY PUTS (small)"
+    elif _is_neutral and _short_vol: _trade = "IRON CONDOR"
+    elif _is_neutral and _long_vol:  _trade = "STRADDLE"
+    else:                            _trade = "WAIT — no clear edge"
 
-        _dash = pd.DataFrame({
-            "Metric": ["Prob Up","Prob Down","Dir Edge",
-                       "Implied Move","Model Move","Move Edge",
-                       "ATM IV","IV/HV","Brier Score","Calibration","Trade"],
-            "Value":  [f"{_pe_pu*100:.1f}%", f"{_pe_pd*100:.1f}%",
-                       f"{_pe_dir_e*100:+.1f}pp - {_dir_edge_lbl}",
-                       f"+-{_pe_impl_pct:.2f}% (Rs{_pe_impl_rs:,.0f})",
-                       _pe_mmi, _pe_mei,
-                       f"{_pe_iv*100:.1f}%", f"{(_pe_iv/(_pe_hv+1e-9)):.2f}x",
-                       _pe_bd, _cal_l, _pe_trade],
-        })
-        def _dvs(v):
-            s = str(v)
-            for kw,col in [("BUY CALL","#00d084"),("PUT SPREAD","#7dca84"),
-                           ("BUY PUT","#ff3b3b"),("CALL SPREAD","#ff7777"),
-                           ("CONDOR","#1e90ff"),("STRADDLE","#9b59b6"),("WAIT","#888")]:
-                if kw in s: return f"color:{col};font-weight:700"
-            return "color:#e8e8e8"
-        st.dataframe(_dash.style.map(_dvs, subset=["Value"]),
-                     use_container_width=True, hide_index=True)
+    _e1, _e2 = st.columns(2)
+    with _e1:
+        st.metric("Direction Edge", _pe_edg_lbl,
+                  delta=f"Prob Up {_pe_pu*100:.1f}%  |  score {_pe_rs:+.3f}")
+        st.metric("Volatility Edge", _vol_edge,
+                  delta=f"IV/HV {_pe_ivhv:.2f}x" +
+                        (f"  |  Avg Move/IV {_avg_mvi:.2f}x" if _avg_mvi else ""),
+                  delta_color="off")
+        st.metric("Recommended", _trade)
 
-        _impl_s = f"+-{_pe_impl_pct:.1f}%"
-        _mdl_s  = f"+-{_pe_model_move_pct:.1f}%" if _pe_model_move_pct else "(implied)"
-        st.markdown(f"""<div style="font-family:monospace;background:#0d0d0d;border:1px solid #2a2a2a;
-     padding:12px 16px;font-size:.78rem;line-height:2em;margin-top:8px;">
-<span style="color:#ff8c00;font-weight:700;">DECISION WORKFLOW</span><br>
-<span style="color:#888;">Signals</span> <span style="color:#444;">-></span>
-<span style="color:#888;">Score ({_pe_rs:+.3f})</span> <span style="color:#444;">-></span>
-<span style="color:{_pu_col};font-weight:700;">P-up {_pe_pu*100:.1f}%</span>
-<span style="color:#444;"> -> </span>
-<span style="color:#e8e8e8;">Implied {_impl_s} vs Model {_mdl_s}</span>
-<span style="color:#444;"> -> </span>
-<span style="color:{_ve_col2};">Vol: {_pe_vol_edge}</span>
-<span style="color:#444;"> -> </span>
-<span style="color:{_pe_trade_col};font-weight:700;">{_pe_trade}</span>
-</div>""", unsafe_allow_html=True)
+    with _e2:
+        st.markdown("**Decision Logic**")
+        st.markdown(f"""
+- Prob Up **{_pe_pu*100:.1f}%** → {_pe_edg_lbl}
+- Vol Edge: **{_vol_edge}** (IV/HV {_pe_ivhv:.2f}x)
+- Score: **{_pe_rs:+.3f}** → {_pe_str}
+- Brier: **{"%.4f" % _brier if _n_obs >= 5 else "< 5 obs"}**
+
+---
+**{_trade}**
+""")
+
+    # ── SECTION 6: COMPLETE DASHBOARD TABLE ──────────────────────────────────
+    st.markdown("---")
+    st.markdown("#### Section 6 — Full Decision Dashboard")
+
+    _brier_disp = f"{_brier:.4f} ({_blbl})" if _n_obs >= 5 else "< 5 obs"
+    _me_disp    = (f"{_me_pct:+.2f}pp ({'Buy options' if _me_pct>0.3 else 'Sell options' if _me_pct<-0.3 else 'Fair'})"
+                   if _me_pct is not None else
+                   (f"{_avg_mvi:.2f}x avg" if _avg_mvi else "< 3 obs"))
+    _cal_disp   = "< 5 obs"
+    if _n_obs >= 5:
+        _rpa     = np.array(_prob_hist[-20:], dtype=float)
+        _raa     = np.array(_act_hist[-20:],  dtype=float)
+        _cacc    = float(np.mean((_rpa > 0.5) == (_raa > 0.5))) * 100
+        _cal_disp = f"{_cacc:.0f}% directional accuracy (last 20 obs)"
+
+    _dashboard = pd.DataFrame({
+        "Metric": [
+            "Prob Up", "Prob Down", "Direction Edge", "Signal Strength",
+            "Implied Move", "Model Move", "Move Edge", "Vol Edge",
+            "ATM IV", "IV / HV Ratio", "HV20",
+            "Brier Score", "Calibration",
+            "Recommended Trade"
+        ],
+        "Value": [
+            f"{_pe_pu*100:.1f}%",
+            f"{_pe_pd*100:.1f}%",
+            f"{_pe_edge*100:+.1f}pp — {_pe_edg_lbl}",
+            _pe_str,
+            f"+-{_pe_impl_pct:.2f}%  (Rs{_pe_impl_rs:,.0f})",
+            f"+-{_mdl_pct:.2f}%  (Rs{_mdl_rs:,.0f})" + ("" if _model_move_pct else "  [implied fallback]"),
+            _me_disp,
+            _vol_edge,
+            f"{_pe_iv_pct:.1f}%",
+            f"{_pe_ivhv:.2f}x",
+            f"{_pe_hv_pct:.1f}%",
+            _brier_disp,
+            _cal_disp,
+            _trade,
+        ]
+    })
+    st.dataframe(_dashboard, use_container_width=True, hide_index=True)
+
+    st.caption(
+        f"Workflow: Signals -> Score ({_pe_rs:+.3f}) -> "
+        f"Prob Up {_pe_pu*100:.1f}% -> Implied +-{_pe_impl_pct:.1f}% -> "
+        f"Vol Edge {_vol_edge} -> {_trade}"
+    )
+    st.caption(
+        "NOTE: Prob Up is currently a logistic transform of lagging technical signals. "
+        "It becomes a real calibrated probability after 50+ resolved observations "
+        "accumulate in the Brier score section above."
+    )
