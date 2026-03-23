@@ -4260,6 +4260,19 @@ def ev_rank_strategies(universe, spot, T, r, atm_iv, q,
         _ev_w    = _calib("ev_score_vs_dir_align")
         composite = _ev_w * ev_score + (1.0 - _ev_w) * (dir_align - 0.5) * 2
         composite = max(-1.0, min(1.0, composite))
+
+        # Hard penalty for negative-EV strategies: cap composite so they never
+        # outrank a strategy with positive EV regardless of dir_align score.
+        # Threshold: if MC EV < -0.5% of max_risk, apply descending cap.
+        # This prevents a Short Straddle with EV=-44 from ranking above positive-EV trades
+        # just because market is momentarily neutral (dir_align=0.99).
+        if ev < -0.005 * _eff_risk:
+            # Scale penalty: deeper negative EV → lower cap
+            _ev_penalty  = math.tanh(abs(ev) / (_eff_risk + 1e-9))   # 0→1 severity
+            _composite_cap = 0.20 * (1.0 - _ev_penalty)              # cap shrinks toward 0
+            composite = min(composite, _composite_cap)
+
+        composite = max(-1.0, min(1.0, composite))
         # Record for calibration
         _record("_calib_ev_score_hist",   ev_score)
         _record("_calib_dir_align_hist",  dir_align)
@@ -4294,6 +4307,8 @@ def ev_rank_strategies(universe, spot, T, r, atm_iv, q,
             "Max Risk":      f"₹{max_risk:,.0f}" if max_risk < 1e5 else "Unlimited",
             "Max Reward":    f"₹{max_reward:,.0f}" if max_reward < 1e5 else "Unlimited",
             "Ideal DTE":     f"{s['ideal_dte_lo']}–{s['ideal_dte_hi']} DTE",
+            "ideal_dte_lo":  s["ideal_dte_lo"],
+            "ideal_dte_hi":  s["ideal_dte_hi"],
             "Rationale":     (
                 f"POP {pop*100:.1f}% · EV ₹{ev:+.0f} · Safety {safety_ratio:.2f}× EM · "
                 f"DTE-align {dte_align:.2f} · Dir-align {dir_align:.2f}"
@@ -5237,7 +5252,11 @@ with t_ov:
     p3.metric("Prob Down ↓", f"{_pd*100:.1f}%")
     p4.metric("Exp Move",    f"₹{_em:.0f}",       delta=f"±{_emp:.1f}%")
     p5.metric("ATM IV",      f"{atm_iv*100:.1f}%", delta=f"HV {hv20*100:.1f}%")
-    p6.metric("IV Rank",     f"{ivr:.0f}",          delta=f"Pctile {iv_pct:.0f}")
+    p6.metric("IV Rank",     f"{ivr:.0f}",
+              delta=f"Pctile {iv_pct:.0f}",
+              help=f"IV Rank = (current−min)/(max−min) × 100 over session history. "
+                   f"IV Pctile = % of sessions where IV was lower ({iv_pct:.0f}%). "
+                   f"Gap between them is normal when historical IV had outlier spikes.")
     p7.metric("DTE",         str(dte))
 
     # ── Probability bar ───────────────────────────────────────────────────
@@ -6140,13 +6159,9 @@ with t_chain:
         ]
 
         # Format numeric columns cleanly — no trailing .000000
-        chain_show["Strike"]  = chain_show["Strike"].astype(int)
-        chain_show["CE OI"]   = chain_show["CE OI"].astype(int)
-        chain_show["PE OI"]   = chain_show["PE OI"].astype(int)
-        chain_show["CE Vol"]  = chain_show["CE Vol"].astype(int)
-        chain_show["PE Vol"]  = chain_show["PE Vol"].astype(int)
-        chain_show["CE ΔOI"]  = chain_show["CE ΔOI"].astype(int)
-        chain_show["PE ΔOI"]  = chain_show["PE ΔOI"].astype(int)
+        # Use pandas nullable integer type to force integer display in Streamlit dataframe
+        for _icol in ["Strike", "CE OI", "PE OI", "CE Vol", "PE Vol", "CE ΔOI", "PE ΔOI"]:
+            chain_show[_icol] = pd.to_numeric(chain_show[_icol], errors="coerce").fillna(0).astype("Int64")
         chain_show["CE LTP"]  = chain_show["CE LTP"].round(2)
         chain_show["PE LTP"]  = chain_show["PE LTP"].round(2)
         chain_show["CE IV"]   = chain_show["CE IV"].round(2)
@@ -6167,7 +6182,14 @@ with t_chain:
         styled = chain_show.style \
             .applymap(sig_style,  subset=["CE Signal","CE IV Sig","PE Signal","PE IV Sig"]) \
             .applymap(mm_style,   subset=["Money"])
-        st.dataframe(styled, use_container_width=True, hide_index=True)
+        st.dataframe(styled, use_container_width=True, hide_index=True,
+                     column_config={
+                         "CE LTP":  st.column_config.NumberColumn(format="%.2f"),
+                         "PE LTP":  st.column_config.NumberColumn(format="%.2f"),
+                         "CE IV":   st.column_config.NumberColumn(format="%.2f"),
+                         "PE IV":   st.column_config.NumberColumn(format="%.2f"),
+                         "PCR":     st.column_config.NumberColumn(format="%.3f"),
+                     })
         st.caption("CE/PE Signal = directional signal from bias. IV Sig = IV vs HV edge (overpriced/underpriced).")
 
 # ══════════════════════════════════════════════════════════════
