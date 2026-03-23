@@ -1882,17 +1882,30 @@ def get_ohlcv(symbol: str, token: str, master_df=None) -> pd.DataFrame:
         d = yf.download(yftick, period="1y", interval="1d", progress=False, auto_adjust=True)
         if not d.empty:
             d = d.copy()
-            d.columns = [c[0].lower() if isinstance(c, tuple) else c.lower() for c in d.columns]
+            # Handle MultiIndex columns from yfinance 0.2+ (e.g. ('Close','NSEI'))
+            if isinstance(d.columns, pd.MultiIndex):
+                # Drop ticker level — keep only the price-type level
+                d.columns = [c[0].lower() if isinstance(c, tuple) else str(c).lower()
+                             for c in d.columns]
+            else:
+                d.columns = [str(c).lower() for c in d.columns]
             d = d.reset_index()
-            d.columns = [c.lower() for c in d.columns]
+            # After reset_index, date is in 'date' or 'datetime' or 'index' depending on version
+            d.columns = [str(c).lower() for c in d.columns]
+            # Normalise date column name to 'date'
+            for _dc in ("datetime", "index", "date"):
+                if _dc in d.columns and _dc != "date":
+                    d = d.rename(columns={_dc: "date"})
+                    break
+            # Ensure required columns exist
+            if "close" not in d.columns:
+                return pd.DataFrame()
             # FIX: yfinance lags by 1 day during market hours — no today's candle yet.
             # Append a synthetic today row using live spot so EMAs/HV are current.
             _live_spot = st.session_state.get("opt_spot", 0.0)
             _today     = datetime.now().date()
             if "date" in d.columns:
                 _last_d = pd.to_datetime(d["date"].iloc[-1]).date()
-            elif "datetime" in d.columns:
-                _last_d = pd.to_datetime(d["datetime"].iloc[-1]).date()
             else:
                 _last_d = _today
             if _live_spot > 0 and _last_d < _today:
@@ -2177,8 +2190,8 @@ def compute_flow_scores(chain_df, ohlcv_df):
         _step = st.session_state.get("opt_step", 50)
         if _spot > 0 and _step > 0:
             atm_k      = atm_strike(_spot, _step)
-            otm_ce_row = chain_df[chain_df.Strike == atm_k + _step]
-            otm_pe_row = chain_df[chain_df.Strike == atm_k - _step]
+            otm_ce_row = chain_df[(chain_df.Strike - (atm_k + _step)).abs() < 0.5]
+            otm_pe_row = chain_df[(chain_df.Strike - (atm_k - _step)).abs() < 0.5]
             if not otm_ce_row.empty and not otm_pe_row.empty:
                 ce_iv_now  = _sanitise_iv(float(otm_ce_row.CE_IV.values[0]), 0) or 0.0
                 pe_iv_now  = _sanitise_iv(float(otm_pe_row.PE_IV.values[0]), 0) or 0.0
@@ -4625,7 +4638,16 @@ if load_btn:
             try:
                 d = yf.download(yftick, period="2d", interval="1d", progress=False, auto_adjust=True)
                 if not d.empty:
-                    spot = float(d["Close"].iloc[-1])
+                    # Handle MultiIndex columns (yfinance 0.2+)
+                    if isinstance(d.columns, pd.MultiIndex):
+                        d.columns = [c[0].lower() if isinstance(c, tuple) else str(c).lower()
+                                     for c in d.columns]
+                    else:
+                        d.columns = [str(c).lower() for c in d.columns]
+                    _close_col = "close" if "close" in d.columns else (
+                                 "Close" if "Close" in d.columns else None)
+                    if _close_col:
+                        spot = float(d[_close_col].iloc[-1])
             except Exception as _yf_err:
                 st.warning(f"yfinance spot fallback failed for {sym_sel}: {_yf_err}")
         if not spot or spot <= 0:
@@ -4824,6 +4846,7 @@ if load_btn:
         st.session_state.opt_T          = T_val
         st.session_state.opt_hv10       = hv10 or hv_ref
         st.session_state.opt_ohlcv      = ohlcv_df
+        # opt_ohlcv_df already set earlier (line ~4666) before calibration cycle
         st.session_state.opt_loaded     = True
         st.session_state.payoff_legs    = []
 
@@ -5152,16 +5175,16 @@ if _pending and _pending.get("symbol") == sym:
     _top_s = strat_recs[0] if strat_recs else {}
     _append_signal(
         symbol        = sym,
-        prob_up       = prob_score["prob_up"],
-        prob_down     = prob_score["prob_down"],
-        flow_score    = prob_score["feature_scores"].get("flow_score", 0),
+        prob_up       = prob_score.get("prob_up", 0.5),
+        prob_down     = prob_score.get("prob_down", 0.5),
+        flow_score    = prob_score.get("feature_scores", {}).get("flow_score", 0),
         flow_magnitude= prob_score.get("flow_magnitude", 0),
-        raw_score     = prob_score["raw_score"],
+        raw_score     = prob_score.get("raw_score", 0.0),
         top_strategy  = _top_s.get("Strategy", "—"),
         strategy_ev   = _top_s.get("ev", 0),
         strategy_pop  = _top_s.get("pop", 0.5),
         strategy_kelly= _top_s.get("kelly", 0),
-        expected_move = prob_score["expected_move"],
+        expected_move = prob_score.get("expected_move", 0.0),
         atm_iv        = atm_iv,
         ivr           = ivr,
         bias          = bias,
@@ -5238,11 +5261,11 @@ with t_ov:
     st.markdown("### ◼ Options Intelligence Summary")
 
     # ── Probabilistic core outputs ─────────────────────────────────────────
-    _pu  = prob_score["prob_up"]
-    _pd  = prob_score["prob_down"]
-    _em  = prob_score["expected_move"]
+    _pu  = prob_score.get("prob_up", 0.5)
+    _pd  = prob_score.get("prob_down", 0.5)
+    _em  = prob_score.get("expected_move", 0.0)
     _emp = prob_score["expected_move_pct"]
-    _rs  = prob_score["raw_score"]
+    _rs  = prob_score.get("raw_score", 0.0)
     _pu_col  = "#00d084" if _pu > 0.55 else ("#ff3b3b" if _pu < 0.45 else "#ffb347")
     _pd_col  = "#ff3b3b" if _pd > 0.55 else ("#00d084" if _pd < 0.45 else "#ffb347")
 
@@ -5669,9 +5692,9 @@ with t_dir:
     st.markdown("### 🧭 Directional Signal Stack")
 
     # ── Probabilistic summary ─────────────────────────────────────────────
-    _pu_d  = prob_score["prob_up"]
-    _pd_d  = prob_score["prob_down"]
-    _rs_d  = prob_score["raw_score"]
+    _pu_d  = prob_score.get("prob_up", 0.5)
+    _pd_d  = prob_score.get("prob_down", 0.5)
+    _rs_d  = prob_score.get("raw_score", 0.0)
     _pu_dc = "#00d084" if _pu_d > 0.55 else ("#ff3b3b" if _pu_d < 0.45 else "#ffb347")
     _pd_dc = "#ff3b3b" if _pd_d > 0.55 else ("#00d084" if _pd_d < 0.45 else "#ffb347")
 
@@ -5733,7 +5756,7 @@ with t_dir:
                 if v > 0.05: return "color:#00d084;font-weight:700"
                 if v < -0.05: return "color:#ff3b3b;font-weight:700"
             return "color:#888"
-        st.dataframe(_fdf.style.applymap(_zscore_style, subset=["Score"]),
+        st.dataframe(_fdf.style.map(_zscore_style, subset=["Score"]),
                      use_container_width=True, hide_index=True)
 
         # Flow conviction bar
@@ -5780,7 +5803,7 @@ font-family:'IBM Plex Mono',monospace;margin-bottom:10px;">
                 if v > 0: return "color:#00d084;font-weight:700"
                 if v < 0: return "color:#ff3b3b;font-weight:700"
             return ""
-        st.dataframe(fdf.style.applymap(pts_style, subset=["Points"]),
+        st.dataframe(fdf.style.map(pts_style, subset=["Points"]),
                      use_container_width=True, hide_index=True)
 
     st.divider()
@@ -5854,10 +5877,10 @@ with t_strat:
     _kelly_cap  = CFG["kelly_cap_pct"]
 
     # ── Probabilistic summary bar ─────────────────────────────────────────
-    _pu_s  = prob_score["prob_up"]
-    _pd_s  = prob_score["prob_down"]
-    _em_s  = prob_score["expected_move"]
-    _rs_s  = prob_score["raw_score"]
+    _pu_s  = prob_score.get("prob_up", 0.5)
+    _pd_s  = prob_score.get("prob_down", 0.5)
+    _em_s  = prob_score.get("expected_move", 0.0)
+    _rs_s  = prob_score.get("raw_score", 0.0)
     _pu_c  = "#00d084" if _pu_s > 0.55 else ("#ff3b3b" if _pu_s < 0.45 else "#ffb347")
 
     # IVR bootstrap label — tells user if IVR is real or estimated
@@ -5880,7 +5903,7 @@ font-family:'IBM Plex Mono',monospace;font-size:0.83rem;margin-bottom:4px;">
     _flow_mag_now   = prob_score.get("flow_magnitude", 0.0)
     _flow_threshold = st.session_state.get("opt_flow_conv_threshold", CFG["flow_conviction_seed"])
     _fs_now         = prob_score.get("feature_scores", {})
-    _flow_dir       = prob_score["feature_scores"].get("flow_score", 0)
+    _flow_dir       = prob_score.get("feature_scores", {}).get("flow_score", 0)
 
     if _flow_mag_now >= _flow_threshold and _flow_threshold > 0:
         _fb_col  = "#00d084" if _flow_dir > 0 else "#ff3b3b"
@@ -6162,11 +6185,10 @@ with t_chain:
         # Use pandas nullable integer type to force integer display in Streamlit dataframe
         for _icol in ["Strike", "CE OI", "PE OI", "CE Vol", "PE Vol", "CE ΔOI", "PE ΔOI"]:
             chain_show[_icol] = pd.to_numeric(chain_show[_icol], errors="coerce").fillna(0).astype("Int64")
-        chain_show["CE LTP"]  = chain_show["CE LTP"].round(2)
-        chain_show["PE LTP"]  = chain_show["PE LTP"].round(2)
-        chain_show["CE IV"]   = chain_show["CE IV"].round(2)
-        chain_show["PE IV"]   = chain_show["PE IV"].round(2)
-        chain_show["PCR"]     = chain_show["PCR"].round(3)
+        # Keep floats as floats (rounded) — Streamlit renders them without trailing zeros
+        for _fcol, _dp in [("CE LTP",2),("PE LTP",2),("CE IV",2),("PE IV",2),("PCR",3)]:
+            if _fcol in chain_show.columns:
+                chain_show[_fcol] = pd.to_numeric(chain_show[_fcol], errors="coerce").round(_dp)
 
         def sig_style(v):
             if v == "BUY":        return "background-color:#1a3300;color:#00d084;font-weight:700"
@@ -6180,15 +6202,17 @@ with t_chain:
             return "color:#555"
 
         styled = chain_show.style \
-            .applymap(sig_style,  subset=["CE Signal","CE IV Sig","PE Signal","PE IV Sig"]) \
-            .applymap(mm_style,   subset=["Money"])
+            .map(sig_style,  subset=["CE Signal","CE IV Sig","PE Signal","PE IV Sig"]) \
+            .map(mm_style,   subset=["Money"])
+        # Use column_config for number formatting on the plain dataframe level
+        # (column_config works alongside Styler in Streamlit ≥1.22)
         st.dataframe(styled, use_container_width=True, hide_index=True,
                      column_config={
-                         "CE LTP":  st.column_config.NumberColumn(format="%.2f"),
-                         "PE LTP":  st.column_config.NumberColumn(format="%.2f"),
-                         "CE IV":   st.column_config.NumberColumn(format="%.2f"),
-                         "PE IV":   st.column_config.NumberColumn(format="%.2f"),
-                         "PCR":     st.column_config.NumberColumn(format="%.3f"),
+                         "CE LTP": st.column_config.NumberColumn(format="%.2f"),
+                         "PE LTP": st.column_config.NumberColumn(format="%.2f"),
+                         "CE IV":  st.column_config.NumberColumn(format="%.2f"),
+                         "PE IV":  st.column_config.NumberColumn(format="%.2f"),
+                         "PCR":    st.column_config.NumberColumn(format="%.3f"),
                      })
         st.caption("CE/PE Signal = directional signal from bias. IV Sig = IV vs HV edge (overpriced/underpriced).")
 
@@ -6935,8 +6959,8 @@ border-bottom:1px solid #1a1a1a;font-family:'IBM Plex Mono',monospace;">
     # ═══════════════════════════════════════════════════════
     _section(1, "WHAT IS THE MARKET DOING RIGHT NOW?")
     _c1, _c2, _c3, _c4 = st.columns(4)
-    _pu_tp  = prob_score["prob_up"]
-    _pd_tp  = prob_score["prob_down"]
+    _pu_tp  = prob_score.get("prob_up", 0.5)
+    _pd_tp  = prob_score.get("prob_down", 0.5)
     _pu_tpc = "#00d084" if _pu_tp > 0.55 else ("#ff3b3b" if _pu_tp < 0.45 else "#ffb347")
     _c1.markdown(_card("Probability",
                         f"P(↑) {_pu_tp*100:.1f}%  P(↓) {_pd_tp*100:.1f}%",
@@ -6980,7 +7004,7 @@ border-bottom:1px solid #1a1a1a;font-family:'IBM Plex Mono',monospace;">
     _pos_s       = _fs_tp.get("positioning_score", 0.0)
     _vol_rs      = _fs_tp.get("vol_regime_score", 0.0)
     _iv_hv_pct_g = prob_score.get("iv_hv_pct", 0.5)
-    _pu_conv     = prob_score["prob_up"]
+    _pu_conv     = prob_score.get("prob_up", 0.5)
     _dir_edge    = abs(_pu_conv - 0.5)
     _flow_thr    = st.session_state.get("opt_flow_conv_threshold", CFG["flow_conviction_seed"])
 
@@ -7257,8 +7281,8 @@ font-family:'IBM Plex Mono',monospace;height:100%;">
                 return ""
             st.dataframe(
                 _tdf.style
-                    .applymap(_order_style, subset=["ORDER"])
-                    .applymap(_type_style,  subset=["TYPE"]),
+                    .map(_order_style, subset=["ORDER"])
+                    .map(_type_style,  subset=["TYPE"]),
                 use_container_width=True, hide_index=True
             )
 
@@ -7395,7 +7419,7 @@ font-family:'IBM Plex Mono',monospace;">
                 if isinstance(v, str) and v.startswith("+₹"): return "color:#00d084;font-weight:600"
                 if isinstance(v, str) and v.startswith("-₹") or (isinstance(v, str) and "−" in v): return "color:#ff3b3b;font-weight:600"
                 return ""
-            st.dataframe(_pnl_df.style.applymap(_pnl_style, subset=["P&L (₹)"]),
+            st.dataframe(_pnl_df.style.map(_pnl_style, subset=["P&L (₹)"]),
                          use_container_width=True, hide_index=True)
 
         else:
@@ -7893,7 +7917,7 @@ font-family:'IBM Plex Mono',monospace;font-size:0.86rem;color:{_shape_c};margin:
                 return ""
 
             st.dataframe(
-                _cdf_display.style.applymap(_cal_style, subset=["Entry"]),
+                _cdf_display.style.map(_cal_style, subset=["Entry"]),
                 use_container_width=True, hide_index=True
             )
 
@@ -8230,8 +8254,8 @@ font-family:'IBM Plex Mono',monospace;font-size:0.86rem;color:{_liq_col};margin:
             except: return ""
         st.dataframe(
             _ldf.style
-                .applymap(_liq_ok_style, subset=["CE OK","PE OK"])
-                .applymap(_spread_style, subset=["CE Spread%","PE Spread%"]),
+                .map(_liq_ok_style, subset=["CE OK","PE OK"])
+                .map(_spread_style, subset=["CE Spread%","PE Spread%"]),
             use_container_width=True, hide_index=True
         )
         st.caption("✓ = spread <5% AND OI ≥1000 AND volume ≥100. ⚠ = fails one or more criteria. "
@@ -8489,8 +8513,8 @@ with t_backtest:
 
         st.dataframe(
             _log_df.style
-                .applymap(_log_pu_style, subset=["P(↑)%"])
-                .applymap(_log_ev_style, subset=["EV"]),
+                .map(_log_pu_style, subset=["P(↑)%"])
+                .map(_log_ev_style, subset=["EV"]),
             use_container_width=True, hide_index=True)
 
         # P(↑) trend chart
