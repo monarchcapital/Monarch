@@ -4138,6 +4138,16 @@ def ev_rank_strategies(universe, spot, T, r, atm_iv, q,
 
     results = []
     for s in universe:
+        # ── Strategy-specific IV for MC simulation ───────────────────────────
+        # Use the average IV across the strategy's strikes (from the surface),
+        # not just ATM IV. This gives proper vol for OTM strangles etc.
+        _leg_strikes = [float(leg["strike"]) for leg in s["legs"]]
+        _leg_ivs     = [iv_surf(k) for k in _leg_strikes]
+        sigma_strat  = float(np.mean(_leg_ivs)) if _leg_ivs else sigma_sim
+        # Recompute terminal prices for this strategy's vol profile
+        prices_strat = spot * np.exp(
+            (mu - 0.5 * sigma_strat**2) * T + sigma_strat * math.sqrt(T) * Z)
+
         # ── MC P&L ──────────────────────────────────────────────
         pnl = np.zeros(n_sims)
         for leg in s["legs"]:
@@ -4145,7 +4155,7 @@ def ev_rank_strategies(universe, spot, T, r, atm_iv, q,
             pr  = float(leg["premium"])
             qty = int(leg.get("qty", 1))
             d   = 1 if leg["action"] == "buy" else -1
-            intr = np.maximum(prices - k, 0) if leg["opt"] == "CE" else np.maximum(k - prices, 0)
+            intr = np.maximum(prices_strat - k, 0) if leg["opt"] == "CE" else np.maximum(k - prices_strat, 0)
             pnl += d * (intr - pr) * qty
 
         pop = float((pnl > 0).mean())
@@ -4154,6 +4164,16 @@ def ev_rank_strategies(universe, spot, T, r, atm_iv, q,
 
         max_risk   = float(s["max_risk"])
         max_reward = float(s["max_reward"])
+
+        # FIX Bug 6: For unlimited-risk/reward strategies (max_risk=999 or max_reward=999),
+        # use MC-derived actual risk/reward instead of the placeholder sentinel value.
+        # This prevents ev_norm collapsing (credit strategies) or saturating (debit strategies).
+        _mc_pnl_5pct  = float(np.percentile(pnl, 5))   # worst 5% outcome
+        _mc_pnl_95pct = float(np.percentile(pnl, 95))  # best 5% outcome
+        _mc_risk_eff   = max(abs(_mc_pnl_5pct), sum(abs(leg["premium"]) for leg in s["legs"]), 1.0)
+        _mc_reward_eff = max(abs(_mc_pnl_95pct), 1.0)
+        if max_risk   >= 999: max_risk   = _mc_risk_eff
+        if max_reward >= 999: max_reward = _mc_reward_eff
 
         # ── True Kelly from PnL distribution (Improvement #5) ────
         # Derive p, avg_win, avg_loss directly from MC PnL paths
@@ -4184,7 +4204,10 @@ def ev_rank_strategies(universe, spot, T, r, atm_iv, q,
         else:
             dist      = min(abs(actual_dte - dte_lo), abs(actual_dte - dte_hi))
             half_rng  = max((dte_hi - dte_lo) / 2.0, 1.0)
-            dte_align = max(0.05, math.exp(-math.log(2) * dist / half_rng))
+            # Steeper decay: halves every half_range DTE outside ideal window.
+            # Floor lowered to 0.01 so severely mismatched strategies (e.g. Long Strangle
+            # at DTE=1 with ideal=30-60) score near-zero rather than 0.26.
+            dte_align = max(0.01, math.exp(-math.log(2) * dist / half_rng))
 
         # ── Safety factor — calibrated sigmoid sharpness ─────────────────────
         sk = s.get("short_strike")
@@ -4220,7 +4243,18 @@ def ev_rank_strategies(universe, spot, T, r, atm_iv, q,
         elif "bear" in stype:
             dir_align = final_prob_down
         else:
-            dir_align = 1.0 - 2.0 * abs(final_prob_up - 0.5)
+            # Neutral strategies: alignment depends on whether they need vol or calm
+            # centrality = how close prob_up is to 0.5 (0=strong directional, 1=pure neutral)
+            centrality = 1.0 - 2.0 * abs(final_prob_up - 0.5)   # 0→1
+            if "debit" in stype:
+                # Debit neutral (Long Straddle/Strangle, Butterfly buy): profit from BIG moves.
+                # PENALISE when market is range-bound (centrality high = bad for long vol)
+                # REWARD when strong directional signal exists (big move expected either way)
+                dir_align = 1.0 - centrality   # strong direction → high alignment for debit neutral
+            else:
+                # Credit neutral (Short Straddle/Strangle, Iron Condor/Butterfly): profit from CALM.
+                # REWARD when market is range-bound, PENALISE when strong directional signal
+                dir_align = centrality
 
         # ── Composite — calibrated blend of EV score vs directional alignment ──
         _ev_w    = _calib("ev_score_vs_dir_align")
@@ -5933,6 +5967,25 @@ padding:8px 14px;margin-bottom:8px;font-family:'IBM Plex Mono',monospace;">
                 + (f" · ~{_days_to_target}d to 50% profit" if _days_to_target else "")
             )
 
+            # ── Conflict / warning badges ────────────────────────────────────
+            _warnings = []
+            _stype = s.get("type", "")
+            # DTE mismatch warning
+            if _dte_a < 0.15:
+                _dte_lo_s = s.get("Ideal DTE", "?")
+                _warnings.append(f"⚠️ DTE mismatch — ideal {s.get('ideal_dte_lo',0)}-{s.get('ideal_dte_hi',0)}d, current {dte}d")
+            # Vol regime conflict: debit neutral in high-IV environment (better to sell)
+            if "debit" in _stype and "neutral" in _stype and ivr > 70:
+                _warnings.append("⚠️ IV Rich (IVR>70) — debit neutral strategies overpay for vol; consider credit spreads")
+            # Credit neutral when strong directional signal
+            if "credit" in _stype and "neutral" in _stype and abs(prob_score.get("raw_score", 0)) > 0.15:
+                _warnings.append("⚠️ Strong directional signal — credit neutral strategies risk large directional loss")
+            # Directional strategy against flow signal
+            if "bull" in _stype and _flow_dir < -0.3:
+                _warnings.append("⚠️ Bearish flow signal conflicts with bullish strategy")
+            if "bear" in _stype and _flow_dir > 0.3:
+                _warnings.append("⚠️ Bullish flow signal conflicts with bearish strategy")
+
             st.markdown(f"""
 <div style="background:#0d0d0d;border:1px solid #2a2a2a;{top_border}
 padding:12px 16px;margin-bottom:7px;font-family:'IBM Plex Mono',monospace;">
@@ -5958,6 +6011,7 @@ padding:12px 16px;margin-bottom:7px;font-family:'IBM Plex Mono',monospace;">
     <span style="color:#555;font-size:0.77rem;">DTE {s['Ideal DTE']}</span>
   </div>
   <div style="color:#555;font-size:0.77rem;margin-top:5px;line-height:1.5;">{_dynamic_rationale}</div>
+  {chr(10).join(f'<div style="color:#ffb347;font-size:0.74rem;margin-top:3px;">{w}</div>' for w in _warnings) if _warnings else ''}
 </div>""", unsafe_allow_html=True)
 
     else:
@@ -6046,14 +6100,14 @@ with t_chain:
             pe_iv = _sanitise_iv(float(row.PE_IV), None)
             ce_dir = "BUY" if bias_score >= 12 else "SELL" if bias_score <= -12 else "—"
             pe_dir = "BUY" if bias_score <= -12 else "SELL" if bias_score >= 12 else "—"
-            # FIX: suppress IV vol signal when actual per-strike IV is missing/zero
-            if ce_iv is None or not _has_real_iv:
+            # Suppress IV vol signal when: IV missing/zero, no real IV, or DTE=1 (structurally distorted)
+            if ce_iv is None or not _has_real_iv or dte <= 1:
                 ce_vol = "—"
             else:
                 ce_ratio = ce_iv / (hv_ref + 1e-9)
                 ce_vol = (f"SELL (rich ×{ce_ratio:.2f})"  if ce_ratio >= _rich_thresh else
                           f"BUY (cheap ×{ce_ratio:.2f})" if ce_ratio <= _cheap_thresh else "—")
-            if pe_iv is None or not _has_real_iv:
+            if pe_iv is None or not _has_real_iv or dte <= 1:
                 pe_vol = "—"
             else:
                 pe_ratio = pe_iv / (hv_ref + 1e-9)
