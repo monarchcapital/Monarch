@@ -9906,3 +9906,257 @@ flow magnitude, and signal alignment (flow + positioning + vol all pointing same
 **Confidence:** 5+ signals = indicative, 20+ = moderate, 50+ = high confidence.
 Collect signals daily for 2–3 months for statistically meaningful results.
 """)
+
+        # ══════════════════════════════════════════════════════════════
+        # STEP 8 — PROBABILITY CALIBRATION RESULTS
+        # Predicted probability ≈ Actual probability
+        # ══════════════════════════════════════════════════════════════
+        st.divider()
+        st.markdown("#### 🎯 Step 8 — Probability Calibration")
+        st.caption("Does the model's predicted P(↑) match the actual frequency of up-moves? "
+                   "A well-calibrated model has: when it says 70% bullish, the market goes up ~70% of the time.")
+
+        # Pull raw/return history from session state (symbol-namespaced)
+        _s8_raw   = _get_hist("_calib_raw_score_hist", sym)
+        _s8_ret   = _get_hist("_calib_realised_ret_hist", sym)
+        _s8_sharp = _calib("logistic_sharpness")
+        n_s8      = min(len(_s8_raw), len(_s8_ret))
+
+        c8a, c8b, c8c, c8d = st.columns(4)
+        c8a.metric("Observations",    str(n_s8),
+                   help="Paired (raw_score, realised_return) observations used for calibration")
+        c8b.metric("Logistic k",       f"{_s8_sharp:.3f}",
+                   help="Calibrated sharpness. Default=4.0. Higher=steeper prob curve. "
+                        "Learned from correlation between raw_score and forward returns.")
+        c8c.metric("Min needed",       str(_CALIB_MIN_OBS),
+                   help=f"Minimum {_CALIB_MIN_OBS} observations before sharpness overrides cold-start prior")
+        _s8_status = ("🟢 LIVE — using learned k" if n_s8 >= _CALIB_MIN_OBS
+                      else f"🟡 WARMING UP — {n_s8}/{_CALIB_MIN_OBS}")
+        c8d.metric("Status",  _s8_status)
+
+        if n_s8 >= 5:
+            # ── Reliability Diagram (Calibration Plot) ────────────────────
+            with st.expander("📊 Reliability Diagram — Predicted vs Actual Probability", expanded=True):
+                st.caption("Each point = one bucket of signals with similar predicted P(↑). "
+                           "Perfect calibration = all points on the diagonal.")
+
+                # Convert raw scores to predicted probs using current sharpness
+                _raw_arr = np.array(_s8_raw[-min(n_s8, 200):])
+                _ret_arr = np.array(_s8_ret[-min(n_s8, 200):])
+                _pred_pu = 1.0 / (1.0 + np.exp(-_s8_sharp * _raw_arr))
+                _actual_up = (_ret_arr > 0).astype(float)
+
+                # Bin into 5 buckets by predicted probability
+                _bins = [0.0, 0.35, 0.45, 0.55, 0.65, 1.0]
+                _bin_labels = ["<35%", "35-45%", "45-55%", "55-65%", ">65%"]
+                _rel_rows = []
+                for i in range(len(_bins)-1):
+                    mask = (_pred_pu >= _bins[i]) & (_pred_pu < _bins[i+1])
+                    n_bin = int(mask.sum())
+                    if n_bin == 0:
+                        continue
+                    pred_mean  = float(_pred_pu[mask].mean())
+                    actual_freq = float(_actual_up[mask].mean())
+                    _rel_rows.append({
+                        "Predicted P(↑)": _bin_labels[i],
+                        "Avg Predicted":  round(pred_mean * 100, 1),
+                        "Actual Up %":    round(actual_freq * 100, 1),
+                        "N":              n_bin,
+                        "Gap":            round((actual_freq - pred_mean) * 100, 1),
+                    })
+
+                if _rel_rows:
+                    _rel_df = pd.DataFrame(_rel_rows)
+
+                    # Plot reliability diagram
+                    fig_rel = go.Figure()
+                    # Perfect calibration line
+                    fig_rel.add_trace(go.Scatter(
+                        x=[0, 100], y=[0, 100],
+                        mode="lines", name="Perfect calibration",
+                        line=dict(color="#555", dash="dash", width=1)
+                    ))
+                    # Actual calibration points
+                    _col_pts = ["#ff3b3b" if abs(r["Gap"]) > 10 else
+                                "#ffb347" if abs(r["Gap"]) > 5 else "#00d084"
+                                for r in _rel_rows]
+                    fig_rel.add_trace(go.Scatter(
+                        x=[r["Avg Predicted"] for r in _rel_rows],
+                        y=[r["Actual Up %"] for r in _rel_rows],
+                        mode="markers+lines",
+                        name="Model calibration",
+                        marker=dict(size=[max(8, r["N"]*2) for r in _rel_rows],
+                                   color=_col_pts, line=dict(color="#fff", width=1)),
+                        line=dict(color="#ff8c00", width=1.5),
+                        text=[f"N={r['N']}, Gap={r['Gap']:+.1f}pp" for r in _rel_rows],
+                        hovertemplate="%{text}<extra></extra>"
+                    ))
+                    fig_rel.update_layout(
+                        height=300, plot_bgcolor="#000", paper_bgcolor="#000",
+                        font=dict(color="#e8e8e8", family="IBM Plex Mono", size=9),
+                        xaxis=dict(title="Predicted P(↑) %", range=[0,100], gridcolor="#111"),
+                        yaxis=dict(title="Actual Up %",       range=[0,100], gridcolor="#111"),
+                        margin=dict(t=20, b=10),
+                        legend=dict(orientation="h", y=1.08)
+                    )
+                    st.plotly_chart(fig_rel, use_container_width=True)
+
+                    # Table with gap highlighting
+                    def _gap_style(v):
+                        try:
+                            g = float(str(v).replace("+",""))
+                            if abs(g) > 10: return "color:#ff3b3b;font-weight:700"
+                            if abs(g) > 5:  return "color:#ffb347"
+                            return "color:#00d084"
+                        except Exception:
+                            return ""
+                    st.dataframe(
+                        _rel_df.style.map(_gap_style, subset=["Gap"]),
+                        use_container_width=True, hide_index=True
+                    )
+                    # Calibration verdict
+                    _max_gap = max(abs(r["Gap"]) for r in _rel_rows)
+                    if _max_gap <= 5:
+                        st.success(f"✅ Well-calibrated — max gap {_max_gap:.1f}pp. "
+                                   "Predicted probabilities closely match actual frequencies.")
+                    elif _max_gap <= 10:
+                        st.warning(f"⚠️ Moderate miscalibration — max gap {_max_gap:.1f}pp. "
+                                   "Adjust logistic sharpness (k) or collect more data.")
+                    else:
+                        st.error(f"❌ Poor calibration — max gap {_max_gap:.1f}pp. "
+                                 "The model over/underestimates probabilities significantly. "
+                                 "More data needed for auto-calibration to correct this.")
+
+            # ── Brier Score ───────────────────────────────────────────────
+            with st.expander("📐 Brier Score — Probability Forecast Accuracy", expanded=False):
+                st.caption("Brier Score = mean((predicted_prob − actual_outcome)²). "
+                           "Lower is better. Random model = 0.25. Perfect = 0.00.")
+
+                _brier = float(np.mean((_pred_pu - _actual_up) ** 2))
+                _brier_skill = 1.0 - _brier / 0.25   # skill vs random baseline
+                _brier_col = ("#00d084" if _brier < 0.20
+                              else "#ffb347" if _brier < 0.23
+                              else "#ff3b3b")
+
+                bc1, bc2, bc3 = st.columns(3)
+                bc1.metric("Brier Score",  f"{_brier:.4f}",
+                           delta=f"vs random: {0.25:.4f}",
+                           delta_color="inverse",
+                           help="Mean squared error of probability forecasts. Lower = better. Random = 0.25")
+                bc2.metric("Brier Skill",  f"{_brier_skill*100:.1f}%",
+                           help="% improvement over a random (50/50) baseline. Positive = model adds value.")
+                _log_score = float(-np.mean(
+                    _actual_up * np.log(_pred_pu + 1e-9) +
+                    (1 - _actual_up) * np.log(1 - _pred_pu + 1e-9)
+                ))
+                bc3.metric("Log Score",    f"{_log_score:.4f}",
+                           help="Binary cross-entropy. Lower is better. Random = ln(2) ≈ 0.693")
+
+                st.markdown(f"""
+<div style="font-family:'IBM Plex Mono',monospace;font-size:0.78rem;color:#555;margin-top:6px;">
+  <span style="color:{_brier_col};font-weight:700;">Brier Score {_brier:.4f}</span>
+  &nbsp;·&nbsp; n={n_s8} observations &nbsp;·&nbsp; k={_s8_sharp:.3f}
+  &nbsp;·&nbsp;
+  {'✅ Better than random' if _brier_skill > 0 else '❌ Worse than random'}
+</div>""", unsafe_allow_html=True)
+
+            # ── Sharpness Calibration History ─────────────────────────────
+            with st.expander("📈 Logistic Sharpness k — Learning Curve", expanded=False):
+                st.caption("Shows how the calibrated sharpness k has evolved. "
+                           "Starts at prior (4.0), updated as real outcomes accumulate.")
+
+                # Reconstruct what k would have been at each step using OLS
+                if n_s8 >= 10:
+                    _k_history = []
+                    for _i in range(10, n_s8 + 1):
+                        _x = np.array(_s8_raw[:_i])
+                        _y = np.array(_s8_ret[:_i])
+                        _xx = float(np.dot(_x, _x))
+                        if _xx > 1e-9:
+                            _k_ols = float(np.dot(_x, _y)) / _xx
+                            # Shrink toward prior
+                            _shrink = max(0.0, 1.0 - (_i - _CALIB_MIN_OBS) / _CALIB_WINDOW)
+                            _k_blended = (1.0 - _shrink) * _k_ols + _shrink * 4.0
+                            _k_history.append(round(max(0.5, min(20.0, _k_blended)), 4))
+                        else:
+                            _k_history.append(4.0)
+
+                    fig_k = go.Figure()
+                    fig_k.add_hline(y=4.0, line=dict(color="#555", dash="dot", width=1),
+                                    annotation_text="Prior k=4.0")
+                    fig_k.add_trace(go.Scatter(
+                        x=list(range(10, n_s8 + 1)), y=_k_history,
+                        mode="lines", name="Calibrated k",
+                        line=dict(color="#ff8c00", width=2)
+                    ))
+                    fig_k.add_hline(y=_s8_sharp,
+                                    line=dict(color="#00d084", dash="dash", width=1.5),
+                                    annotation_text=f"Current k={_s8_sharp:.3f}")
+                    fig_k.update_layout(
+                        title="Logistic Sharpness k Over Time",
+                        height=240, plot_bgcolor="#000", paper_bgcolor="#000",
+                        font=dict(color="#e8e8e8", family="IBM Plex Mono", size=9),
+                        xaxis=dict(title="Observations", gridcolor="#111"),
+                        yaxis=dict(title="k", gridcolor="#111"),
+                        margin=dict(t=40, b=10)
+                    )
+                    st.plotly_chart(fig_k, use_container_width=True)
+
+                    _k_interp = ("Sharpness above prior → model signals are more decisive than cold-start" if _s8_sharp > 4.5
+                                 else "Sharpness below prior → signals are weaker than expected, wider prob spread" if _s8_sharp < 3.5
+                                 else "Sharpness near prior → model behaving as expected")
+                    st.caption(f"Current k={_s8_sharp:.3f} · {_k_interp}")
+                else:
+                    st.caption(f"Need 10+ observations to show learning curve. Currently {n_s8}.")
+
+            # ── Predicted vs Actual Scatter ───────────────────────────────
+            with st.expander("🔍 Predicted Probability vs Actual 1d Return", expanded=False):
+                st.caption("Each point is one signal. X = model's predicted P(↑), Y = actual 1-day log return. "
+                           "Good calibration → positive correlation, points trending upward left-to-right.")
+
+                fig_scat = go.Figure()
+                _colors_scat = ["#00d084" if r > 0 else "#ff3b3b" for r in _ret_arr]
+                fig_scat.add_trace(go.Scatter(
+                    x=(_pred_pu * 100).tolist(),
+                    y=(_ret_arr * 100).tolist(),
+                    mode="markers",
+                    marker=dict(size=6, color=_colors_scat, opacity=0.7),
+                    name="Signals",
+                    hovertemplate="P(↑): %{x:.1f}%<br>Ret: %{y:.2f}%<extra></extra>"
+                ))
+                # Trend line
+                if len(_pred_pu) >= 5:
+                    _z = np.polyfit(_pred_pu, _ret_arr * 100, 1)
+                    _px = np.linspace(_pred_pu.min(), _pred_pu.max(), 50)
+                    _py = np.polyval(_z, _px)
+                    fig_scat.add_trace(go.Scatter(
+                        x=(_px * 100).tolist(), y=_py.tolist(),
+                        mode="lines", name="Trend",
+                        line=dict(color="#ff8c00", width=1.5, dash="dot")
+                    ))
+                    _corr = float(np.corrcoef(_pred_pu, _ret_arr)[0, 1])
+                    _corr_col = "#00d084" if _corr > 0.1 else "#ff3b3b" if _corr < -0.1 else "#888"
+
+                fig_scat.add_hline(y=0, line=dict(color="#333", width=1))
+                fig_scat.add_vline(x=50, line=dict(color="#333", width=1))
+                fig_scat.update_layout(
+                    height=280, plot_bgcolor="#000", paper_bgcolor="#000",
+                    font=dict(color="#e8e8e8", family="IBM Plex Mono", size=9),
+                    xaxis=dict(title="Predicted P(↑) %", gridcolor="#111", range=[20, 80]),
+                    yaxis=dict(title="Actual 1d Return %", gridcolor="#111"),
+                    margin=dict(t=20, b=10)
+                )
+                st.plotly_chart(fig_scat, use_container_width=True)
+
+                if len(_pred_pu) >= 5:
+                    st.markdown(
+                        f"Correlation: <span style='color:{_corr_col};font-weight:700;font-family:monospace;'>"
+                        f"{_corr:+.3f}</span> "
+                        f"({'positive — model direction aligns with returns' if _corr > 0.05 else 'negative — model may need recalibration' if _corr < -0.05 else 'near zero — no directional correlation yet'})",
+                        unsafe_allow_html=True
+                    )
+
+        else:
+            st.info(f"ℹ️ Probability calibration requires at least 5 paired (score, return) observations. "
+                    f"Currently {n_s8}. These accumulate automatically with daily use — "
+                    "each Load records a snapshot and resolves it after 4 trading days.")
