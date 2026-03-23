@@ -284,8 +284,12 @@ def _save_hist():
                 k.startswith("_oi_snap_") or
                 k.startswith("_calib_intra_") or
                 (":_calib_" in k) or
-                k == "opt_factor_hist" or       # FIX: factor weight correlation histories
-                k == "_flow_skew_oi_hist"):     # FIX: OI skew history for z-score baseline
+                k == "opt_factor_hist" or         # FIX: factor weight correlation histories
+                k == "_flow_skew_oi_hist" or      # FIX: OI skew history for z-score baseline
+                k == "_fhist_last_load_id" or     # FIX: factor hist load guard
+                k == "_last_recorded_load_id" or  # FIX: prob_up record guard
+                k == "_last_outcome_load_id" or   # FIX: outcome record guard
+                k == "_flow_fii_hist"):            # FII/DII signal history
                 if isinstance(v, (list, dict)):
                     out[k] = v
         with open(_HIST_FILE, "w") as f:
@@ -660,6 +664,19 @@ def _record(key: str, val: float, symbol: str = None):
     if len(hist) > _CALIB_WINDOW:
         hist = hist[-_CALIB_WINDOW:]
     st.session_state[ns_key] = hist
+
+def _record_if_load(key: str, val: float, symbol: str = None):
+    """Record only on genuine Load clicks (not every Streamlit re-render).
+    Checks opt_load_id against _last_recorded_load_id before calling _record.
+    Use this for all _record() calls inside functions that run every render
+    (compute_probabilistic_score, ev_rank_strategies, etc.).
+    The final prob_up/raw_score records in PART 8 are exempt — they have
+    their own guard that also updates _last_recorded_load_id.
+    """
+    _cur  = st.session_state.get("opt_load_id", 0)
+    _last = st.session_state.get("_last_recorded_load_id", -1)
+    if _cur != _last:
+        _record(key, val, symbol)
 
 
 def _get_hist(key: str, symbol: str = "") -> list:
@@ -1594,6 +1611,1118 @@ def strikes_around(spot, step, n=6):
     atm = atm_strike(spot, step)
     return [round(atm + i * step, 2) for i in range(-n, n+1)]
 
+def _clear_api_caches():
+    """Clear all Upstox @st.cache_data caches.
+    Must be called AFTER all cached functions are defined (not at module top-level
+    where the functions don't exist yet).  Called once per session whenever the
+    access token changes (flag set by the sidebar token widget).
+    """
+    fetch_option_chain.clear()
+    fetch_expiries.clear()
+    fetch_upstox_candles.clear()
+    fetch_upstox_intraday_candles.clear()
+
+# Execute any pending cache clear that was requested by the sidebar token widget
+# (which runs before the cached functions were defined).
+if st.session_state.pop("_pending_cache_clear", False):
+    _clear_api_caches()
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_fii_dii_data() -> dict:
+    """Fetch FII/DII cash market net activity from NSE India.
+    Published daily after 18:00 IST. Cached 1 hour.
+    FII net = leading directional signal for Nifty (drives ~60% of index moves).
+    DII net = lagging/counter-cyclical (domestic funds absorb FII selling).
+    Returns normalised signals in [-1,+1] for use in the flow factor.
+    """
+    result = {
+        "fii_net_crore": 0.0, "dii_net_crore": 0.0, "combined_net": 0.0,
+        "fii_hist": [], "dii_hist": [],
+        "fii_3d_avg": 0.0,
+        "fii_signal": 0.0, "dii_signal": 0.0, "combined_signal": 0.0,
+        "source_date": "", "data_available": False,
+    }
+    try:
+        hdrs = {
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/120.0.0.0 Safari/537.36"),
+            "Accept":          "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer":         "https://www.nseindia.com/",
+        }
+        sess = requests.Session()
+        # NSE requires a valid browser session cookie before API calls
+        sess.get("https://www.nseindia.com/", headers=hdrs, timeout=10)
+        resp = sess.get("https://www.nseindia.com/api/fiidiiTradeReact",
+                        headers=hdrs, timeout=12)
+        if resp.status_code != 200:
+            return result
+        data = resp.json()
+        if not data or not isinstance(data, list):
+            return result
+
+        fii_hist, dii_hist, dates = [], [], []
+        for entry in data[-10:]:
+            try:
+                def _parse_crore(v):
+                    return float(str(v).replace(",", "").replace("\u2212", "-").replace("−", "-").strip() or "0")
+                # NSE uses various key names across API versions
+                fv = _parse_crore(entry.get("fii_index_net",
+                     entry.get("fiiIndexNet",
+                     entry.get("fii_net", entry.get("netPurchaseSalesFII", 0)))))
+                dv = _parse_crore(entry.get("dii_index_net",
+                     entry.get("diiIndexNet",
+                     entry.get("dii_net", entry.get("netPurchaseSalesDII", 0)))))
+                fii_hist.append(fv)
+                dii_hist.append(dv)
+                dates.append(str(entry.get("date", entry.get("trade_date",
+                                entry.get("Date", "")))))
+            except Exception:
+                continue
+
+        if not fii_hist:
+            return result
+
+        fii_today = float(fii_hist[-1])
+        dii_today = float(dii_hist[-1])
+        fii_3d    = float(np.mean(fii_hist[-3:])) if len(fii_hist) >= 3 else fii_today
+
+        def _z_to_signal(hist, current):
+            arr = np.array(hist, dtype=float)
+            if len(arr) < 3:
+                # Cold-start: tanh-normalise vs magnitude
+                scale = max(abs(float(np.mean(np.abs(arr)))) if len(arr) > 0 else 1000.0, 500.0)
+                return float(max(-1.0, min(1.0, math.tanh(current / scale))))
+            mu = float(arr.mean()); sd = float(arr.std())
+            sd = max(sd, abs(mu) * 0.05 + 500.0)  # floor: never divide by near-zero
+            return float(max(-1.0, min(1.0, (current - mu) / sd / 2.0)))
+
+        fii_sig  = _z_to_signal(fii_hist, fii_today)
+        dii_sig  = _z_to_signal(dii_hist, dii_today)
+        # FII 70% weight (leads), DII 30% (counter-cyclical, lower predictive value)
+        comb_sig = round(0.70 * fii_sig + 0.30 * dii_sig, 4)
+
+        result.update({
+            "fii_net_crore":   round(fii_today, 1),
+            "dii_net_crore":   round(dii_today, 1),
+            "combined_net":    round(fii_today + dii_today, 1),
+            "fii_hist":        [round(v,1) for v in fii_hist],
+            "dii_hist":        [round(v,1) for v in dii_hist],
+            "fii_3d_avg":      round(fii_3d, 1),
+            "fii_signal":      round(fii_sig,  4),
+            "dii_signal":      round(dii_sig,  4),
+            "combined_signal": comb_sig,
+            "source_date":     dates[-1] if dates else "",
+            "data_available":  True,
+        })
+    except Exception:
+        pass  # FII/DII is a bonus signal — never block main flow on failure
+    return result
+
+
+
+
+def get_ohlcv(symbol: str, token: str, master_df=None) -> pd.DataFrame:
+    """Get daily OHLCV. Tries Upstox historical API first, then yfinance.
+    Returns DataFrame with columns: date, open, high, low, close, volume.
+    1 year of daily data for volatility, drift, and calibration computation.
+    """
+    # ── Primary: Upstox historical candles ──────────────────────────────────
+    if token:
+        _mdf = master_df if master_df is not None else load_fno_master()
+        ikey = _upstox_instrument_key_for_ohlcv(symbol, _mdf)
+        if ikey:
+            df_up = fetch_upstox_candles(token, ikey, interval="day", days=365)
+            if not df_up.empty and len(df_up) >= 20:
+                return df_up
+
+    # ── Fallback: yfinance ───────────────────────────────────────────────────
+    yftick = YF_TICKERS.get(symbol.upper(), f"{symbol.upper()}.NS")
+    try:
+        d = yf.download(yftick, period="1y", interval="1d", progress=False, auto_adjust=True)
+        if not d.empty:
+            d = d.copy()
+            # Handle MultiIndex columns from yfinance 0.2+ (e.g. ('Close','NSEI'))
+            if isinstance(d.columns, pd.MultiIndex):
+                # Drop ticker level — keep only the price-type level
+                d.columns = [c[0].lower() if isinstance(c, tuple) else str(c).lower()
+                             for c in d.columns]
+            else:
+                d.columns = [str(c).lower() for c in d.columns]
+            d = d.reset_index()
+            # After reset_index, date is in 'date' or 'datetime' or 'index' depending on version
+            d.columns = [str(c).lower() for c in d.columns]
+            # Normalise date column name to 'date'
+            for _dc in ("datetime", "index", "date"):
+                if _dc in d.columns and _dc != "date":
+                    d = d.rename(columns={_dc: "date"})
+                    break
+            # Ensure required columns exist
+            if "close" not in d.columns:
+                return pd.DataFrame()
+            # FIX: yfinance lags by 1 day during market hours — no today's candle yet.
+            # Append a synthetic today row using live spot so EMAs/HV are current.
+            _live_spot = st.session_state.get("opt_spot", 0.0)
+            _today     = datetime.now().date()
+            if "date" in d.columns:
+                _last_d = pd.to_datetime(d["date"].iloc[-1]).date()
+            else:
+                _last_d = _today
+            if _live_spot > 0 and _last_d < _today:
+                _today_row = pd.DataFrame([{
+                    "date": _today, "open": _live_spot, "high": _live_spot,
+                    "low": _live_spot, "close": _live_spot, "volume": 0.0,
+                }])
+                d = pd.concat([d, _today_row], ignore_index=True)
+            return d
+    except Exception as e:
+        st.warning(f"⚠️ yfinance OHLCV failed for {symbol} ({yftick}): {e}")
+    return pd.DataFrame()
+
+
+def get_intraday_ohlcv(symbol: str, token: str,
+                        interval: str = "5minute",
+                        master_df=None) -> pd.DataFrame:
+    """Get today's intraday OHLCV candles from Upstox.
+    Returns DataFrame with columns: datetime, open, high, low, close, volume.
+    Returns empty DataFrame outside market hours or on API error.
+    """
+    if not token:
+        return pd.DataFrame()
+    _mdf = master_df if master_df is not None else load_fno_master()
+    ikey = _upstox_instrument_key_for_ohlcv(symbol, _mdf)
+    if not ikey:
+        return pd.DataFrame()
+    return fetch_upstox_intraday_candles(token, ikey, interval=interval)
+
+
+# ============================================================
+# INTRADAY SIGNAL COMPUTATION
+# ============================================================
+
+def compute_intraday_signals(intraday_df: pd.DataFrame,
+                              chain_df: pd.DataFrame,
+                              spot: float) -> dict:
+    """Derive intraday behavioural signals from live 5-minute candles + chain.
+
+    Signals computed:
+      opening_momentum  — first 30-min directional move (opening auction bias)
+      vwap_position     — spot vs VWAP (above = bullish intraday flow)
+      intraday_range_pct— today's range as % of spot (realised volatility so far)
+      volume_acceleration — current 30-min volume vs session average (flow surge detector)
+      oi_build_direction  — OI change sign: CE OI rising faster than PE = bearish flow
+      price_structure     — higher highs / lower lows intraday (momentum confirmation)
+      lunch_reversal      — post-12:30 reversal vs opening direction
+
+    Returns dict with each signal ∈ [-1, +1] and composite intraday_score.
+    """
+    result = {
+        "opening_momentum":    0.0,
+        "vwap_position":       0.0,
+        "intraday_range_pct":  0.0,
+        "volume_acceleration": 0.0,
+        "oi_build_direction":  0.0,
+        "price_structure":     0.0,
+        "lunch_reversal":      0.0,
+        "intraday_score":      0.0,
+        "intraday_available":  False,
+        "vwap":                spot,
+        "session_high":        spot,
+        "session_low":         spot,
+        "candles_so_far":      0,
+    }
+
+    if intraday_df is None or intraday_df.empty or len(intraday_df) < CFG["intra_min_candles"]:
+        return result
+
+    df = intraday_df.copy()
+    result["intraday_available"] = True
+    result["candles_so_far"] = len(df)
+
+    # ── VWAP — volume-weighted average price ─────────────────────────────────
+    df["typical"] = (df["high"] + df["low"] + df["close"]) / 3.0
+    total_vol = float(df["volume"].sum())
+    if total_vol > 0:
+        vwap = float((df["typical"] * df["volume"]).sum() / total_vol)
+    else:
+        vwap = float(df["close"].mean())
+    result["vwap"] = round(vwap, 2)
+
+    session_high = float(df["high"].max())
+    session_low  = float(df["low"].min())
+    result["session_high"] = round(session_high, 2)
+    result["session_low"]  = round(session_low, 2)
+    intra_range  = session_high - session_low
+    if intra_range > 0:
+        vwap_pos = (spot - vwap) / (intra_range / 2.0 + 1e-9)
+        result["vwap_position"] = round(max(-1.0, min(1.0, vwap_pos)), 4)
+
+    # ── Opening momentum — configurable window from CFG ───────────────────────
+    _oc = CFG["intra_opening_candles"]
+    opening_candles = df.head(_oc)
+    if len(opening_candles) >= 2:
+        open_price  = float(opening_candles.iloc[0]["open"])
+        close_open  = float(opening_candles.iloc[-1]["close"])
+        if open_price > 0 and intra_range > 0:
+            open_move     = (close_open - open_price) / open_price
+            open_momentum = open_move / (intra_range / spot + 1e-9)
+            result["opening_momentum"] = round(max(-1.0, min(1.0, open_momentum)), 4)
+
+    # ── Intraday range % ─────────────────────────────────────────────────────
+    result["intraday_range_pct"] = round(intra_range / spot * 100, 3) if spot > 0 else 0.0
+
+    # ── Volume acceleration — configurable recent window ─────────────────────
+    _rc = CFG["intra_recent_candles"]
+    _mv = CFG["intra_min_candles_vol"]
+    session_avg_vol = float(df["volume"].mean())
+    if session_avg_vol > 0 and len(df) >= _mv:
+        recent_vol  = float(df.tail(_rc)["volume"].mean())
+        vol_accel   = (recent_vol - session_avg_vol) / (session_avg_vol + 1e-9)
+        result["volume_acceleration"] = round(max(-1.0, min(1.0, vol_accel)), 4)
+
+    # ── Price structure — configurable early/late window ─────────────────────
+    _sc = CFG["intra_structure_candles"]
+    _ms = CFG["intra_min_candles_struct"]
+    if len(df) >= _ms:
+        early_high = float(df.head(_sc)["high"].mean())
+        late_high  = float(df.tail(_sc)["high"].mean())
+        early_low  = float(df.head(_sc)["low"].mean())
+        late_low   = float(df.tail(_sc)["low"].mean())
+        if intra_range > 0:
+            hh_score = (late_high - early_high) / (intra_range + 1e-9)
+            ll_score = (early_low  - late_low)  / (intra_range + 1e-9)
+            price_struct = (hh_score + ll_score) / 2.0
+            result["price_structure"] = round(max(-1.0, min(1.0, price_struct)), 4)
+
+    # ── Lunch-hour reversal — configurable candle indices from CFG ───────────
+    _lm  = CFG["intra_min_candles_lunch"]
+    _lcs = CFG["intra_lunch_candle_start"]   # pre-lunch candle index
+    _lcm = CFG["intra_lunch_candle_morn"]    # morning close candle index
+    if len(df) >= _lm:
+        morning_close   = float(df.iloc[_lcm]["close"])
+        prelunch_close  = float(df.iloc[_lcs]["close"])
+        postlunch_close = float(df.tail(1)["close"].values[0])
+        open_p          = float(df.iloc[0]["open"])
+        if open_p > 0 and intra_range > 0:
+            morning_dir   = (morning_close - open_p)           / (intra_range + 1e-9)
+            postlunch_dir = (postlunch_close - prelunch_close) / (intra_range + 1e-9)
+            lunch_rev = postlunch_dir * (-1 if morning_dir * postlunch_dir < 0 else 1)
+            result["lunch_reversal"] = round(max(-1.0, min(1.0, lunch_rev)), 4)
+
+    # ── OI build direction from chain ─────────────────────────────────────────
+    # CE OI change vs PE OI change: net call build = bearish, net put build = bullish
+    if chain_df is not None and not chain_df.empty:
+        try:
+            ce_oic = float(chain_df["CE_OIC"].sum())
+            pe_oic = float(chain_df["PE_OIC"].sum())
+            total_oic = abs(ce_oic) + abs(pe_oic)
+            if total_oic > 0:
+                # More put OI building = bullish (put sellers adding support)
+                # More call OI building = bearish (call sellers capping upside)
+                oi_dir = (pe_oic - ce_oic) / (total_oic + 1e-9)
+                result["oi_build_direction"] = round(max(-1.0, min(1.0, oi_dir)), 4)
+        except Exception:
+            pass
+
+    # ── Composite intraday score ──────────────────────────────────────────────
+    # Weights derived from empirical importance for NSE intraday:
+    # Opening momentum and VWAP position are strongest intraday signals.
+    # OI build direction and volume acceleration are secondary.
+    # Price structure and lunch reversal are tertiary.
+    # All weights are calibrated in _run_calibration_cycle if history is available.
+    _iw = {
+        "opening_momentum":    _calib("intra_w_opening_momentum"),
+        "vwap_position":       _calib("intra_w_vwap_position"),
+        "volume_acceleration": _calib("intra_w_volume_acceleration"),
+        "oi_build_direction":  _calib("intra_w_oi_build"),
+        "price_structure":     _calib("intra_w_price_structure"),
+        "lunch_reversal":      _calib("intra_w_lunch_reversal"),
+    }
+    total_w = sum(_iw.values())
+    if total_w < 1e-9:
+        total_w = 1.0
+
+    intra_composite = sum(
+        (_iw[k] / total_w) * result.get(k, 0.0)
+        for k in _iw
+    )
+    result["intraday_score"] = round(max(-1.0, min(1.0, intra_composite)), 4)
+
+    # Record signals for calibration
+    for k in _iw:
+        _record_if_load(f"_calib_intra_{k}_hist", result.get(k, 0.0))
+
+    return result
+
+
+def compute_hv(close_series, window=20):
+    """Annualised historical vol using CFG['ann_days'] (252 trading days)."""
+    lr = np.log(close_series / close_series.shift(1)).dropna()
+    if len(lr) < window: return None
+    return float(lr.tail(window).std() * np.sqrt(CFG["ann_days"]))
+# ============================================================
+# DIRECTIONAL ANALYSIS — 7-FACTOR MODEL
+# ============================================================
+
+def compute_flow_scores(chain_df, ohlcv_df):
+    """Compute LEADING flow signals from delta-changes in positioning metrics.
+
+    For 1–5 day prediction, CHANGES matter more than levels.
+    A PCR moving from 1.2→1.5 is more predictive than PCR=1.5 in isolation.
+
+    Signals and their directional encoding:
+      dIV    (signed): rising IV → institutions buying options → bearish for underlying longs
+                        falling IV → dealers covering shorts → bullish
+      dOI    (signed): rising OI + price rising = bullish (fresh longs)
+                        rising OI + price falling = bearish (fresh shorts)
+                        Note: without price context, use magnitude only (neutral sign)
+      dPCR   (signed): RISING put/call ratio = MORE puts being written = BULLISH (support)
+                        FALLING put/call ratio = puts being closed or calls written = BEARISH
+      dSkew  (signed): steepening skew (put IV > call IV widening) = downside fear = BEARISH
+                        flattening/reversing skew = complacency = BULLISH
+      dGEX   (signed): GEX rising = dealers buying more = range-bound / vol-suppressed
+                        GEX falling = dealers selling = directional move coming
+
+    Returns dict with each delta z-score in [-1, +1] and a composite flow_score.
+    """
+    flow = {
+        "dIV": 0.0, "dOI": 0.0, "dPCR": 0.0,
+        "dSkew": 0.0, "dGEX": 0.0,
+        "dFII": 0.0,             # FII/DII institutional net flow signal
+        "flow_score": 0.0,
+        "flow_magnitude": 0.0,   # abs(flow_score) — conviction level
+    }
+    if chain_df is None or chain_df.empty:
+        return flow
+
+    try:
+        # ── dIV: Change in ATM IV vs 5-session average ──────────────────────────
+        # Rising IV = institutions buying options = protective hedging = bearish for spot
+        # Falling IV = fear unwind = bullish for spot
+        iv_hist  = st.session_state.get("opt_iv_history", {})
+        sym_hist = iv_hist.get(st.session_state.get("opt_symbol", ""), [])
+        if len(sym_hist) >= 5:
+            cur_iv   = float(sym_hist[-1])
+            avg_5    = float(np.mean(sym_hist[-5:]))
+            std_5    = float(np.std(sym_hist[-5:])) if len(sym_hist) >= 5 else (avg_5 * _calib("std_floor_frac"))
+            std_5    = max(std_5, avg_5 * (_calib("std_floor_frac") * 0.2))  # floor at fraction of avg
+            dIV_raw  = (cur_iv - avg_5) / (std_5 + 1e-9)    # z-score of IV change
+            # Encode: rising IV = bearish for longs → negative score
+            flow["dIV"] = round(max(-1.0, min(1.0, -dIV_raw / 2.0)), 3)
+
+        # ── dOI: Change in total chain open interest ─────────────────────────────
+        # OI build-up signals fresh positioning — a large OI surge means new bets are placed
+        # Net direction unknown from OI alone → use PCR shift to determine lean
+        total_oi = float(chain_df["CE_OI"].sum() + chain_df["PE_OI"].sum())
+        _oi_hist = st.session_state.get("_flow_oi_hist", [])
+        _oi_hist.append(total_oi)
+        if len(_oi_hist) > 30: _oi_hist = _oi_hist[-30:]  # FIX: was 10; 30 gives stable z-score baseline
+        st.session_state["_flow_oi_hist"] = _oi_hist
+        if len(_oi_hist) >= 5:
+            oi_arr   = np.array(_oi_hist)
+            oi_mu    = float(np.mean(oi_arr[:-1]))
+            oi_std   = float(np.std(oi_arr[:-1])) or (oi_mu * _calib("std_floor_frac"))
+            dOI_z    = (total_oi - oi_mu) / (oi_std + 1e-9)
+            # FIX: dOI gets direction from dPCR sign (put growth=bullish, call growth=bearish).
+            # Rising OI alone is ambiguous: new longs OR new shorts.
+            # dPCR tells us which side is growing; its sign orients the OI surge.
+            # When dPCR is not yet available, treat as unsigned conviction boost only.
+            _dPCR_sign = math.copysign(1.0, flow.get("dPCR", 0.0)) if flow.get("dPCR", 0.0) != 0 else 0.0
+            dOI_directed = dOI_z * _dPCR_sign if _dPCR_sign != 0 else abs(dOI_z)
+            flow["dOI"] = round(max(-1.0, min(1.0, dOI_directed / 2.0)), 3)
+
+        # ── dPCR: Change in put/call ratio ───────────────────────────────────────
+        # RISING PCR (more puts being added) = put writers providing support = BULLISH
+        # FALLING PCR (puts being closed or calls added) = hedgers exiting = BEARISH
+        ce_oi    = float(chain_df["CE_OI"].sum())
+        pe_oi    = float(chain_df["PE_OI"].sum())
+        pcr_now  = pe_oi / (ce_oi + 1e-9)
+        _pcr_hist = st.session_state.get("_flow_pcr_hist", [])
+        _pcr_hist.append(pcr_now)
+        if len(_pcr_hist) > 30: _pcr_hist = _pcr_hist[-30:]  # FIX: was 10
+        st.session_state["_flow_pcr_hist"] = _pcr_hist
+        if len(_pcr_hist) >= 5:
+            pcr_arr  = np.array(_pcr_hist)
+            pcr_mu   = float(np.mean(pcr_arr[:-1]))
+            pcr_std  = float(np.std(pcr_arr[:-1])) or (pcr_mu * _calib("std_floor_frac"))
+            dPCR_z   = (pcr_now - pcr_mu) / (pcr_std + 1e-9)
+            # Rising PCR = more put writing = bullish support → POSITIVE directional score
+            flow["dPCR"] = round(max(-1.0, min(1.0, dPCR_z / 2.0)), 3)
+
+        # ── dSkew: Change in IV skew (OTM put IV minus OTM call IV) ─────────────
+        # Steepening put skew = downside hedging demand = BEARISH
+        # Flattening / reversal = complacency or call-buying = BULLISH
+        _spot = st.session_state.get("opt_spot", 0)
+        _step = st.session_state.get("opt_step", 50)
+        if _spot > 0 and _step > 0:
+            atm_k      = atm_strike(_spot, _step)
+            otm_ce_row = chain_df[(chain_df.Strike - (atm_k + _step)).abs() < 0.5]
+            otm_pe_row = chain_df[(chain_df.Strike - (atm_k - _step)).abs() < 0.5]
+            if not otm_ce_row.empty and not otm_pe_row.empty:
+                ce_iv_now  = _sanitise_iv(float(otm_ce_row.CE_IV.values[0]), 0) or 0.0
+                pe_iv_now  = _sanitise_iv(float(otm_pe_row.PE_IV.values[0]), 0) or 0.0
+                skew_now   = (pe_iv_now - ce_iv_now) if (ce_iv_now > 0 and pe_iv_now > 0) else 0.0
+                _skew_hist = st.session_state.get("_flow_skew_hist", [])
+                _skew_hist.append(skew_now)
+                if len(_skew_hist) > 30: _skew_hist = _skew_hist[-30:]  # FIX: was 10
+                st.session_state["_flow_skew_hist"] = _skew_hist
+                if len(_skew_hist) >= 5:
+                    sk_arr   = np.array(_skew_hist)
+                    sk_mu    = float(np.mean(sk_arr[:-1]))
+                    sk_std   = float(np.std(sk_arr[:-1])) or (_calib("std_floor_frac") * 0.1)
+                    dSkew_z  = (skew_now - sk_mu) / (sk_std + 1e-9)
+                    # Steepening skew = more put demand = bearish → NEGATIVE score
+                    flow["dSkew"] = round(max(-1.0, min(1.0, -dSkew_z / 2.0)), 3)
+
+        # ── dGEX: Change in net gamma exposure ───────────────────────────────────
+        # Rising GEX = dealers long gamma = price pinning = range-bound
+        # Falling GEX = dealers short gamma = price trending = vol expansion
+        # For directional: falling GEX + price trend = amplified move
+        _gex_hist = st.session_state.get("_flow_gex_hist", [])
+        oi_d_cur  = st.session_state.get("opt_oi", {})
+        gex_now   = float(oi_d_cur.get("net_gex", 0) or 0)
+        if gex_now != 0:   # only track when we have real GEX data
+            _gex_hist.append(gex_now)
+            if len(_gex_hist) > 30: _gex_hist = _gex_hist[-30:]  # FIX: was 10
+            st.session_state["_flow_gex_hist"] = _gex_hist
+            if len(_gex_hist) >= 5:
+                gex_arr  = np.array(_gex_hist)
+                gex_mu   = float(np.mean(gex_arr[:-1]))
+                gex_std  = float(np.std(gex_arr[:-1])) or (abs(gex_mu) * 0.1 + 1e-9)
+                dGEX_z   = (gex_now - gex_mu) / (gex_std + 1e-9)
+                flow["dGEX"] = round(max(-1.0, min(1.0, -dGEX_z / 2.0)), 3)
+
+        # ── Track FII signal history for weight-learning ──────────────────────
+        # Store each session's FII signal so _compute_flow_weights can correlate
+        # with forward returns to learn the optimal FII weight adaptively.
+        _fii_sig_now = flow.get("dFII", 0.0)
+        _fii_hist_store = st.session_state.get("_flow_fii_hist", [])
+        _fii_hist_store.append(_fii_sig_now)
+        if len(_fii_hist_store) > 30: _fii_hist_store = _fii_hist_store[-30:]
+        st.session_state["_flow_fii_hist"] = _fii_hist_store
+
+        # ── dFII: FII/DII institutional cash market net flow ──────────────────────
+        # FII net buying in cash market = bullish signal for Nifty F&O.
+        # FII net selling = bearish. DII is counter-cyclical (weaker signal).
+        # This is the most reliable leading indicator for 1-5 day Nifty direction.
+        # Data is T+0 (same day after ~18:00 IST) or T-1 if fetched before close.
+        _fii_data = st.session_state.get("opt_fii_dii", {})
+        if _fii_data.get("data_available"):
+            flow["dFII"] = round(float(_fii_data.get("combined_signal", 0.0)), 3)
+        else:
+            flow["dFII"] = 0.0
+
+        # ── Composite FLOW SCORE (data-driven weights) ────────────────────────
+        # fixed fallback weights (FII added at 15%, others scaled down proportionally):
+        _fw_fallback = {
+            "dPCR": 0.30, "dSkew": 0.25, "dIV": 0.17, "dOI": 0.08,
+            "dGEX": 0.05, "dFII": 0.15,
+        }
+        signal_keys = ["dPCR", "dSkew", "dIV", "dOI", "dGEX", "dFII"]
+
+        def _compute_flow_weights(ohlcv_df_local, horizon=4):
+            """Return dict of normalised abs-correlation weights for each flow signal.
+            horizon: forecast horizon in sessions (default 4 ≈ 1 trading week).
+            Requires ≥10 aligned observations; otherwise returns fallback weights.
+            """
+            try:
+                if ohlcv_df_local is None or ohlcv_df_local.empty or len(ohlcv_df_local) < horizon + 10:
+                    return _fw_fallback.copy()
+
+                c_local = ohlcv_df_local["close"].astype(float).reset_index(drop=True)
+                # Forward log return: return realised horizon sessions later
+                fwd_ret = np.log(c_local.shift(-horizon) / c_local).dropna().values
+
+                # Retrieve signal histories aligned to the same sessions
+                hist_map = {
+                    "dIV":   st.session_state.get("opt_iv_history", {}).get(
+                                 st.session_state.get("opt_symbol", ""), []),
+                    "dPCR":  st.session_state.get("_flow_pcr_hist",  []),
+                    "dSkew": st.session_state.get("_flow_skew_hist", []),
+                    "dOI":   st.session_state.get("_flow_oi_hist",   []),
+                    "dGEX":  st.session_state.get("_flow_gex_hist",  []),
+                    "dFII":  st.session_state.get("_flow_fii_hist",  []),
+                }
+
+                raw_weights = {}
+                for sig_k in signal_keys:
+                    hist = np.array(hist_map[sig_k], dtype=float)
+                    n_common = min(len(hist), len(fwd_ret))
+                    if n_common < 10:
+                        raw_weights[sig_k] = _fw_fallback[sig_k]  # not enough data
+                        continue
+                    # Align: use the most-recent n_common observations
+                    sig_aligned = hist[-n_common:]
+                    ret_aligned = fwd_ret[-n_common:]
+                    # Compute Pearson correlation; use abs value for weight
+                    if np.std(sig_aligned) < 1e-9 or np.std(ret_aligned) < 1e-9:
+                        raw_weights[sig_k] = _fw_fallback[sig_k]
+                        continue
+                    corr = float(np.corrcoef(sig_aligned, ret_aligned)[0, 1])
+                    if np.isnan(corr):
+                        corr = 0.0
+                    raw_weights[sig_k] = abs(corr)
+
+                total_w = sum(raw_weights.values())
+                if total_w < 1e-9:
+                    return _fw_fallback.copy()
+                return {k: v / total_w for k, v in raw_weights.items()}
+
+            except Exception:
+                return _fw_fallback.copy()
+
+        _flow_weights = _compute_flow_weights(
+            st.session_state.get("opt_ohlcv_df", None)
+        )
+
+        fs_composite = sum(_flow_weights.get(k, _fw_fallback[k]) * flow.get(k, 0.0)
+                           for k in signal_keys)
+        flow["flow_score"]      = round(max(-1.0, min(1.0, fs_composite)), 3)
+        flow["flow_magnitude"]  = round(abs(fs_composite), 3)
+        flow["flow_weights"]    = {k: round(v, 4) for k, v in _flow_weights.items()}
+
+    except Exception:
+        pass
+
+    return flow
+
+
+def directional_bias(df, ltp, chain_df=None):
+    """Directional bias model — fully adaptive, no magic scaling constants.
+
+    Every sub-signal is converted to a z-score (from its own rolling history)
+    or a percentile rank within the current data series, then clamped to [-1, +1].
+
+    Five independent factor groups (zero multicollinearity by design):
+      TREND       (weight 0.30): EMA structure + ADX percentile
+      MOMENTUM    (weight 0.25): RSI z-score + 5-day return z-score
+      VOLATILITY  (weight 0.15): ATR percentile + BB width percentile (regime signal)
+      POSITIONING (weight 0.20): PCR percentile + OI skew + max pain distance / EM
+      REL STRENGTH(weight 0.10): stock vs Nifty z-score (from session state)
+
+    Each factor score ∈ [-1, +1]; final score = weighted sum ∈ [-1, +1].
+    Displayed as –100 to +100 for UI compatibility.
+    """
+    if df.empty or len(df) < 50:
+        return {"bias": "NEUTRAL", "score": 0, "factors": {}, "rsi": 50, "macd_hist": 0,
+                "bb_pct": 50, "vol_ratio": 1, "atr_pct": 1.5,
+                "e9": ltp, "e20": ltp, "e50": ltp, "atr": _atr_seed(ltp),
+                "flow": {}, "adx": 0.0}
+
+    c = df["close"].astype(float)
+    h = df["high"].astype(float)
+    l = df["low"].astype(float)
+    v = df["volume"].astype(float)
+
+    # ── Common series ────────────────────────────────────────────────────────
+    e9   = c.ewm(span=9,   adjust=False).mean()
+    e20  = c.ewm(span=20,  adjust=False).mean()
+    e50  = c.ewm(span=50,  adjust=False).mean()
+    e200 = c.ewm(span=200, adjust=False).mean()
+
+    tr    = pd.concat([h - l, (h - c.shift(1)).abs(), (l - c.shift(1)).abs()], axis=1).max(axis=1)
+    atr14 = tr.ewm(span=14, adjust=False).mean()
+    atrv  = float(atr14.iloc[-1])
+    if ltp > 0: _record("_calib_atr_pct_hist", atrv / ltp)
+
+    e9v   = float(e9.iloc[-1])
+    e20v  = float(e20.iloc[-1])
+    e50v  = float(e50.iloc[-1])
+    e200v = float(e200.iloc[-1]) if len(c) >= 200 else ltp
+
+    # ── ADX (14-period Wilder) ───────────────────────────────────────────────
+    up_move   = h - h.shift(1)
+    down_move = l.shift(1) - l
+    dm_p = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=c.index)
+    dm_m = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=c.index)
+    di_p = 100 * dm_p.ewm(alpha=1/14, adjust=False).mean() / (atr14 + 1e-9)
+    di_m = 100 * dm_m.ewm(alpha=1/14, adjust=False).mean() / (atr14 + 1e-9)
+    dx   = 100 * (di_p - di_m).abs() / (di_p + di_m + 1e-9)
+    adx_series = dx.ewm(alpha=1/14, adjust=False).mean().dropna()
+    adx_val    = float(adx_series.iloc[-1])
+    adx_dir    = 1.0 if float(di_p.iloc[-1]) > float(di_m.iloc[-1]) else -1.0
+    # ADX percentile within its own history (no fixed 25 threshold)
+    adx_pct    = _percentile_score(adx_series.values, adx_val)  # 0–1
+
+    # ── RSI ─────────────────────────────────────────────────────────────────
+    delta = c.diff()
+    gain  = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+    loss  = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
+    rs_raw = gain / loss.replace(0, float('nan'))
+    rsi_series = (100 - 100 / (1 + rs_raw)).fillna(
+        gain.apply(lambda g: 100.0 if g > 0 else 0.0))
+    rsi = float(rsi_series.iloc[-1])
+    # RSI z-score over 1-year history (no fixed 50 centre, no fixed 15 scale)
+    rsi_z = _zscore_clamp(rsi_series.tail(252).values, rsi, clamp=3.0) / 3.0  # → [-1,+1]
+
+    # ── MACD histogram ──────────────────────────────────────────────────────
+    macd_l  = c.ewm(span=12, adjust=False).mean() - c.ewm(span=26, adjust=False).mean()
+    macd_s  = macd_l.ewm(span=9, adjust=False).mean()
+    macd_hist_series = macd_l - macd_s
+    macd_h  = float(macd_hist_series.iloc[-1])
+    # MACD histogram z-score (no fixed std normaliser — derived from rolling 1Y)
+    macd_z  = _zscore_clamp(macd_hist_series.tail(252).values, macd_h, clamp=3.0) / 3.0
+
+    # ── Bollinger Bands ──────────────────────────────────────────────────────
+    bm     = c.rolling(20).mean()
+    bb_std = c.rolling(20).std()
+    bup    = (bm + 2 * bb_std)
+    blo    = (bm - 2 * bb_std)
+    bb_pct = float((ltp - float(blo.iloc[-1])) / (float(bup.iloc[-1]) - float(blo.iloc[-1]) + 1e-9))
+    # Bollinger %B percentile: what fraction of historical %B values was <= today's
+    bb_pct_pctile   = _percentile_score(
+        ((c.tail(252) - blo.tail(252)) / (bup.tail(252) - blo.tail(252) + 1e-9)).dropna().values,
+        bb_pct)  # 0–1; high = price near upper band
+
+    # ── Volume ──────────────────────────────────────────────────────────────
+    vol_ma5  = float(v.tail(5).mean())
+    vol_ma20 = float(v.tail(20).mean())
+    _vol_data_valid = vol_ma20 >= 100
+    vol_ratio = (vol_ma5 / vol_ma20) if _vol_data_valid else 1.0
+    # Volume percentile within 1-year rolling volume (no fixed 1.0× or 0.5 scale)
+    if _vol_data_valid and len(v) >= 20:
+        # Compute rolling 5-day avg volumes over history
+        vol_roll5 = v.rolling(5).mean().dropna()
+        vol_pct   = _percentile_score(vol_roll5.tail(252).values, vol_ma5)  # 0–1
+    else:
+        vol_pct = 0.5   # no data → neutral
+
+    # ── 5-day return z-score ────────────────────────────────────────────────
+    if len(c) >= 6:
+        ret5_series = (c / c.shift(5) - 1).dropna() * 100
+        ret5_now    = float((ltp / float(c.iloc[-6]) - 1) * 100) if float(c.iloc[-6]) != 0 else 0
+        ret5_z      = _zscore_clamp(ret5_series.tail(252).values, ret5_now, clamp=3.0) / 3.0
+    else:
+        ret5_z = 0.0; ret5_now = 0.0
+
+    # ── Distance from 200 EMA → z-score (no fixed ATR scale) ────────────────
+    dist200_series = ((c - e200) / (atr14 + 1e-9)).dropna()
+    dist200_now    = (ltp - e200v) / (atrv + 1e-9)
+    dist200_z      = _zscore_clamp(dist200_series.tail(252).values, dist200_now, clamp=3.0) / 3.0
+
+    # ── ATR percentile (vol regime) ─────────────────────────────────────────
+    atr_pct_pctile = _percentile_score(atr14.tail(252).dropna().values, atrv)  # 0–1
+
+    factors = {}
+
+    # ════════════════════════════════════════════════════════════════════════
+    # FACTOR GROUP 1 — TREND  (weight 0.30)
+    # Inputs: EMA structure (sign-based) + ADX percentile × direction
+    # ════════════════════════════════════════════════════════════════════════
+    # EMA structure score: count how many of 3 checks pass, normalise to [-1,+1]
+    # Uses sign only (no arbitrary weights 2,4,6)
+    ema_checks = [ltp > e20v, ltp > e50v, e20v > e50v, ltp > e200v, e50v > e200v]
+    ema_pass   = sum(ema_checks)
+    ema_score  = (ema_pass / len(ema_checks)) * 2 - 1  # → [-1, +1]
+
+    # ADX contribution: strength × direction (percentile replaces fixed 25)
+    adx_score  = adx_pct * adx_dir  # high-percentile ADX + direction → strong trend signal
+
+    trend_score = _calib("trend_ema_vs_adx") * ema_score + (1.0 - _calib("trend_ema_vs_adx")) * adx_score
+    trend_score = max(-1.0, min(1.0, trend_score))
+    # Record for calibration
+    _record("_calib_ema_score_hist", ema_score)
+    _record("_calib_adx_score_hist", adx_score)
+    factors["TREND (EMA+ADX)"] = round(trend_score * 30, 1)  # display as ±30
+
+    # ════════════════════════════════════════════════════════════════════════
+    # FACTOR GROUP 2 — MOMENTUM  (weight 0.25)
+    # Inputs: RSI z-score, 5-day return z-score
+    # Both already in [-1,+1] via z/3 normalisation
+    # ════════════════════════════════════════════════════════════════════════
+    momentum_score = _calib("momentum_rsi_vs_ret5") * rsi_z + (1.0 - _calib("momentum_rsi_vs_ret5")) * ret5_z
+    momentum_score = max(-1.0, min(1.0, momentum_score))
+    factors["MOMENTUM (RSI+5D)"] = round(momentum_score * 25, 1)  # display as ±25
+
+    # ════════════════════════════════════════════════════════════════════════
+    # FACTOR GROUP 3 — VOLATILITY REGIME  (weight 0.15)
+    # Low ATR percentile = mean-revert environment → slight bullish
+    # High BB %B percentile = near upper band → slight bullish (momentum)
+    # Combine as regime signal — high ATR = uncertainty = slight bearish weight
+    # ════════════════════════════════════════════════════════════════════════
+    # bb_pct_pctile high → price near upper band; contextually bullish in trending
+    # Paired with ema_score to determine direction
+    bb_regime  = (bb_pct_pctile * 2 - 1) * trend_score  # aligned with trend direction
+    atr_regime = 1 - 2 * atr_pct_pctile  # high ATR pctile → -1 (noise/caution signal)
+    vol_regime_score = _calib("vol_bb_vs_atr") * bb_regime + (1.0 - _calib("vol_bb_vs_atr")) * atr_regime
+    vol_regime_score = max(-1.0, min(1.0, vol_regime_score))
+    factors["VOL REGIME (ATR+BB)"] = round(vol_regime_score * 15, 1)  # display as ±15
+
+    # ════════════════════════════════════════════════════════════════════════
+    # FACTOR GROUP 4 — POSITIONING  (weight 0.20)
+    # Inputs: PCR percentile, OI skew, max pain distance / expected_move
+    # ════════════════════════════════════════════════════════════════════════
+    positioning_score = 0.0
+    if chain_df is not None and not chain_df.empty:
+        total_ce = float(chain_df["CE_OI"].sum())
+        total_pe = float(chain_df["PE_OI"].sum())
+        pcr_val  = total_pe / (total_ce + 1e-9)
+
+        # PCR percentile within full chain (not fixed 1.0 centre)
+        all_pcr = chain_df["PCR"].replace([np.inf, -np.inf], np.nan).dropna().values
+        pcr_pctile = _percentile_score(all_pcr, pcr_val)  # 0–1; high = bullish
+        pcr_s      = 2 * pcr_pctile - 1  # → [-1, +1]
+
+        # OI skew percentile: (put OI below spot vs call OI above spot)
+        above_oi = chain_df[chain_df.Strike > ltp]["CE_OI"].sum()
+        below_oi = chain_df[chain_df.Strike < ltp]["PE_OI"].sum()
+        oi_skew_val = (below_oi - above_oi) / (total_ce + total_pe + 1e-9)
+        # Convert raw skew to z-score via session history
+        skew_hist = st.session_state.get("_flow_skew_oi_hist", [])
+        skew_hist.append(float(oi_skew_val))
+        if len(skew_hist) > 30: skew_hist = skew_hist[-30:]
+        st.session_state["_flow_skew_oi_hist"] = skew_hist
+        # FIX: use tanh of raw value when history < 3 (z-score would be 0 with 1 sample)
+        if len(skew_hist) >= 3:
+            oi_skew_z = _zscore_clamp(skew_hist, float(oi_skew_val), clamp=2.0) / 2.0
+        else:
+            # Raw skew ∈ [-1,+1] already (it's a ratio). Amplify via tanh for signal.
+            oi_skew_z = math.tanh(oi_skew_val * 3.0)
+
+        # Max pain proximity: distance normalised by expected move (not % of spot)
+        oi_d = st.session_state.get("opt_oi", {})
+        mp   = oi_d.get("max_pain", ltp)
+        # Expected move fallback: use ATR from OHLCV if available, else 1% of price
+        _ohlcv_em = st.session_state.get("opt_ohlcv_df", None)
+        if _ohlcv_em is not None and not _ohlcv_em.empty and len(_ohlcv_em) >= 5:
+            _c_em = _ohlcv_em["close"].astype(float)
+            _h_em = _ohlcv_em["high"].astype(float)
+            _l_em = _ohlcv_em["low"].astype(float)
+            _tr_em = pd.concat([_h_em - _l_em,
+                                 (_h_em - _c_em.shift(1)).abs(),
+                                 (_l_em - _c_em.shift(1)).abs()], axis=1).max(axis=1)
+            _atr_em = float(_tr_em.tail(14).mean())
+        else:
+            _atr_em = _atr_seed(ltp)
+        em_price = oi_d.get("atm_straddle", _atr_em)
+        if em_price > 0:
+            mp_dist_em = (ltp - mp) / (em_price + 1e-9)  # in units of expected move
+            mp_s = max(-1.0, min(1.0, -mp_dist_em * _calib("mp_gravity")))
+        else:
+            mp_s = 0.0
+
+        _pw = _calib_vec("positioning_pcr_vs_oi_vs_mp")
+        positioning_score = _pw[0] * pcr_s + _pw[1] * oi_skew_z + _pw[2] * mp_s
+        positioning_score = max(-1.0, min(1.0, positioning_score))
+
+    factors["POSITIONING (OI+PCR)"] = round(positioning_score * 20, 1)  # display as ±20
+
+    # ════════════════════════════════════════════════════════════════════════
+    # FACTOR GROUP 5 — RELATIVE STRENGTH vs NIFTY  (weight 0.10)
+    # RS ratio z-score from session history (no fixed 1.02 threshold)
+    # ════════════════════════════════════════════════════════════════════════
+    rs_factor = 0.0
+    rs_data   = st.session_state.get("opt_rs_nifty", None)
+    if rs_data and isinstance(rs_data, dict):
+        rs_series_hist = rs_data.get("rs_series", [])
+        rs_ratio       = rs_data.get("rs_ratio", 1.0)
+        rs_z = _zscore_clamp(rs_series_hist, rs_ratio, clamp=2.0) / 2.0  # → [-1,+1]
+        rs_factor = rs_z
+    factors["REL STRENGTH (vs Nifty)"] = round(rs_factor * 10, 1)  # display as ±10
+
+    # ════════════════════════════════════════════════════════════════════════
+    # WEIGHTED FINAL SCORE — aligned with CFG["factor_weights"] key names
+    # New key structure: flow, positioning, vol_regime, rel_strength, trend
+    #
+    # directional_bias computes trend + momentum + vol_regime separately.
+    # Map them onto new keys:
+    #   trend    → blend of trend_score (60%) + momentum_score (40%)
+    #              Momentum is now a minor confirming input inside trend, not a
+    #              separate primary factor (matches 1-5 day signal model design).
+    #   vol_regime → vol_regime_score (ATR/BB regime signal)
+    #   positioning → positioning_score (PCR + OI skew + max pain)
+    #   rel_strength → rs_factor
+    #   flow → from compute_flow_scores; computed after this block and stored in
+    #           bias_res["flow"]. directional_bias does not weight flow here —
+    #           flow is applied in compute_probabilistic_score where it has 0.30 weight.
+    #           Here we use 0.0 for flow since it hasn't been computed yet.
+    # ════════════════════════════════════════════════════════════════════════
+    fw = CFG["factor_weights"]
+
+    # Blend trend + momentum → single "trend" contribution
+    # Momentum (RSI z-score, 5D return) shrinks to minor role inside trend
+    _ct_w = _calib("trend_combined_trend_vs_momentum")
+    combined_trend = _ct_w * trend_score + (1.0 - _ct_w) * momentum_score
+    combined_trend = max(-1.0, min(1.0, combined_trend))
+
+    raw_score = (fw["trend"]        * combined_trend
+               + fw["vol_regime"]   * vol_regime_score
+               + fw["positioning"]  * positioning_score
+               + fw["rel_strength"] * rs_factor
+               + 0.0)                # flow: computed separately in compute_probabilistic_score
+    raw_score = max(-1.0, min(1.0, raw_score))
+    # Scale to ±100 for display and threshold compatibility
+    score_100 = int(round(raw_score * 100))
+
+    # Bias thresholds: 22/9 on ±100 scale (equivalent to old 30/12 on old ±90 range)
+    bias = ("STRONGLY BULLISH" if score_100 >= 30 else "BULLISH"   if score_100 >= 12 else
+            "NEUTRAL"          if score_100 >  -12 else "BEARISH"  if score_100 >= -30 else "STRONGLY BEARISH")
+
+    # Flow scores (delta-based, also adaptive)
+    flow = compute_flow_scores(chain_df, df)
+
+    return {
+        "bias": bias, "score": score_100,
+        "rsi": round(rsi, 1), "macd_hist": round(macd_h, 3),
+        "bb_pct": round(bb_pct * 100, 1),
+        "vol_ratio": round(vol_ratio, 2),
+        "atr_pct":   round(atrv / ltp * 100, 2) if ltp > 0 else 0,
+        "e9": round(e9v, 2), "e20": round(e20v, 2), "e50": round(e50v, 2),
+        "atr": round(atrv, 2), "factors": factors, "flow": flow,
+        "adx": round(adx_val, 1),
+        # Z-scores exposed for downstream use
+        "rsi_z": round(rsi_z, 3), "macd_z": round(macd_z, 3),
+        "ret5_z": round(ret5_z, 3), "dist200_z": round(dist200_z, 3),
+        "adx_pct": round(adx_pct, 3), "vol_pct": round(vol_pct, 3),
+    }
+
+# ============================================================
+# VOLATILITY REGIME
+# ============================================================
+
+def iv_rank(iv_series, current_iv):
+    s = pd.Series(iv_series).dropna()
+    if len(s) < 3: return 50.0
+    lo, hi = s.min(), s.max()
+    # When range is negligible (all IVs identical), return 50 — we have no useful information
+    if (hi - lo) < 1e-6:
+        return 50.0
+    return round((current_iv - lo) / (hi - lo) * 100, 1)
+
+def vol_regime(ivr):
+    """Classify vol regime from IV Rank (0–100 percentile).
+    Thresholds from CFG: iv_hv_pct_sell (sell premium) and iv_hv_pct_buy (buy premium).
+    Midpoints between those are normal-high / normal-low.
+    """
+    _sell = CFG["iv_hv_pct_sell"]  # e.g. 75
+    _buy  = CFG["iv_hv_pct_buy"]   # e.g. 30
+    _mid  = (_sell + _buy) / 2     # e.g. 52.5
+    _very_hi = _sell + (100 - _sell) * 0.6  # 60% of way to 100 → extreme
+
+    if   ivr >= _very_hi: return "HIGH VOL",     "SELL premium — iron condors / strangles / short straddle","#ff3b3b"
+    elif ivr >= _sell:    return "ELEVATED",      "Lean SELL — credit spreads / iron condor",               "#ff8c00"
+    elif ivr >= _mid:     return "NORMAL-HIGH",   "Slight sell lean — balanced spreads, light credits",     "#ffb347"
+    elif ivr >= _buy:     return "NORMAL-LOW",    "Slight buy lean — calendars / ratio spreads",            "#7ec8e3"
+    else:                 return "LOW VOL",       "BUY premium — debit spreads / long options / straddles", "#1e90ff"
+
+# ============================================================
+# MARKET REGIME DETECTION
+# ============================================================
+
+
+def strategy_prob_profit(legs, spot, T, r, atm_iv, q=0.0, simulations=None,
+                         chain_df=None, ohlcv_df=None):
+    """Monte Carlo estimate of Probability of Profit for a multi-leg strategy.
+    Improvements:
+      1. VOL SURFACE: each leg repriced at its own strike IV (skew-aware), not ATM IV.
+      2. REAL-WORLD DRIFT: uses historical mu from last 60 days instead of risk-neutral.
+    legs: list of dicts with keys: opt (CE/PE), strike, premium, action (Buy/Sell), qty
+    Returns: prob_profit (float 0–1), expected_value (₹ per unit)
+    """
+    n_sims = simulations or CFG["pop_simulations"]
+    if T <= 0 or atm_iv <= 0 or not legs:
+        return 0.5, 0.0
+
+    # Build IV surface (falls back to flat surface = atm_iv if no chain data)
+    iv_surf = build_iv_surface(chain_df, spot, atm_iv)
+
+    # Real-world drift (improvement #2)
+    mu = _estimate_real_world_drift(ohlcv_df, r, q)
+
+    # Deterministic but position-unique seed
+    _seed = int(abs(spot * 1000 + T * 1e6 + sum(l.get("strike", 0) for l in legs))) % (2**31)
+    rng  = np.random.default_rng(_seed)
+    Z    = rng.standard_normal(n_sims)
+    # Use ATM IV for GBM diffusion (surface IV at spot), real-world mu for drift
+    atm_sigma_sim = iv_surf(spot)
+    drift  = (mu - 0.5 * atm_sigma_sim**2) * T
+    diff   = atm_sigma_sim * math.sqrt(T) * Z
+    prices = spot * np.exp(drift + diff)
+
+    total_pnl = np.zeros(n_sims)
+    for leg in legs:
+        k    = float(leg["strike"])
+        pr   = float(leg["premium"])
+        qty  = int(leg.get("qty", 1))
+        d    = 1 if leg["action"].lower() == "buy" else -1
+        if leg["opt"].upper() in ("CE", "CALL"):
+            intr = np.maximum(prices - k, 0)
+        else:
+            intr = np.maximum(k - prices, 0)
+        total_pnl += d * (intr - pr) * qty
+
+    prob_profit = float((total_pnl > 0).mean())
+    ev          = float(total_pnl.mean())
+    return round(prob_profit, 4), round(ev, 4)
+
+
+def iv_percentile(iv_series):
+    """IV Percentile: fraction of past observations that current IV exceeds.
+    Unlike IV Rank (range-normalized), IV Percentile is robust to outliers.
+    Returns 0–100."""
+    s = pd.Series(iv_series).dropna()
+    if len(s) < 3:
+        return 50.0
+    cur = float(s.iloc[-1])
+    pct = float((s < cur).mean() * 100)
+    return round(pct, 1)
+
+
+def _load_signal_log() -> list:
+    """Load forward signal log from disk. Returns list of dicts."""
+    fp = CFG["signal_log_file"]
+    try:
+        if os.path.exists(fp):
+            with open(fp, "r") as f:
+                data = json.load(f)
+            return data if isinstance(data, list) else []
+    except Exception:
+        pass
+    return []
+
+def _save_signal_log(log: list):
+    """Persist signal log to disk. Keeps last CFG['signal_log_max'] entries."""
+    try:
+        log = log[-CFG["signal_log_max"]:]
+        with open(CFG["signal_log_file"], "w") as f:
+            json.dump(log, f)
+    except Exception:
+        pass
+
+def _append_signal(symbol: str, prob_up: float, prob_down: float, flow_score: float,
+                   flow_magnitude: float, raw_score: float, top_strategy: str,
+                   strategy_ev: float, strategy_pop: float, strategy_kelly: float,
+                   expected_move: float, atm_iv: float, ivr: float, bias: str,
+                   # Edge Audit fields — full snapshot per spec
+                   spot: float = 0.0, hv20: float = 0.0,
+                   pcr: float = 1.0, oi_total: float = 0.0, oi_skew: float = 0.0,
+                   max_pain: float = 0.0, max_pain_dist_pct: float = 0.0,
+                   skew_pp: float = 0.0, term_slope: float = 0.0,
+                   positioning_score: float = 0.0, vol_regime_score: float = 0.0,
+                   trend_score: float = 0.0, intraday_score: float = 0.0,
+                   dte: int = 1):
+    """Append a forward signal snapshot to the persistent log.
+    Now captures full Edge Audit fields so the Edge Diagnostic tab can measure
+    what actually happens after each signal across 1/2/3/5-day horizons.
+    """
+    if "opt_signal_log" not in st.session_state:
+        st.session_state.opt_signal_log = _load_signal_log()
+    # Expected move = ATM_IV * sqrt(DTE/365) per spec
+    _em_calc = atm_iv * math.sqrt(max(dte, 1) / 365.0) * spot if spot > 0 else expected_move
+    entry = {
+        "ts":             datetime.now().isoformat(timespec="minutes"),
+        "symbol":         symbol.upper(),
+        # Direction signals
+        "prob_up":        round(prob_up, 4),
+        "prob_down":      round(prob_down, 4),
+        "raw_score":      round(raw_score, 4),
+        "flow_score":     round(flow_score, 4),
+        "flow_magnitude": round(flow_magnitude, 4),
+        "bias":           bias,
+        # Strategy
+        "top_strategy":   top_strategy,
+        "strategy_ev":    round(strategy_ev, 2),
+        "strategy_pop":   round(strategy_pop, 4),
+        "strategy_kelly": round(strategy_kelly, 4),
+        # Price & Vol at signal time
+        "spot":           round(spot, 2),
+        "atm_iv_pct":     round(atm_iv * 100, 2),
+        "hv20_pct":       round(hv20 * 100, 2),
+        "iv_hv_ratio":    round(atm_iv / (hv20 + 1e-9), 3) if hv20 > 0.01 else 0.0,
+        "ivr":            round(ivr, 1),
+        "dte":            dte,
+        # Expected move
+        "expected_move":  round(_em_calc, 2),
+        # Positioning at signal time
+        "pcr":            round(pcr, 3),
+        "oi_total":       round(oi_total, 0),
+        "oi_skew":        round(oi_skew, 0),
+        "max_pain":       round(max_pain, 2),
+        "max_pain_dist_pct": round(max_pain_dist_pct, 3),
+        # Skew & term structure
+        "skew_pp":        round(skew_pp, 3),
+        "term_slope":     round(term_slope, 4),
+        # Sub-scores for grouping
+        "positioning_score": round(positioning_score, 4),
+        "vol_regime_score":  round(vol_regime_score, 4),
+        "trend_score":       round(trend_score, 4),
+        "intraday_score":    round(intraday_score, 4),
+        # Forward outcomes — filled in later by _resolve_edge_outcomes()
+        "fwd_ret_1d": None, "fwd_ret_2d": None, "fwd_ret_3d": None, "fwd_ret_5d": None,
+        "fwd_spot_1d": None, "fwd_spot_2d": None, "fwd_spot_3d": None, "fwd_spot_5d": None,
+        "fwd_iv_1d": None, "fwd_iv_2d": None,
+        "fwd_skew_1d": None, "fwd_skew_2d": None,
+        "fwd_oi_1d": None, "fwd_oi_2d": None,
+        "resolved": False,
+    }
+    log = st.session_state.opt_signal_log
+    # Deduplicate: don't append if last entry is same symbol within same minute
+    if log and log[-1]["ts"] == entry["ts"] and log[-1]["symbol"] == entry["symbol"]:
+        return
+    log.append(entry)
+    st.session_state.opt_signal_log = log
+    _save_signal_log(log)
+def bs_charm(S, K, T, r, sigma, opt="call", q=0.0):
+    """Charm = dDelta/dt per trading day.
+    Derived analytically from the Merton BSM delta:
+      Call delta  = exp(-qT) * N(d1)
+      Put  delta  = exp(-qT) * (N(d1) - 1)
+    Differentiating wrt T (holding S, K, sigma fixed):
+      charm = exp(-qT) * npdf(d1) * [d1*(r-q)/(sigma*sqrt(T)) - (r-q) - sigma/(2*sqrt(T))*d2/d1_adj]
+    Standard closed form (Hull, 10th ed §19):
+      charm_call = -exp(-qT) * [npdf(d1)*(2*(r-q)*T - d2*sigma*sqrt(T)) / (2*T*sigma*sqrt(T))
+                                - q*N(d1)]
+      charm_put  = charm_call + q*exp(-qT)   [because delta_put = delta_call - exp(-qT)]
+    Both divided by ann_days for per-trading-day value.
+    """
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return 0.0
+    sqrtT = math.sqrt(T)
+    F     = S * math.exp((r - q) * T)
+    d1    = (math.log(F / K) + 0.5 * sigma**2 * T) / (sigma * sqrtT)
+    d2    = d1 - sigma * sqrtT
+    nd1   = _npdf(d1)
+    dq    = math.exp(-q * T)
+    # Core term shared by call and put
+    core  = -dq * nd1 * (2 * (r - q) * T - d2 * sigma * sqrtT) / (2 * T * sigma * sqrtT)
+    if opt == "call":
+        charm_raw = core - q * dq * _ncdf(d1)
+    else:
+        # charm_put = charm_call + q*exp(-qT)  (from delta_put = delta_call - exp(-qT))
+        charm_call = core - q * dq * _ncdf(d1)
+        charm_raw  = charm_call + q * dq
+    return round(charm_raw / CFG["ann_days"], 6)
+
+
+def bs_vanna(S, K, T, r, sigma, opt="call", q=0.0):
+    """Vanna = dDelta/dIV = d²V/dSdσ.
+    Vanna = -exp(-q*T) * npdf(d1) * d2 / sigma
+    Same for calls and puts.
+    Returns vanna (delta change per 1 unit IV change, not per 1%).
+    """
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return 0.0
+    sqrtT = math.sqrt(T)
+    F  = S * math.exp((r - q) * T)
+    d1 = (math.log(F / K) + 0.5 * sigma**2 * T) / (sigma * sqrtT)
+    d2 = d1 - sigma * sqrtT
+    nd1 = _npdf(d1)
+    dq  = math.exp(-q * T)
+    vanna = -dq * nd1 * d2 / sigma
+    return round(vanna, 6)
+
+
+def atm_strike(spot, step):
+    # Use round-half-up (standard trading convention) not Python's banker's rounding.
+    # Python's round(0.5)=0 (rounds to even), but traders expect 24525→24550 not 24500.
+    # math.floor(x + 0.5) gives true round-half-up for positive numbers.
+    return float(math.floor(spot / step + 0.5) * step)
+
+def strikes_around(spot, step, n=6):
+    atm = atm_strike(spot, step)
+    return [round(atm + i * step, 2) for i in range(-n, n+1)]
+
 # ============================================================
 # UPSTOX API HELPERS
 # ============================================================
@@ -2188,7 +3317,7 @@ def compute_intraday_signals(intraday_df: pd.DataFrame,
 
     # Record signals for calibration
     for k in _iw:
-        _record(f"_calib_intra_{k}_hist", result.get(k, 0.0))
+        _record_if_load(f"_calib_intra_{k}_hist", result.get(k, 0.0))
 
     return result
 
@@ -3764,9 +4893,9 @@ def compute_probabilistic_score(
     positioning_score = _pw2[0] * pcr_level_z + _pw2[1] * oi_skew_z + _pw2[2] * mp_z
     positioning_score = max(-1.0, min(1.0, positioning_score))
     # Record sub-scores for calibration
-    _record("_calib_pcr_level_hist", pcr_level_z)
-    _record("_calib_oi_skew_hist",   oi_skew_z)
-    _record("_calib_mp_z_hist",      mp_z)
+    _record_if_load("_calib_pcr_level_hist", pcr_level_z)
+    _record_if_load("_calib_oi_skew_hist",   oi_skew_z)
+    _record_if_load("_calib_mp_z_hist",      mp_z)
 
     fs["positioning_score"] = round(positioning_score, 4)
     fs["pcr_level_z"]       = round(pcr_level_z, 4)
@@ -3793,7 +4922,7 @@ def compute_probabilistic_score(
 
     # Expensive vol → bearish lean.  Dampening coefficient is calibrated.
     vol_regime_z = -(2 * iv_hv_pct - 1) * _calib("vol_regime_damp")
-    _record("_calib_vol_regime_z_hist", vol_regime_z)
+    _record_if_load("_calib_vol_regime_z_hist", vol_regime_z)
 
     # Term structure z-score: slope × calibrated scale factor
     ts_data      = st.session_state.get("opt_multi_expiry", [])
@@ -3802,10 +4931,10 @@ def compute_probabilistic_score(
         iv_near  = float(ts_data[0].get("atm_iv", atm_iv))
         iv_far   = float(ts_data[1].get("atm_iv", atm_iv))
         ts_slope = iv_far - iv_near
-        _record("_calib_ts_slope_raw_hist", ts_slope)
+        _record_if_load("_calib_ts_slope_raw_hist", ts_slope)
         term_slope_z = max(-1.0, min(1.0, ts_slope * _calib("ts_slope_scale")))
 
-    _record("_calib_term_slope_z_hist", term_slope_z)
+    _record_if_load("_calib_term_slope_z_hist", term_slope_z)
     _vr_w = _calib("vol_bb_vs_atr")   # reused as vol_regime_z vs term_slope_z blend
     vol_regime_score = _vr_w * vol_regime_z + (1.0 - _vr_w) * term_slope_z
     vol_regime_score = max(-1.0, min(1.0, vol_regime_score))
@@ -3828,8 +4957,8 @@ def compute_probabilistic_score(
         rs_slope_z  = _normalise_to_signal(rs_slope, "_calib_rs_slope_raw_hist")
         _rs_lv_w    = _calib("rs_level_vs_slope")
         rs_score    = _rs_lv_w * rs_z + (1.0 - _rs_lv_w) * rs_slope_z
-        _record("_calib_rs_z_hist",     rs_z)
-        _record("_calib_rs_slope_hist", rs_slope_z)
+        _record_if_load("_calib_rs_z_hist",     rs_z)
+        _record_if_load("_calib_rs_slope_hist", rs_slope_z)
     else:
         rs_score = 0.0; rs_z = 0.0; rs_slope_z = 0.0
 
@@ -3854,7 +4983,7 @@ def compute_probabilistic_score(
                           (l_series - c_series.shift(1)).abs()], axis=1).max(axis=1)
         atr14 = tr.ewm(alpha=1/14, adjust=False).mean()
         atrv  = float(atr14.iloc[-1])
-        if spot > 0: _record("_calib_atr_pct_hist", atrv / spot)
+        if spot > 0: _record_if_load("_calib_atr_pct_hist", atrv / spot)
         e20v  = float(e20.iloc[-1])
         e50v  = float(e50.iloc[-1])
         e200v = float(e200.iloc[-1]) if len(c_series) >= 200 else spot
@@ -3895,9 +5024,9 @@ def compute_probabilistic_score(
         trend_z = (_ema_w2 * ema_score
                    + _non_ema * _adx_frac       * (adx_pct * adx_d)
                    + _non_ema * (1.0 - _adx_frac) * rsi_z)
-        _record("_calib_ema_score_hist", ema_score)
-        _record("_calib_adx_score_hist", adx_pct * adx_d)
-        _record("_calib_rsi_trend_hist", rsi_z)
+        _record_if_load("_calib_ema_score_hist", ema_score)
+        _record_if_load("_calib_adx_score_hist", adx_pct * adx_d)
+        _record_if_load("_calib_rsi_trend_hist", rsi_z)
     else:
         e20v = e50v = e200v = spot
 
@@ -3924,25 +5053,31 @@ def compute_probabilistic_score(
     def _compute_factor_weights(ohlcv_local, factor_hist_key="opt_factor_score_hist",
                                  horizon=4):
         """Compute normalised abs-correlation weights for the five factors.
-        Uses rolling histories stored in session_state under per-factor keys.
-        Falls back to CFG weights when insufficient data.
+        FIX C: Use _calib_realised_ret_hist (session-indexed real returns) instead of
+        OHLCV fwd_ret (daily-bar-indexed). OHLCV has 252 bars; factor_hist has N loads.
+        Correlating hist[-n:] vs fwd_ret[-n:] aligned them by count not by time.
+        realised_ret_hist is correctly aligned: one entry per Load session.
         """
         try:
-            if ohlcv_local is None or len(ohlcv_local) < horizon + 10:
-                return _fw_cfg.copy()
-            c_local  = ohlcv_local["close"].astype(float).reset_index(drop=True)
-            fwd_ret  = np.log(c_local.shift(-horizon) / c_local).dropna().values
+            sym_pfx = st.session_state.get("opt_symbol","").upper()
+            # Use resolved real returns (one per Load session, correctly aligned)
+            ret_key  = f"{sym_pfx}:_calib_realised_ret_hist" if sym_pfx else "_calib_realised_ret_hist"
+            ret_hist = st.session_state.get(ret_key,
+                       st.session_state.get("_calib_realised_ret_hist", []))
+            if len(ret_hist) < 10:
+                return _fw_cfg.copy()   # not enough resolved outcomes yet
 
+            r_arr_full = np.array(ret_hist, dtype=float)
             factor_hist_store = st.session_state.get("opt_factor_hist", {})
             raw_w = {}
             for fname in _factor_scores_now:
                 hist = np.array(factor_hist_store.get(fname, []), dtype=float)
-                n = min(len(hist), len(fwd_ret))
+                n = min(len(hist), len(r_arr_full))
                 if n < 10:
                     raw_w[fname] = _fw_cfg[fname]
                     continue
                 s_arr = hist[-n:]
-                r_arr = fwd_ret[-n:]
+                r_arr = r_arr_full[-n:]  # aligned: same session index
                 if np.std(s_arr) < 1e-9 or np.std(r_arr) < 1e-9:
                     raw_w[fname] = _fw_cfg[fname]
                     continue
@@ -3956,15 +5091,18 @@ def compute_probabilistic_score(
         except Exception:
             return _fw_cfg.copy()
 
-    # Update rolling factor score history (append current session's scores)
+    # Update rolling factor score history — only on genuine Load (FIX: was every render)
     _fhist = st.session_state.get("opt_factor_hist", {})
-    for _fname, _fval in _factor_scores_now.items():
-        _fhist.setdefault(_fname, []).append(float(_fval))
-        _fhist[_fname] = _fhist[_fname][-252:]   # keep 1 year of sessions
-    st.session_state["opt_factor_hist"] = _fhist
+    _fhist_load_id = st.session_state.get("opt_load_id", 0)
+    _fhist_last_id = st.session_state.get("_fhist_last_load_id", -1)
+    if _fhist_load_id != _fhist_last_id:
+        st.session_state["_fhist_last_load_id"] = _fhist_load_id
+        for _fname, _fval in _factor_scores_now.items():
+            _fhist.setdefault(_fname, []).append(float(_fval))
+            _fhist[_fname] = _fhist[_fname][-252:]
+        st.session_state["opt_factor_hist"] = _fhist
 
-    _ohlcv_for_fw = st.session_state.get("opt_ohlcv_df", None)
-    fw = _compute_factor_weights(_ohlcv_for_fw)
+    fw = _compute_factor_weights(None)  # FIX C: uses realised_ret_hist now, not OHLCV
 
     raw_score = (
           fw["flow"]         * fs["flow_score"]
@@ -3979,7 +5117,7 @@ def compute_probabilistic_score(
     _sharpness = _calib("logistic_sharpness")
     prob_up   = _logistic(raw_score * _sharpness)
     prob_down = 1.0 - prob_up
-    _record("_calib_raw_score_hist", raw_score)
+    # raw_score recorded in Load-guarded PART 8 block only (FIX A).
 
     # ── Intraday blend — integrate live 5-min signals when market is open ─────
     # The intraday score is computed from Upstox live candles and blended into
@@ -4005,7 +5143,7 @@ def compute_probabilistic_score(
         blended_raw = max(-1.0, min(1.0, blended_raw))
         prob_up   = _logistic(blended_raw * _sharpness)
         prob_down = 1.0 - prob_up
-        _record("_calib_intraday_score_hist", _intra_score)
+        _record_if_load("_calib_intraday_score_hist", _intra_score)
 
     # ── Monte Carlo direction signal (Improvement #1) ─────────────────────────
     # Run a lightweight MC to get a distribution-based directional score.
@@ -4090,10 +5228,13 @@ def compute_probabilistic_score(
     else:                      signal_strength = "No Edge"
 
     # ── PART 8: Store dedicated calibration histories ─────────────────────────
-    # _calib_prob_up_hist  — model predicted probability
-    # _calib_actual_up_hist— will be filled at outcome resolution (1 if return > 0)
-    # _calib_move_vs_iv_hist— actual_move / expected_move (filled at resolution)
-    _record("_calib_prob_up_hist", prob_up)
+    # FIX A: Only record on genuine Load click, not every Streamlit re-render.
+    _cur_load_id = st.session_state.get("opt_load_id", 0)
+    _last_rec_id = st.session_state.get("_last_recorded_load_id", -1)
+    if _cur_load_id != _last_rec_id:
+        st.session_state["_last_recorded_load_id"] = _cur_load_id
+        _record("_calib_prob_up_hist", prob_up)
+        _record("_calib_raw_score_hist", raw_score)
     # _calib_actual_up_hist and _calib_move_vs_iv_hist filled in _ingest_resolved_outcomes
 
     return {
@@ -4412,7 +5553,7 @@ def ev_rank_strategies(universe, spot, T, r, atm_iv, q,
         if sk is not None and em > 0:
             safety_ratio = abs(float(sk) - spot) / (em + 1e-9)
             safety_factor = _logistic(_calib("safety_sigmoid_sharpness") * (safety_ratio - 1.0))
-            _record("_calib_safety_ratio_hist", safety_ratio)
+            _record_if_load("_calib_safety_ratio_hist", safety_ratio)
         else:
             safety_ratio  = 2.0
             safety_factor = 1.0
@@ -4421,7 +5562,7 @@ def ev_rank_strategies(universe, spot, T, r, atm_iv, q,
         ts_factor = 1.0
         ts_slope  = s.get("term_slope")
         if ts_slope is not None:
-            _record("_calib_ts_slope_raw_hist", ts_slope)
+            _record_if_load("_calib_ts_slope_raw_hist", ts_slope)
             ts_factor = 1.0 + 0.5 * math.tanh(ts_slope * _calib("ts_tanh_scale"))
 
         # ── EV-adjusted score — calibrated ev_tanh_scale ─────────────────────
@@ -4473,9 +5614,9 @@ def ev_rank_strategies(universe, spot, T, r, atm_iv, q,
 
         composite = max(-1.0, min(1.0, composite))
         # Record for calibration
-        _record("_calib_ev_score_hist",   ev_score)
-        _record("_calib_dir_align_hist",  dir_align)
-        _record("_calib_realised_pnl_hist", ev)
+        _record_if_load("_calib_ev_score_hist",   ev_score)
+        _record_if_load("_calib_dir_align_hist",  dir_align)
+        _record_if_load("_calib_realised_pnl_hist", ev)
         # Convert to 0-100 display score
         display_score = int(round((composite + 1.0) / 2.0 * 100))
 
@@ -4646,6 +5787,7 @@ if "opt_dte"         not in st.session_state: st.session_state.opt_dte         =
 if "opt_step"        not in st.session_state: st.session_state.opt_step        = 50
 if "payoff_legs"     not in st.session_state: st.session_state.payoff_legs     = []
 if "opt_loaded"      not in st.session_state: st.session_state.opt_loaded      = False
+if "opt_fii_dii"     not in st.session_state: st.session_state.opt_fii_dii     = {}
 if "opt_div_yield"   not in st.session_state: st.session_state.opt_div_yield   = {}
 # Chain live-data flags — set on each load, read by render section
 if "_chain_has_live" not in st.session_state: st.session_state["_chain_has_live"] = False
@@ -4806,6 +5948,7 @@ padding:8px 10px;font-family:'IBM Plex Mono',monospace;font-size:0.77rem;margin-
 # ============================================================
 
 if load_btn:
+    st.session_state.opt_load_id += 1   # FIX A: detect genuine Load vs re-render
     with st.spinner(f"Loading {sym_sel} options intelligence…"):
 
         # Validate expiry format before any API calls
@@ -4866,7 +6009,32 @@ if load_btn:
             horizon=4
         )
 
-        # 3. Direction — pass chain_df for positioning factors
+        # 3a. FII/DII institutional flow data (leading signal for Nifty)
+        # Fetch once per Load and store in session_state for use in compute_flow_scores.
+        # Only relevant for index options (Nifty/BankNifty etc.) — skip for stocks.
+        _sym_upper = sym_sel.upper()
+        _is_index  = _sym_upper in ("NIFTY","BANKNIFTY","FINNIFTY","MIDCPNIFTY","SENSEX")
+        if _is_index:
+            _fii_raw = fetch_fii_dii_data()
+            st.session_state["opt_fii_dii"] = _fii_raw
+            if _fii_raw.get("data_available"):
+                _fii_net = _fii_raw["fii_net_crore"]
+                _dii_net = _fii_raw["dii_net_crore"]
+                _fii_sig = _fii_raw["fii_signal"]
+                _fii_sign = "+" if _fii_net >= 0 else ""
+                _dii_sign = "+" if _dii_net >= 0 else ""
+                st.caption(
+                    f"📊 FII/DII ({_fii_raw['source_date']}): "
+                    f"FII {_fii_sign}{_fii_net:,.0f} Cr | "
+                    f"DII {_dii_sign}{_dii_net:,.0f} Cr | "
+                    f"Signal: {_fii_sig:+.3f}"
+                )
+        else:
+            # For stocks: clear FII/DII signal (not relevant at stock level)
+            st.session_state["opt_fii_dii"] = {"data_available": False,
+                                                 "combined_signal": 0.0}
+
+        # 3b. Direction — pass chain_df for positioning factors
         bias_res = directional_bias(ohlcv_df, spot,
                                     chain_df=st.session_state.opt_chain_data
                                     if not st.session_state.opt_chain_data.empty else None)
@@ -5303,8 +6471,8 @@ st.session_state["opt_prob_score"] = prob_score
 # Record MC and factor direction signals for MC-blend calibration
 _mc_dir_now  = float(prob_score.get("mc_direction", 0.0))
 _fac_dir_now = float(prob_score.get("prob_up", 0.5) - prob_score.get("prob_down", 0.5))
-_record("_calib_mc_dir_hist",  _mc_dir_now)
-_record("_calib_fac_dir_hist", _fac_dir_now)
+_record_if_load("_calib_mc_dir_hist",  _mc_dir_now)
+_record_if_load("_calib_fac_dir_hist", _fac_dir_now)
 
 strat_recs = recommend_strategies(
     bias, v_lbl, dte, spot, atm_k, step, ivr, bias_score,
@@ -5318,36 +6486,39 @@ strat_recs = recommend_strategies(
 )
 
 # ── Record signal snapshot for future outcome resolution ──────────────────────
-# Stored with current spot; resolved on next load of same symbol ≥4 sessions later.
-# _resolve_outcomes() computes log(new_spot / old_spot) as the real outcome.
-# This closes the loop: model signals → real market return → weight calibration.
+# FIX B: Only record on genuine Load click (opt_load_id changed), not every rerender.
+# Without this guard, every tab click appends a duplicate pending outcome.
 _fs         = prob_score.get("feature_scores", {})
 _top_s_snap = strat_recs[0] if strat_recs else {}
-_record_outcome(sym, {
-    "spot":               spot,
-    "raw_score":          prob_score.get("raw_score",    0.0),
-    "flow_score":         _fs.get("flow_score",          0.0),
-    "mc_direction":       _mc_dir_now,
-    "factor_direction":   _fac_dir_now,
-    "ev_score":           float(_top_s_snap.get("ev_score",  0.0)),
-    "dir_align":          float(_top_s_snap.get("dir_align", 0.5)),
-    "safety_ratio":       float(_top_s_snap.get("safety_ratio", 2.0)),
-    "ts_slope":           float(_top_s_snap.get("term_slope",   0.0) or 0.0),
-    "pcr_level_z":        _fs.get("pcr_level_z",         0.0),
-    "oi_skew_z":          _fs.get("oi_skew_z",            0.0),
-    "mp_z":               _fs.get("mp_z",                 0.0),
-    "vol_regime_z":       _fs.get("vol_regime_z",         0.0),
-    "term_slope_z":       _fs.get("term_slope_z",         0.0),
-    "rs_z":               _fs.get("rs_z",                 0.0),
-    "rs_slope_z":         0.0,
-    "ema_score":          _fs.get("trend_z",              0.0),
-    "adx_score":          float(prob_score.get("iv_hv_pct", 0.5)),
-    "rsi_z":              _fs.get("rsi_v",                50.0),
-    "iv_pillar":          float(prob_score.get("iv_hv_pct", 0.5)) * 2 - 1,
-    "adx_pillar":         _fs.get("trend_z",              0.0),
-    "hv_accel_pillar":    0.0,
-    "gex_pillar":         0.0,
-}, horizon_days=max(4, dte // 2))
+if st.session_state.get("opt_load_id",0) != st.session_state.get("_last_outcome_load_id",-1):
+    st.session_state["_last_outcome_load_id"] = st.session_state.get("opt_load_id",0)
+    _record_outcome(sym, {
+        "spot":               spot,
+        "raw_score":          prob_score.get("raw_score",    0.0),
+        "prob_up":            float(prob_score.get("prob_up", 0.5)),  # FIX E: store directly
+        "expected_move":      float(prob_score.get("expected_move", 0.0)),  # FIX E: for move_vs_iv
+        "flow_score":         _fs.get("flow_score",          0.0),
+        "mc_direction":       _mc_dir_now,
+        "factor_direction":   _fac_dir_now,
+        "ev_score":           float(_top_s_snap.get("ev_score",  0.0)),
+        "dir_align":          float(_top_s_snap.get("dir_align", 0.5)),
+        "safety_ratio":       float(_top_s_snap.get("safety_ratio", 2.0)),
+        "ts_slope":           float(_top_s_snap.get("term_slope",   0.0) or 0.0),
+        "pcr_level_z":        _fs.get("pcr_level_z",         0.0),
+        "oi_skew_z":          _fs.get("oi_skew_z",            0.0),
+        "mp_z":               _fs.get("mp_z",                 0.0),
+        "vol_regime_z":       _fs.get("vol_regime_z",         0.0),
+        "term_slope_z":       _fs.get("term_slope_z",         0.0),
+        "rs_z":               _fs.get("rs_z",                 0.0),
+        "rs_slope_z":         0.0,
+        "ema_score":          _fs.get("trend_z",              0.0),
+        "adx_score":          float(prob_score.get("iv_hv_pct", 0.5)),
+        "rsi_z":              _fs.get("rsi_v",                50.0),
+        "iv_pillar":          float(prob_score.get("iv_hv_pct", 0.5)) * 2 - 1,
+        "adx_pillar":         _fs.get("trend_z",              0.0),
+        "hv_accel_pillar":    0.0,
+        "gex_pillar":         0.0,
+    }, horizon_days=max(4, dte // 2))
 
 BIAS_COLORS = {
     "STRONGLY BULLISH":"#00d084","BULLISH":"#7dca84","NEUTRAL":"#ffb347",
@@ -5734,6 +6905,29 @@ with t_ov:
                    f"IV Pctile = % of sessions where IV was lower ({iv_pct:.0f}%). "
                    f"Gap between them is normal when historical IV had outlier spikes.")
     p7.metric("DTE",         str(dte))
+
+    # ── FII/DII institutional flow display ───────────────────────────────────────
+    _fii_d = st.session_state.get("opt_fii_dii", {})
+    if _fii_d.get("data_available"):
+        _fii_n = _fii_d["fii_net_crore"]
+        _dii_n = _fii_d["dii_net_crore"]
+        _fi_sig = _fii_d["combined_signal"]
+        _fi_col = "#00d084" if _fi_sig > 0.1 else "#ff3b3b" if _fi_sig < -0.1 else "#888"
+        _fi_arrow = "↑" if _fi_sig > 0.1 else "↓" if _fi_sig < -0.1 else "→"
+        st.markdown(
+            f"<div style='font-family:IBM Plex Mono,monospace;font-size:.80rem;"
+            f"background:#111;border:1px solid #222;border-left:3px solid {_fi_col};"
+            f"padding:6px 12px;margin-bottom:6px;'>"
+            f"<span style='color:{_fi_col};font-weight:700;'>FII/DII {_fi_arrow}</span>"
+            f"&nbsp;&nbsp;FII: <b style='color:{_fi_col};'>{'+'if _fii_n>=0 else ''}{_fii_n:,.0f} Cr</b>"
+            f"&nbsp;·&nbsp;DII: {'+'if _dii_n>=0 else ''}{_dii_n:,.0f} Cr"
+            f"&nbsp;·&nbsp;3D avg FII: {'+'if _fii_d['fii_3d_avg']>=0 else ''}"
+            f"{_fii_d['fii_3d_avg']:,.0f} Cr"
+            f"&nbsp;·&nbsp;Signal: <b style='color:{_fi_col};'>{_fi_sig:+.3f}</b>"
+            f"&nbsp;·&nbsp;<span style='color:#555;font-size:.72rem;'>{_fii_d['source_date']}</span>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
 
     # ── PART 12: Decision Panel ───────────────────────────────────────────────
     # Full output: Signals → Score → Probability → Edge → EV → Kelly → Strategy
