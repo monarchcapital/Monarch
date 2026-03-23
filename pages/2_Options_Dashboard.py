@@ -215,6 +215,78 @@ _CALIB_FILE      = ".monarch_calib.json"   # disk path — survives restarts
 _CALIB_MIN_OBS   = 15                # minimum paired observations before overriding prior
 _CALIB_WINDOW    = 252               # rolling window for correlation computation
 
+# ── Signal history persistence ─────────────────────────────────────────────────
+# All calibration signal histories, pending outcomes, and flow histories are
+# stored in session_state BUT must also be persisted to disk so calibration
+# survives app restarts. Without this the system always trains from scratch.
+_HIST_FILE       = ".monarch_hist.json"    # disk path for all signal histories
+_HIST_LOADED_KEY = "_monarch_hist_loaded"  # session flag — load only once per session
+
+# Keys to persist: all _record() targets, pending outcomes, flow histories
+_HIST_PERSIST_PREFIXES = (
+    "_calib_",          # calibration signal histories (e.g. _calib_raw_score_hist)
+    "_outcome_pending_",# pending signal snapshots awaiting resolution
+    "_flow_",           # flow signal histories (pcr_hist, oi_hist, skew_hist, gex_hist)
+    "NIFTY:_calib_",    # symbol-namespaced histories
+    "BANKNIFTY:_calib_",
+    "FINNIFTY:_calib_",
+    "MIDCPNIFTY:_calib_",
+)
+
+
+def _load_hist() -> dict:
+    """Load all signal histories from disk. Returns {} on any error."""
+    try:
+        if os.path.exists(_HIST_FILE):
+            with open(_HIST_FILE, "r") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def _save_hist():
+    """Persist all signal histories from session_state to disk.
+    Called at the end of every LOAD cycle so data survives restarts.
+    Saves keys matching calibration/flow/outcome patterns to avoid bloat.
+    """
+    try:
+        out = {}
+        for k, v in st.session_state.items():
+            if not isinstance(k, str):
+                continue
+            # Match any calibration history, flow history, pending outcome,
+            # OI snapshot, or intraday calibration key
+            if (k.startswith("_calib_") or
+                k.startswith("_flow_") or
+                k.startswith("_outcome_pending_") or
+                k.startswith("_oi_snap_") or
+                k.startswith("_calib_intra_") or
+                (":_calib_" in k)):
+                if isinstance(v, (list, dict)):
+                    out[k] = v
+        with open(_HIST_FILE, "w") as f:
+            json.dump(out, f)
+    except Exception:
+        pass
+
+
+def _restore_hist():
+    """Load persisted signal histories into session_state on first session call.
+    Merges disk data into session_state without overwriting keys already present
+    (in case the session was partially populated before this call).
+    Called once at startup via _HIST_LOADED_KEY flag.
+    """
+    if st.session_state.get(_HIST_LOADED_KEY):
+        return
+    data = _load_hist()
+    for k, v in data.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+    st.session_state[_HIST_LOADED_KEY] = True
+
 
 def _load_calib() -> dict:
     """Load persisted calibration from disk. Returns {} on any error."""
@@ -4348,6 +4420,12 @@ if "opt_factor_hist"    not in st.session_state: st.session_state.opt_factor_his
 if "opt_intraday_df"    not in st.session_state: st.session_state.opt_intraday_df    = pd.DataFrame()
 if "opt_intraday_signals" not in st.session_state: st.session_state.opt_intraday_signals = {}
 
+# ── CRITICAL: Restore all signal histories from disk ──────────────────────────
+# Without this, every app restart wipes calibration signal histories, pending
+# outcomes, and flow histories → the adaptive engine always trains from scratch
+# and the weights never improve beyond the cold-start priors.
+_restore_hist()
+
 # ============================================================
 # SIDEBAR — ALL INPUTS
 # ============================================================
@@ -4741,6 +4819,12 @@ if load_btn:
             "bias":      bias_res.get("bias", "NEUTRAL"),
             "flow_score": _flow_mag_now,
         }
+
+        # ── CRITICAL: Persist all signal histories to disk ────────────────────────
+        # This is the fix for the calibration system never accumulating data across
+        # restarts. _record() writes to session_state only; _save_hist() syncs to disk.
+        # Weights in _CALIB_FILE are also saved here via _set_calib → _save_calib.
+        _save_hist()
 
 # ============================================================
 # MULTI-EXPIRY LOAD LOGIC
@@ -5181,6 +5265,8 @@ border-left:4px solid {_ev_col};padding:10px 14px;font-family:'IBM Plex Mono',mo
     _calib_status  = (f"LIVE — {_n_real} real outcomes · {_pending_n} pending"
                       if _n_real >= _CALIB_MIN_OBS
                       else f"WARMING UP — {_n_real}/{_CALIB_MIN_OBS} real outcomes needed")
+    _hist_exists   = os.path.exists(_HIST_FILE)
+    _hist_kb       = round(os.path.getsize(_HIST_FILE) / 1024, 1) if _hist_exists else 0
 
     with st.expander("⚙ Adaptive Engine — Live Calibration State", expanded=False):
         cc1, cc2, cc3, cc4 = st.columns(4)
@@ -5189,6 +5275,9 @@ border-left:4px solid {_ev_col};padding:10px 14px;font-family:'IBM Plex Mono',mo
         cc3.metric("MC Blend Weight",   f"{_mc_blend_live}%",help="MC direction weight in final prob blend (learned)")
         cc4.metric("Logistic Sharpness",str(_sharp_live),    help="Calibrated raw_score scaling for prob_up (learned)")
 
+        # Persistence status
+        _persist_col = "#00d084" if _hist_exists else "#ff3b3b"
+        _persist_lbl = f"SAVED ({_hist_kb} KB)" if _hist_exists else "NOT SAVED YET — click Load first"
         st.markdown(
             f"""<div style="font-family:'IBM Plex Mono',monospace;font-size:0.78rem;
 color:#555;padding:6px 0 2px;">
@@ -5196,7 +5285,9 @@ color:#555;padding:6px 0 2px;">
 &nbsp;·&nbsp;
 <span style="color:#888;">STATUS:</span> <span style="color:{_calib_color};font-weight:700;">{_calib_status}</span>
 &nbsp;·&nbsp;
-<span style="color:#555;">{_n_symbols} symbol(s) in calibration store · disk: {_CALIB_FILE}</span>
+<span style="color:#888;">HIST DISK:</span> <span style="color:{_persist_col};font-weight:700;">{_persist_lbl}</span>
+&nbsp;·&nbsp;
+<span style="color:#555;">{_n_symbols} symbol(s) · weights: {_CALIB_FILE} · histories: {_HIST_FILE}</span>
 </div>""", unsafe_allow_html=True)
 
         # Calibration quality bar — fraction of parameters with real data vs priors
