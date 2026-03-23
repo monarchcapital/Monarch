@@ -208,6 +208,19 @@ _PRIOR = {
     "intra_w_lunch_reversal":      0.03,   # post-lunch reversal signal
     # Weight of intraday score in final directional blend
     "intra_blend_weight":          0.20,   # 20% intraday, 80% factor+MC by default
+    # ── Vector priors — derived from their scalar equivalents ──────────────────
+    # These are the 2-element weight vectors that _calib_vec() looks up.
+    # Cold-start: uniform or matching the scalar priors above.
+    # They get overwritten by _update_vec_calib() once 15+ observations accumulate.
+    "ev_score_vs_dir_align_vec":  [0.60, 0.40],  # ev_score : dir_align (matches ev_score_vs_dir_align)
+    "mc_blend_vec":               [0.50, 0.50],  # MC direction : factor direction (matches mc_blend)
+    "rs_level_vs_slope_vec":      [0.70, 0.30],  # RS level : RS slope (matches rs_level_vs_slope)
+    "trend_ema_vs_adx_vec":       [0.60, 0.40],  # EMA : ADX (matches trend_ema_vs_adx)
+    "adx_vs_rsi_vec":             [0.75, 0.25],  # ADX : RSI (matches adx_vs_rsi_within_trend)
+    "vol_regime_z_vs_ts":         [0.55, 0.45],  # IV/HV z : term-slope z (matches regime_iv_vs_hv_accel)
+    "regime_conf_pillars":        [0.30, 0.30, 0.25, 0.15],  # IV : ADX : HV : GEX (matches conf priors)
+    "intra_weights_vec":          [0.30, 0.25, 0.20, 0.15, 0.07, 0.03],  # 6 intraday signals
+    "intra_blend_vec":            [0.80, 0.20],  # factor+MC : intraday (matches 1-intra_blend_weight)
 }
 
 _CALIB_STORE_KEY = "monarch_calib"   # session_state key for persisted calibration
