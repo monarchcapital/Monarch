@@ -5788,6 +5788,13 @@ if "opt_step"        not in st.session_state: st.session_state.opt_step        =
 if "payoff_legs"     not in st.session_state: st.session_state.payoff_legs     = []
 if "opt_loaded"      not in st.session_state: st.session_state.opt_loaded      = False
 if "opt_fii_dii"     not in st.session_state: st.session_state.opt_fii_dii     = {}
+# ── Load-ID guard counters — must be initialised BEFORE the load_btn block ──────
+# opt_load_id is incremented on every Load click and used by _record_if_load()
+# to prevent duplicate calibration records on every Streamlit re-render.
+if "opt_load_id"              not in st.session_state: st.session_state["opt_load_id"]              = 0
+if "_last_recorded_load_id"   not in st.session_state: st.session_state["_last_recorded_load_id"]   = -1
+if "_last_outcome_load_id"    not in st.session_state: st.session_state["_last_outcome_load_id"]    = -1
+if "_fhist_last_load_id"      not in st.session_state: st.session_state["_fhist_last_load_id"]      = -1
 if "opt_div_yield"   not in st.session_state: st.session_state.opt_div_yield   = {}
 # Chain live-data flags — set on each load, read by render section
 if "_chain_has_live" not in st.session_state: st.session_state["_chain_has_live"] = False
@@ -5948,7 +5955,7 @@ padding:8px 10px;font-family:'IBM Plex Mono',monospace;font-size:0.77rem;margin-
 # ============================================================
 
 if load_btn:
-    st.session_state.opt_load_id += 1   # FIX A: detect genuine Load vs re-render
+    st.session_state["opt_load_id"] = st.session_state.get("opt_load_id", 0) + 1   # FIX A
     with st.spinner(f"Loading {sym_sel} options intelligence…"):
 
         # Validate expiry format before any API calls
