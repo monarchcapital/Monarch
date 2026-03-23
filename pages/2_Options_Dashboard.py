@@ -28,6 +28,10 @@ from datetime import datetime, timedelta, date
 import plotly.graph_objects as go
 import yfinance as yf
 import os
+try:
+    import pytz
+except ImportError:
+    pytz = None  # graceful fallback — market-hours detection will be skipped
 
 st.set_page_config(layout="wide", page_title="MONARCH — Options Intel")
 
@@ -926,15 +930,40 @@ with st.sidebar:
                              value=st.session_state.opt_access_token, key="opt_tok_inp")
     if tok_inp and tok_inp != st.session_state.opt_access_token:
         st.session_state.opt_access_token = tok_inp
+        # FIX: clear all Upstox API caches so new token takes effect immediately
+        fetch_option_chain.clear()
+        fetch_expiries.clear()
+        fetch_upstox_candles.clear()
+        fetch_upstox_intraday_candles.clear()
         try:
             with open(TOKEN_FILE, "w") as f: f.write(tok_inp)
             st.success("Token saved ✔")
         except: pass
 
-ACCESS_TOKEN = st.session_state.opt_access_token
-HEADERS = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Accept": "application/json"}
+# ── Dynamic token helpers ─────────────────────────────────────────────────────
+# CRITICAL FIX: Never freeze ACCESS_TOKEN or HEADERS at module load time.
+# Streamlit re-executes from top on every interaction; the token may have been
+# pasted AFTER the module first ran, so a module-level constant would be stale.
+# Always read from session_state at call time.
+def get_token() -> str:
+    return st.session_state.get("opt_access_token", "")
 
-if not ACCESS_TOKEN:
+def get_headers() -> dict:
+    return {"Authorization": f"Bearer {get_token()}", "Accept": "application/json"}
+
+# Legacy aliases so older code that references ACCESS_TOKEN still works.
+# These re-evaluate on every use because they call the function above.
+class _DynToken:
+    """Proxy that evaluates to the current token string on every str() call."""
+    def __str__(self):  return get_token()
+    def __bool__(self): return bool(get_token())
+    def __eq__(self, o): return get_token() == o
+    def __ne__(self, o): return get_token() != o
+
+ACCESS_TOKEN = _DynToken()   # acts like a string; re-reads session_state each time
+HEADERS      = get_headers() # used only in places that call get_headers() explicitly
+
+if not get_token():
     st.warning("⚠️  Paste your Upstox access token in the sidebar to continue.")
     st.stop()
 
@@ -1411,7 +1440,8 @@ def load_fno_master():
         if r.status_code == 200:
             with gzip.GzipFile(fileobj=io.BytesIO(r.content)) as gz:
                 return pd.DataFrame(json.load(gz))
-    except: pass
+    except Exception as _e:
+        st.warning(f"Failed to load F&O master from Upstox CDN: {_e}")
     return pd.DataFrame()
 
 def find_instrument_key(master_df, symbol):
@@ -1444,7 +1474,10 @@ def fetch_expiries(_token, instrument_key):
         if r.status_code == 200:
             data = r.json().get("data", [])
             return sorted(set(d["expiry"] for d in data if d.get("expiry")))
-    except: pass
+        elif r.status_code == 401:
+            st.error("🔑 Upstox token expired. Please refresh your access token in the sidebar.")
+    except Exception as _e:
+        st.warning(f"fetch_expiries failed: {_e}")
     return []
 
 @st.cache_data(ttl=CFG["chain_cache_ttl"], show_spinner=False)
@@ -1457,9 +1490,18 @@ def fetch_option_chain(_token, instrument_key, expiry):
                          params={"instrument_key": instrument_key, "expiry_date": expiry},
                          timeout=15)
         if r.status_code == 200:
-            return r.json().get("data", [])
+            data = r.json().get("data", [])
+            if not data:
+                st.warning("⚠️ Upstox returned an empty option chain. Market may be closed or instrument key is wrong.")
+            return data
+        elif r.status_code == 401:
+            st.error("🔑 Upstox token is expired or invalid. Please paste a fresh access token in the sidebar.")
+        elif r.status_code == 429:
+            st.warning("⚠️ Upstox API rate limit hit. Wait a few seconds and try again.")
         else:
             st.warning(f"Chain API error {r.status_code}: {r.text[:200]}")
+    except requests.exceptions.Timeout:
+        st.warning("⚠️ Upstox API timed out. Check your internet connection and retry.")
     except Exception as e:
         st.warning(f"Chain fetch failed: {e}")
     return []
@@ -1469,48 +1511,112 @@ def fetch_spot_quote(instrument_key):
     url    = "https://api.upstox.com/v2/market-quote/quotes"
     params = {"instrument_key": instrument_key}
     try:
-        r = requests.get(url, headers=HEADERS, params=params, timeout=10)
+        # FIX: use get_headers() so token is always current, not frozen at load time
+        r = requests.get(url, headers=get_headers(), params=params, timeout=10)
         if r.status_code == 200:
             data = r.json().get("data", {})
             for v in data.values():
                 lp = v.get("last_price")
                 if lp: return float(lp)
-    except: pass
+        elif r.status_code == 401:
+            st.warning("⚠️ Upstox token expired or invalid. Please paste a fresh token in the sidebar.")
+    except Exception as e:
+        st.warning(f"Spot quote fetch failed: {e}")
     return None
 
 def parse_chain(raw_data, spot, step=50):
-    """Parse Upstox option chain into a clean DataFrame."""
+    """Parse Upstox option chain into a clean DataFrame.
+
+    Upstox v2 /option/chain response structure (each item):
+      {
+        "strike_price": 22600,
+        "call_options": {
+          "instrument_key": "...",
+          "market_data": {
+            "ltp": 232.45, "volume": 9981560,
+            "oi": 1864005, "bid_price": 232.4, "ask_price": 232.5,
+            "prev_oi": ..., "bid_qty": ..., "ask_qty": ...
+          },
+          "option_greeks": {
+            "vega": ..., "theta": ..., "gamma": ..., "delta": ...,
+            "iv": 40.45          ← IV lives HERE, not in market_data
+          }
+        },
+        "put_options": { ... same structure ... }
+      }
+
+    IV is in option_greeks.iv (percent form, e.g. 40.45 = 40.45% annualised).
+    Fallback: compute IV from LTP via Brenner-Subrahmanyam when option_greeks missing.
+    """
     rows = []
     if not raw_data: return pd.DataFrame()
     items = raw_data if isinstance(raw_data, list) else raw_data.get("options", [])
+
+    # Pre-compute approximate T for IV fallback (calendar days / 365, rough)
+    _today = datetime.now().date()
+
     for item in items:
-        strike = item.get("strike_price") or item.get("strike")
+        strike = float(item.get("strike_price") or item.get("strike") or 0)
         if not strike: continue
+
         ce = item.get("call_options", {}) or {}
         pe = item.get("put_options",  {}) or {}
-        def g(d, *keys):
+
+        def _md(d, *keys):
+            """Get from top-level or market_data sub-dict."""
             for k in keys:
                 if k in d: return d[k]
             md = d.get("market_data", {}) or {}
             for k in keys:
                 if k in md: return md[k]
             return 0
+
+        def _iv(d):
+            """Extract IV from option_greeks first, then market_data, then top-level.
+            Upstox returns IV in percent form (e.g. 38.4 means 38.4%).
+            Returns raw value as-is (not divided by 100) — _sanitise_iv handles that.
+            """
+            og = d.get("option_greeks", {}) or {}
+            # option_greeks.iv is the canonical location in Upstox v2
+            for k in ("iv", "implied_volatility"):
+                v = og.get(k)
+                if v is not None and v > 0:
+                    return float(v)
+            # Fallback: check market_data and top-level
+            md = d.get("market_data", {}) or {}
+            for k in ("implied_volatility", "iv"):
+                for src in (d, md):
+                    v = src.get(k)
+                    if v is not None and v > 0:
+                        return float(v)
+            return 0.0
+
+        ce_ltp = float(_md(ce, "ltp", "last_price") or 0)
+        pe_ltp = float(_md(pe, "ltp", "last_price") or 0)
+        ce_iv  = _iv(ce)
+        pe_iv  = _iv(pe)
+
+        ce_oi      = float(_md(ce, "oi", "open_interest") or 0)
+        ce_prev_oi = float(_md(ce, "prev_oi", "oi_day_change") or 0)
+        pe_oi      = float(_md(pe, "oi", "open_interest") or 0)
+        pe_prev_oi = float(_md(pe, "prev_oi", "oi_day_change") or 0)
+
         rows.append({
-            "Strike":  float(strike),
-            "CE_LTP":  g(ce,"last_price","ltp")        or 0,
-            "CE_OI":   g(ce,"open_interest","oi")      or 0,
-            "CE_OIC":  g(ce,"oi_day_change","oichange") or 0,
-            "CE_Vol":  g(ce,"volume","vol")             or 0,
-            "CE_IV":   g(ce,"implied_volatility","iv")  or 0,
-            "CE_Bid":  g(ce,"bid_price","bid")          or 0,
-            "CE_Ask":  g(ce,"ask_price","ask")          or 0,
-            "PE_LTP":  g(pe,"last_price","ltp")        or 0,
-            "PE_OI":   g(pe,"open_interest","oi")      or 0,
-            "PE_OIC":  g(pe,"oi_day_change","oichange") or 0,
-            "PE_Vol":  g(pe,"volume","vol")             or 0,
-            "PE_IV":   g(pe,"implied_volatility","iv")  or 0,
-            "PE_Bid":  g(pe,"bid_price","bid")          or 0,
-            "PE_Ask":  g(pe,"ask_price","ask")          or 0,
+            "Strike":  strike,
+            "CE_LTP":  ce_ltp,
+            "CE_OI":   ce_oi,
+            "CE_OIC":  ce_oi - ce_prev_oi,   # actual day change = oi − prev_oi
+            "CE_Vol":  float(_md(ce, "volume", "vol") or 0),
+            "CE_IV":   ce_iv,
+            "CE_Bid":  float(_md(ce, "bid_price", "bid") or 0),
+            "CE_Ask":  float(_md(ce, "ask_price", "ask") or 0),
+            "PE_LTP":  pe_ltp,
+            "PE_OI":   pe_oi,
+            "PE_OIC":  pe_oi - pe_prev_oi,   # actual day change = oi − prev_oi
+            "PE_Vol":  float(_md(pe, "volume", "vol") or 0),
+            "PE_IV":   pe_iv,
+            "PE_Bid":  float(_md(pe, "bid_price", "bid") or 0),
+            "PE_Ask":  float(_md(pe, "ask_price", "ask") or 0),
         })
     df = pd.DataFrame(rows).sort_values("Strike").reset_index(drop=True)
     if not df.empty:
@@ -4161,6 +4267,9 @@ if "opt_step"        not in st.session_state: st.session_state.opt_step        =
 if "payoff_legs"     not in st.session_state: st.session_state.payoff_legs     = []
 if "opt_loaded"      not in st.session_state: st.session_state.opt_loaded      = False
 if "opt_div_yield"   not in st.session_state: st.session_state.opt_div_yield   = {}
+# Chain live-data flags — set on each load, read by render section
+if "_chain_has_live" not in st.session_state: st.session_state["_chain_has_live"] = False
+if "_market_open"    not in st.session_state: st.session_state["_market_open"]    = True
 # Multi-expiry: stores a list of dicts, one per loaded expiry
 # Each dict: {expiry, dte, T, chain_df, atm_iv, straddle, exp_move_pct, oi_d}
 if "opt_multi_expiry" not in st.session_state: st.session_state.opt_multi_expiry = []
@@ -4226,7 +4335,7 @@ with st.sidebar:
     ikey      = find_instrument_key(master_df, sym_sel)
 
     if ikey:
-        expiry_list = fetch_expiries(ACCESS_TOKEN, ikey)
+        expiry_list = fetch_expiries(get_token(), ikey)
     else:
         expiry_list = []
         st.warning(f"No instrument key found for {sym_sel}")
@@ -4300,7 +4409,7 @@ padding:8px 10px;font-family:'IBM Plex Mono',monospace;font-size:0.77rem;margin-
   <div style="color:#ff8c00;font-weight:700;">{_s.opt_symbol} · {_s.opt_expiry}</div>
   <div style="color:#e8e8e8;">₹{_s.opt_spot:,.1f} · DTE {_s.opt_dte}</div>
   <div style="color:{_bc2};">{_bres.get('bias','—')} ({int(round(_bres.get('score',0))):+d})</div>
-  <div style="color:#555;">IV {_s.opt_atm_iv*100:.1f}% · HV {_s.opt_hv20*100:.1f}%</div>
+  <div style="color:#555;">IV {_s.opt_atm_iv*100:.1f}% · HV {(_s.opt_hv20 or CFG['hv_fallback'])*100:.1f}%</div>
 </div>""", unsafe_allow_html=True)
     else:
         st.caption(f"Strike Step: {step_val}")
@@ -4330,18 +4439,19 @@ if load_btn:
                 d = yf.download(yftick, period="2d", interval="1d", progress=False, auto_adjust=True)
                 if not d.empty:
                     spot = float(d["Close"].iloc[-1])
-            except: pass
+            except Exception as _yf_err:
+                st.warning(f"yfinance spot fallback failed for {sym_sel}: {_yf_err}")
         if not spot or spot <= 0:
             st.error(f"Could not get spot price for {sym_sel}. Use 'Spot Price Override'.")
             st.stop()
 
         # 2. Historical data
-        ohlcv_df = get_ohlcv(sym_sel, ACCESS_TOKEN, master_df)
+        ohlcv_df = get_ohlcv(sym_sel, get_token(), master_df)
         hv20     = compute_hv(ohlcv_df["close"].astype(float), CFG["hv_window"])      if not ohlcv_df.empty else None
         hv10     = compute_hv(ohlcv_df["close"].astype(float), CFG["hv_window_fast"]) if not ohlcv_df.empty else None
 
         # 2b. Intraday OHLCV — 5-min candles from Upstox (live, cached 60s)
-        intraday_df = get_intraday_ohlcv(sym_sel, ACCESS_TOKEN, interval="5minute", master_df=master_df)
+        intraday_df = get_intraday_ohlcv(sym_sel, get_token(), interval="5minute", master_df=master_df)
         st.session_state["opt_intraday_df"] = intraday_df
         # Persist ohlcv_df so flow/factor weight functions can access it without a parameter chain
         st.session_state["opt_ohlcv_df"] = ohlcv_df if not ohlcv_df.empty else None
@@ -4367,8 +4477,39 @@ if load_btn:
                                     if not st.session_state.opt_chain_data.empty else None)
 
         # 4. Option chain
-        chain_raw = fetch_option_chain(ACCESS_TOKEN, ikey, expiry_sel) if ikey and expiry_sel else []
+        chain_raw = fetch_option_chain(get_token(), ikey, expiry_sel) if ikey and expiry_sel else []
         chain_df  = parse_chain(chain_raw, spot, step_val)
+
+        # ── FIX: Detect whether chain has real live data ───────────────────────
+        # During market hours Upstox returns non-zero LTPs. Outside hours the
+        # chain structure arrives but all LTP/OI/IV fields are 0. We detect this
+        # and warn the user so misleading signals are clearly flagged.
+        _chain_has_live = (not chain_df.empty and chain_df["CE_LTP"].sum() > 0
+                           and chain_df["CE_OI"].sum() > 0)
+        _market_open = True  # default: assume open if pytz unavailable
+        if pytz:
+            _ist       = pytz.timezone("Asia/Kolkata")
+            _now_ist   = datetime.now(_ist)
+            _is_weekday = _now_ist.weekday() < 5
+            _mkt_open   = _now_ist.replace(hour=9,  minute=15, second=0, microsecond=0)
+            _mkt_close  = _now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
+            _market_open = _is_weekday and _mkt_open <= _now_ist <= _mkt_close
+
+            if not _market_open:
+                st.info(f"ℹ️ Market is currently **closed** (IST {_now_ist.strftime('%H:%M')}). "
+                        "Option chain LTP/OI/IV will be zero — signals based on OI/flow/IV are "
+                        "unreliable until market opens at 09:15 IST. Use data for planning only.")
+            elif not _chain_has_live:
+                st.warning("⚠️ Market is open but chain data shows all zeros. "
+                           "Possible causes: (1) token expired — paste a fresh token, "
+                           "(2) instrument key mismatch — try reloading. "
+                           "IV, OI and flow-based signals will be unreliable until real data loads.")
+        elif not _chain_has_live:
+            st.warning("⚠️ Option chain returned all-zero LTP/OI values. "
+                       "Check your token validity and retry.")
+
+        st.session_state["_chain_has_live"] = _chain_has_live
+        st.session_state["_market_open"]    = _market_open
 
         # 4b. Compute intraday signals from live 5-min candles + OI change data
         _intra_sigs = compute_intraday_signals(intraday_df, chain_df, spot)
@@ -4542,7 +4683,7 @@ if multi_load_btn:
                     datetime.now().date().isoformat(), _exp)), 1)
                 _T_me   = _dte_td / CFG["ann_days"]
 
-                _raw    = fetch_option_chain(ACCESS_TOKEN, _ikey_me, _exp) if _ikey_me else []
+                _raw    = fetch_option_chain(get_token(), _ikey_me, _exp) if _ikey_me else []
                 _cdf    = parse_chain(_raw, _spot_me, _step_me) if _raw else pd.DataFrame()
 
                 # ATM IV via straddle midpoint
@@ -4654,8 +4795,9 @@ chain_df = st.session_state.opt_chain_data
 bias_res = st.session_state.opt_bias
 oi_d     = st.session_state.opt_oi
 atm_iv   = st.session_state.opt_atm_iv
-hv20     = st.session_state.opt_hv20
-hv10     = st.session_state.get("opt_hv10", hv20)
+# FIX: hv20/hv10 can be None when no OHLCV data is available — guard with fallback
+hv20     = st.session_state.opt_hv20 or CFG["hv_fallback"]
+hv10     = st.session_state.get("opt_hv10") or hv20
 sym      = st.session_state.opt_symbol
 expiry   = st.session_state.opt_expiry
 dte      = st.session_state.opt_dte
@@ -5632,6 +5774,12 @@ with t_chain:
         _chain_hi = atm_k + CFG["chain_strikes"] * step
         disp_c = chain_df[(chain_df.Strike >= _chain_lo) & (chain_df.Strike <= _chain_hi)].copy()
 
+        # Warn when chain data is present but LTP/OI/IV are all zero
+        _live = st.session_state.get("_chain_has_live", True)
+        if not _live:
+            st.warning("⚠️ Chain data is all zeros (market closed or token expired). "
+                       "IV signals below are computed from HV only and are NOT reliable.")
+
         # Add directional + IV edge signal per row
         # IV edge: percentile-based. Collect all chain IV/HV ratios, classify by percentile.
         hv_ref = hv20 if hv20 and hv20 > 0.01 else atm_iv
@@ -5642,25 +5790,34 @@ with t_chain:
             if _ce_iv: _all_iv_ratios.append(_ce_iv / hv_ref)
             if _pe_iv: _all_iv_ratios.append(_pe_iv / hv_ref)
         # Sell threshold = CFG iv_hv_pct_sell-th percentile of this chain's IV/HV ratios
-        if len(_all_iv_ratios) >= 4:
+        # FIX: also guard against all-zero IV case (chain has data but IVs are 0)
+        _has_real_iv = len(_all_iv_ratios) >= 4 and max(_all_iv_ratios) > 0.01
+        if _has_real_iv:
             _rich_thresh  = float(np.percentile(_all_iv_ratios, CFG["iv_hv_pct_sell"]))
             _cheap_thresh = float(np.percentile(_all_iv_ratios, CFG["iv_hv_pct_buy"]))
         else:
-            # Absolute fallback when chain is tiny
+            # Absolute fallback when chain is tiny or IVs are all zero
             _rich_thresh  = CFG["iv_rich_ratio"]
             _cheap_thresh = CFG["iv_cheap_ratio"]
 
         def row_signal(row):
-            ce_iv = _sanitise_iv(float(row.CE_IV), atm_iv)
-            pe_iv = _sanitise_iv(float(row.PE_IV), atm_iv)
-            ce_ratio = ce_iv / (hv_ref + 1e-9)
-            pe_ratio = pe_iv / (hv_ref + 1e-9)
-            ce_dir   = "BUY" if bias_score >= 12 else "SELL" if bias_score <= -12 else "—"
-            pe_dir   = "BUY" if bias_score <= -12 else "SELL" if bias_score >= 12 else "—"
-            ce_vol   = f"SELL (rich ×{ce_ratio:.2f})"  if ce_ratio >= _rich_thresh  else \
-                       f"BUY (cheap ×{ce_ratio:.2f})" if ce_ratio <= _cheap_thresh else "—"
-            pe_vol   = f"SELL (rich ×{pe_ratio:.2f})"  if pe_ratio >= _rich_thresh  else \
-                       f"BUY (cheap ×{pe_ratio:.2f})" if pe_ratio <= _cheap_thresh else "—"
+            ce_iv = _sanitise_iv(float(row.CE_IV), None)
+            pe_iv = _sanitise_iv(float(row.PE_IV), None)
+            ce_dir = "BUY" if bias_score >= 12 else "SELL" if bias_score <= -12 else "—"
+            pe_dir = "BUY" if bias_score <= -12 else "SELL" if bias_score >= 12 else "—"
+            # FIX: suppress IV vol signal when actual per-strike IV is missing/zero
+            if ce_iv is None or not _has_real_iv:
+                ce_vol = "—"
+            else:
+                ce_ratio = ce_iv / (hv_ref + 1e-9)
+                ce_vol = (f"SELL (rich ×{ce_ratio:.2f})"  if ce_ratio >= _rich_thresh else
+                          f"BUY (cheap ×{ce_ratio:.2f})" if ce_ratio <= _cheap_thresh else "—")
+            if pe_iv is None or not _has_real_iv:
+                pe_vol = "—"
+            else:
+                pe_ratio = pe_iv / (hv_ref + 1e-9)
+                pe_vol = (f"SELL (rich ×{pe_ratio:.2f})"  if pe_ratio >= _rich_thresh else
+                          f"BUY (cheap ×{pe_ratio:.2f})" if pe_ratio <= _cheap_thresh else "—")
             return pd.Series({"CE_Dir": ce_dir, "CE_Vol_Sig": ce_vol,
                                "PE_Dir": pe_dir, "PE_Vol_Sig": pe_vol})
 
