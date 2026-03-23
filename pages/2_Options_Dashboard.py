@@ -1555,6 +1555,37 @@ def parse_chain(raw_data, spot, step=50):
     # Pre-compute approximate T for IV fallback (calendar days / 365, rough)
     _today = datetime.now().date()
 
+    # ── Helpers defined ONCE outside the loop ────────────────────────────────
+    def _md(d, *keys):
+        """Get a value from top-level dict OR its nested market_data sub-dict.
+        Returns the first key found (including 0). Returns 0 only if no key exists.
+        """
+        for k in keys:
+            if k in d:
+                return d[k]
+        md = d.get("market_data", {}) or {}
+        for k in keys:
+            if k in md:
+                return md[k]
+        return 0
+
+    def _iv_from(d):
+        """Extract IV % from option_greeks.iv (canonical Upstox v2 location).
+        Falls back to market_data and top-level. Returns raw percent (e.g. 43.4).
+        """
+        og = d.get("option_greeks", {}) or {}
+        for k in ("iv", "implied_volatility"):
+            v = og.get(k)
+            if v is not None and float(v) > 0:
+                return float(v)
+        md = d.get("market_data", {}) or {}
+        for src in (d, md):
+            for k in ("implied_volatility", "iv"):
+                v = src.get(k)
+                if v is not None and float(v) > 0:
+                    return float(v)
+        return 0.0
+
     for item in items:
         strike = float(item.get("strike_price") or item.get("strike") or 0)
         if not strike: continue
@@ -1562,48 +1593,20 @@ def parse_chain(raw_data, spot, step=50):
         ce = item.get("call_options", {}) or {}
         pe = item.get("put_options",  {}) or {}
 
-        def _md(d, *keys):
-            """Get from top-level or market_data sub-dict."""
-            for k in keys:
-                if k in d: return d[k]
-            md = d.get("market_data", {}) or {}
-            for k in keys:
-                if k in md: return md[k]
-            return 0
-
-        def _iv(d):
-            """Extract IV from option_greeks first, then market_data, then top-level.
-            Upstox returns IV in percent form (e.g. 38.4 means 38.4%).
-            Returns raw value as-is (not divided by 100) — _sanitise_iv handles that.
-            """
-            og = d.get("option_greeks", {}) or {}
-            # option_greeks.iv is the canonical location in Upstox v2
-            for k in ("iv", "implied_volatility"):
-                v = og.get(k)
-                if v is not None and v > 0:
-                    return float(v)
-            # Fallback: check market_data and top-level
-            md = d.get("market_data", {}) or {}
-            for k in ("implied_volatility", "iv"):
-                for src in (d, md):
-                    v = src.get(k)
-                    if v is not None and v > 0:
-                        return float(v)
-            return 0.0
-
         ce_ltp = float(_md(ce, "ltp", "last_price") or 0)
         pe_ltp = float(_md(pe, "ltp", "last_price") or 0)
-        ce_iv  = _iv(ce)
-        pe_iv  = _iv(pe)
+        ce_iv  = _iv_from(ce)
+        pe_iv  = _iv_from(pe)
 
         ce_oi      = float(_md(ce, "oi", "open_interest") or 0)
         pe_oi      = float(_md(pe, "oi", "open_interest") or 0)
 
-        # ΔOI: Upstox v2 /option/chain does NOT return prev_oi in the response.
-        # We use net_change from market_data if available, otherwise 0.
-        # True ΔOI tracking is done in session state between consecutive loads.
-        ce_oic = float(_md(ce, "net_change", "oi_change", "oi_day_change") or 0)
-        pe_oic = float(_md(pe, "net_change", "oi_change", "oi_day_change") or 0)
+        # prev_oi IS returned by Upstox v2 inside market_data.
+        # ΔOI = current oi − prev_oi (session-state tracking as secondary fallback).
+        ce_prev_oi = float(_md(ce, "prev_oi") or 0)
+        pe_prev_oi = float(_md(pe, "prev_oi") or 0)
+        ce_oic = (ce_oi - ce_prev_oi) if ce_prev_oi > 0 else float(_md(ce, "net_change", "oi_change") or 0)
+        pe_oic = (pe_oi - pe_prev_oi) if pe_prev_oi > 0 else float(_md(pe, "net_change", "oi_change") or 0)
 
         rows.append({
             "Strike":  strike,
@@ -4481,8 +4484,26 @@ if load_btn:
                                     if not st.session_state.opt_chain_data.empty else None)
 
         # 4. Option chain
+        # FIX: Clear chain cache on every explicit Load button press so LTP/OI always refresh.
+        # The 30s cache is useful for tab-switching re-renders, not for explicit user reloads.
+        fetch_option_chain.clear()
         chain_raw = fetch_option_chain(get_token(), ikey, expiry_sel) if ikey and expiry_sel else []
         chain_df  = parse_chain(chain_raw, spot, step_val)
+
+        # ── Debug expander: show raw API response to diagnose field mapping issues ──
+        with st.expander("🔬 Raw API Debug (first item)", expanded=False):
+            if chain_raw and len(chain_raw) > 0:
+                # Find ATM strike item for display
+                _dbg_item = min(chain_raw, key=lambda x: abs(float(x.get("strike_price", 0)) - spot))
+                st.json(_dbg_item)
+                _dbg_ce = _dbg_item.get("call_options", {})
+                _dbg_md = _dbg_ce.get("market_data", {})
+                _dbg_og = _dbg_ce.get("option_greeks", {})
+                st.caption(f"market_data keys: {list(_dbg_md.keys())}")
+                st.caption(f"option_greeks keys: {list(_dbg_og.keys())}")
+                st.caption(f"Parsed → CE_LTP: {chain_df[chain_df.Strike == float(_dbg_item.get('strike_price',0))]['CE_LTP'].values if not chain_df.empty else 'N/A'}")
+            else:
+                st.warning("chain_raw is empty — API returned no data")
 
         # ── FIX: Detect whether chain has real live data ───────────────────────
         # During market hours Upstox returns non-zero LTPs. Outside hours the
