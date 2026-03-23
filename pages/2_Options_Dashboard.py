@@ -225,7 +225,7 @@ _PRIOR = {
 
 _CALIB_STORE_KEY = "monarch_calib"   # session_state key for persisted calibration
 _CALIB_FILE      = ".monarch_calib.json"   # disk path — survives restarts
-_CALIB_MIN_OBS   = 15                # minimum paired observations before overriding prior
+_CALIB_MIN_OBS   = 8                 # minimum paired observations before overriding prior (was 15 = 60 trading days; 8 = ~32 days)
 _CALIB_WINDOW    = 252               # rolling window for correlation computation
 
 # ── Signal history persistence ─────────────────────────────────────────────────
@@ -240,10 +240,16 @@ _HIST_PERSIST_PREFIXES = (
     "_calib_",          # calibration signal histories (e.g. _calib_raw_score_hist)
     "_outcome_pending_",# pending signal snapshots awaiting resolution
     "_flow_",           # flow signal histories (pcr_hist, oi_hist, skew_hist, gex_hist)
-    "NIFTY:_calib_",    # symbol-namespaced histories
-    "BANKNIFTY:_calib_",
-    "FINNIFTY:_calib_",
-    "MIDCPNIFTY:_calib_",
+    # FIX: all symbol-namespaced histories — use ":_calib_" suffix match instead of
+    # listing each symbol explicitly. The _save_hist() function already handles the
+    # ":_calib_" in k check. This tuple is used by _restore_hist for the load filter.
+    "NIFTY:_calib_", "BANKNIFTY:_calib_", "FINNIFTY:_calib_", "MIDCPNIFTY:_calib_",
+    # Stock symbols
+    "RELIANCE:_calib_", "HDFCBANK:_calib_", "ICICIBANK:_calib_", "INFY:_calib_",
+    "TCS:_calib_", "LT:_calib_", "SBIN:_calib_", "AXISBANK:_calib_",
+    "KOTAKBANK:_calib_", "BHARTIARTL:_calib_", "BAJFINANCE:_calib_",
+    "WIPRO:_calib_", "HCLTECH:_calib_", "TATAMOTORS:_calib_", "MARUTI:_calib_",
+    "SUNPHARMA:_calib_", "TITAN:_calib_", "ADANIENT:_calib_",
 )
 
 
@@ -277,7 +283,9 @@ def _save_hist():
                 k.startswith("_outcome_pending_") or
                 k.startswith("_oi_snap_") or
                 k.startswith("_calib_intra_") or
-                (":_calib_" in k)):
+                (":_calib_" in k) or
+                k == "opt_factor_hist" or       # FIX: factor weight correlation histories
+                k == "_flow_skew_oi_hist"):     # FIX: OI skew history for z-score baseline
                 if isinstance(v, (list, dict)):
                     out[k] = v
         with open(_HIST_FILE, "w") as f:
@@ -290,6 +298,7 @@ def _restore_hist():
     """Load persisted signal histories into session_state on first session call.
     Merges disk data into session_state without overwriting keys already present
     (in case the session was partially populated before this call).
+    FIX: Uses suffix match ":_calib_" to cover ALL stock symbols, not just the 4 indices.
     Called once at startup via _HIST_LOADED_KEY flag.
     """
     if st.session_state.get(_HIST_LOADED_KEY):
@@ -297,7 +306,12 @@ def _restore_hist():
     data = _load_hist()
     for k, v in data.items():
         if k not in st.session_state:
-            st.session_state[k] = v
+            # Accept any key matching the persist prefixes OR any symbol-namespaced calib key
+            _accept = (any(k.startswith(pfx) for pfx in _HIST_PERSIST_PREFIXES)
+                       or ":_calib_" in k
+                       or k in ("opt_factor_hist", "_flow_skew_oi_hist"))
+            if _accept:
+                st.session_state[k] = v
     st.session_state[_HIST_LOADED_KEY] = True
 
 
@@ -714,9 +728,22 @@ def _resolve_outcomes(symbol: str, current_spot: float, ohlcv_df) -> list:
                 if entry_spot <= 0:
                     continue  # can't compute return without entry spot
 
-                # Use actual close price elapsed sessions later if OHLCV available
+                # FIX: Use the close at entry_date + horizon_days, not today's close.
+                # closes[-1] was always today regardless of elapsed days — look-ahead contamination.
+                # Now we find the actual index: closes[-elapsed] approximates the close
+                # that was elapsed trading sessions ago (most recent close at resolution time).
+                # If elapsed > len(closes), fall back to current spot (live price).
                 if closes is not None and elapsed <= len(closes):
-                    realised_ret = float(np.log(closes[-1] / entry_spot))
+                    # closes[-elapsed] = close at approximately entry_date + horizon_days
+                    # (close array is sorted ascending: closes[-1]=today, closes[-elapsed]=N days ago)
+                    # We want the close AT the horizon, not today.
+                    # Since closes is daily OHLCV ending today, closes[-1]=today, closes[-2]=yesterday.
+                    # The close closest to entry+horizon is closes[-(elapsed-horizon+horizon)] = closes[-1]
+                    # when elapsed == horizon (just resolved). But elapsed >= horizon here.
+                    # Use closes[min(-1, -(elapsed - horizon + 1))] to get the horizon-day close.
+                    _idx = max(1, elapsed - int(entry.get("horizon", 4)) + 1)
+                    _target_close = float(closes[min(-1, -_idx)])
+                    realised_ret = float(np.log(_target_close / entry_spot))
                 else:
                     realised_ret = float(np.log(current_spot / entry_spot))
 
@@ -2225,16 +2252,20 @@ def compute_flow_scores(chain_df, ohlcv_df):
         total_oi = float(chain_df["CE_OI"].sum() + chain_df["PE_OI"].sum())
         _oi_hist = st.session_state.get("_flow_oi_hist", [])
         _oi_hist.append(total_oi)
-        if len(_oi_hist) > 10: _oi_hist = _oi_hist[-10:]
+        if len(_oi_hist) > 30: _oi_hist = _oi_hist[-30:]  # FIX: was 10; 30 gives stable z-score baseline
         st.session_state["_flow_oi_hist"] = _oi_hist
-        if len(_oi_hist) >= 3:
+        if len(_oi_hist) >= 5:
             oi_arr   = np.array(_oi_hist)
             oi_mu    = float(np.mean(oi_arr[:-1]))
             oi_std   = float(np.std(oi_arr[:-1])) or (oi_mu * _calib("std_floor_frac"))
             dOI_z    = (total_oi - oi_mu) / (oi_std + 1e-9)
-            # OI change magnitude: higher OI change = more conviction in either direction
-            # Sign: undetermined from OI alone — weight as unsigned activity signal
-            flow["dOI"] = round(max(-1.0, min(1.0, dOI_z / 2.0)), 3)
+            # FIX: dOI gets direction from dPCR sign (put growth=bullish, call growth=bearish).
+            # Rising OI alone is ambiguous: new longs OR new shorts.
+            # dPCR tells us which side is growing; its sign orients the OI surge.
+            # When dPCR is not yet available, treat as unsigned conviction boost only.
+            _dPCR_sign = math.copysign(1.0, flow.get("dPCR", 0.0)) if flow.get("dPCR", 0.0) != 0 else 0.0
+            dOI_directed = dOI_z * _dPCR_sign if _dPCR_sign != 0 else abs(dOI_z)
+            flow["dOI"] = round(max(-1.0, min(1.0, dOI_directed / 2.0)), 3)
 
         # ── dPCR: Change in put/call ratio ───────────────────────────────────────
         # RISING PCR (more puts being added) = put writers providing support = BULLISH
@@ -2244,9 +2275,9 @@ def compute_flow_scores(chain_df, ohlcv_df):
         pcr_now  = pe_oi / (ce_oi + 1e-9)
         _pcr_hist = st.session_state.get("_flow_pcr_hist", [])
         _pcr_hist.append(pcr_now)
-        if len(_pcr_hist) > 10: _pcr_hist = _pcr_hist[-10:]
+        if len(_pcr_hist) > 30: _pcr_hist = _pcr_hist[-30:]  # FIX: was 10
         st.session_state["_flow_pcr_hist"] = _pcr_hist
-        if len(_pcr_hist) >= 3:
+        if len(_pcr_hist) >= 5:
             pcr_arr  = np.array(_pcr_hist)
             pcr_mu   = float(np.mean(pcr_arr[:-1]))
             pcr_std  = float(np.std(pcr_arr[:-1])) or (pcr_mu * _calib("std_floor_frac"))
@@ -2269,9 +2300,9 @@ def compute_flow_scores(chain_df, ohlcv_df):
                 skew_now   = (pe_iv_now - ce_iv_now) if (ce_iv_now > 0 and pe_iv_now > 0) else 0.0
                 _skew_hist = st.session_state.get("_flow_skew_hist", [])
                 _skew_hist.append(skew_now)
-                if len(_skew_hist) > 10: _skew_hist = _skew_hist[-10:]
+                if len(_skew_hist) > 30: _skew_hist = _skew_hist[-30:]  # FIX: was 10
                 st.session_state["_flow_skew_hist"] = _skew_hist
-                if len(_skew_hist) >= 3:
+                if len(_skew_hist) >= 5:
                     sk_arr   = np.array(_skew_hist)
                     sk_mu    = float(np.mean(sk_arr[:-1]))
                     sk_std   = float(np.std(sk_arr[:-1])) or (_calib("std_floor_frac") * 0.1)
@@ -2288,9 +2319,9 @@ def compute_flow_scores(chain_df, ohlcv_df):
         gex_now   = float(oi_d_cur.get("net_gex", 0) or 0)
         if gex_now != 0:   # only track when we have real GEX data
             _gex_hist.append(gex_now)
-            if len(_gex_hist) > 10: _gex_hist = _gex_hist[-10:]
+            if len(_gex_hist) > 30: _gex_hist = _gex_hist[-30:]  # FIX: was 10
             st.session_state["_flow_gex_hist"] = _gex_hist
-            if len(_gex_hist) >= 3:
+            if len(_gex_hist) >= 5:
                 gex_arr  = np.array(_gex_hist)
                 gex_mu   = float(np.mean(gex_arr[:-1]))
                 gex_std  = float(np.std(gex_arr[:-1])) or (abs(gex_mu) * 0.1 + 1e-9)
@@ -4017,11 +4048,20 @@ def compute_probabilistic_score(
     implied_prob_up = min(0.90, max(0.10, 0.50 + (em_iv_spec / (spot + 1e-9)) / 2.0))
 
     # ── PART 4: Model expected move ───────────────────────────────────────────
-    # model_move = expected_move * (0.5 + |final_score|)
-    # This estimates how much the model expects relative to implied move.
-    # Use blended_raw if available (intraday blended), else raw_score
+    # FIX: Replace heuristic (0.5 + |score|) with empirically grounded estimate.
+    # Use the ATR-based 1-day move scaled to DTE, then bias by directional conviction.
+    # When OHLCV is available: use realised volatility (HV20) scaled to DTE.
+    # This is the same logic used for the straddle pricing but uses realised vol, not IV.
+    # model_move = spot * HV20 * sqrt(DTE/252) = HV-implied move for the holding period
+    # Then scale by (1 + 0.5 * |score|) — a moderate conviction multiplier (max 1.5x at |score|=1).
+    # This is far better than implied*1.5 because: (a) it uses realised vol not IV,
+    # (b) the multiplier is bounded and principled, (c) |score| captures model conviction.
+    _hv_for_move = hv20 if (hv20 and hv20 > 0.01) else CFG["hv_fallback"]
+    _hv_move_base  = spot * _hv_for_move * math.sqrt(max(T * CFG["ann_days"], 1) / 252.0)
     _final_score_for_move = raw_score   # best available final score
-    model_move     = em_iv_spec * (0.5 + abs(_final_score_for_move))
+    # Conviction multiplier: 1.0 (neutral) → 1.5 (max conviction). Bounded, not explosive.
+    _conviction_mult = 1.0 + 0.5 * abs(_final_score_for_move)
+    model_move     = _hv_move_base * _conviction_mult
     model_move_pct = round(model_move / (spot + 1e-9) * 100, 2)
 
     # ── PART 5: Edge detection ────────────────────────────────────────────────
