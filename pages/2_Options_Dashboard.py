@@ -10337,6 +10337,21 @@ with t_prob:
                       st.session_state.get("_calib_actual_up_hist", [])
     _pe_n_obs       = min(len(_pe_prob_hist), len(_pe_actual_hist))
 
+    # ── Safe defaults for variables assigned inside conditional blocks ────────
+    # Python raises NameError if §6 references these before the guarded block
+    # that sets them was reached (e.g. _pe_n_obs < 5 skips §4's assignment).
+    _brier         = None          # set in §4 when _pe_n_obs >= 5
+    _brier_label   = "—"           # set in §4 when _pe_n_obs >= 5
+    _brier_skill   = None          # set in §4 when _pe_n_obs >= 5
+    _brier_bar_pct = 0.0           # set in §4 when _pe_n_obs >= 5
+    _dir_edge_col  = "#888"        # set in §1 inside else block
+    _dir_edge_lbl  = "⚪ Neutral"  # set in §1 inside else block
+    _pu_col        = "#ffb347"     # set in §1 inside else block
+    _ve_col2       = "#888"        # set in §5 inside else block
+    _ve_lbl2       = "↔ No Vol Edge — neutral"  # set in §5 inside else block
+    _pe_trade      = "WAIT — no clear edge"     # set in §5 inside else block
+    _pe_trade_col  = "#888"        # set in §5 inside else block
+
     # ── Page title ─────────────────────────────────────────────────────────────
     st.markdown("### 🎲 Probability Engine — Decision Dashboard")
     st.caption(
@@ -10797,7 +10812,7 @@ Neutral + Long Vol → Straddle
         _pe_top_nm  = _pe_top_s.get("Strategy", "—")
 
         # Brier (reuse if already computed, else show placeholder)
-        _pe_brier_disp = f"{_brier:.4f} ({_brier_label})" if _pe_n_obs >= 5 else "— (< 5 obs)"
+        _pe_brier_disp = (f"{_brier:.4f} ({_brier_label})" if (_brier is not None and _pe_n_obs >= 5) else "— (< 5 obs)")
 
         # Move vs IV display
         _pe_mvi_disp2 = (
