@@ -124,6 +124,28 @@ CFG = {
     },
     "lot_size_fallback": 500,
     "pop_simulations": 10000,
+    # ── NSE/SEBI Transaction Cost Schedule (all rates as decimals of premium) ──
+    # Source: NSE circular + SEBI schedule effective Jan 2025.
+    # These are FIXED fee schedules — no data needed, just constants.
+    # Applied per leg at entry AND exit (round-trip = 2×).
+    # EV is already a round-trip calculation (entry cost embedded in premium_eff,
+    # exit assumed at intrinsic), so we apply costs once at entry only.
+    "tx_cost": {
+        # STT: 0.0625% of premium on SELL legs only (option seller pays STT on premium)
+        # Buyer pays STT at exercise only (usually negligible for OTM options)
+        "stt_sell_pct":      0.000625,   # 0.0625% of premium, sell leg only
+        # NSE Exchange Transaction Charges: 0.053% of premium turnover (both sides)
+        "nse_charge_pct":    0.00053,    # 0.053% of premium
+        # SEBI Turnover Fee: ₹10 per crore of turnover = 0.0001% of premium
+        "sebi_fee_pct":      0.000001,   # 0.0001% of premium
+        # Stamp duty: 0.003% of premium on BUY legs only (buyer pays)
+        "stamp_duty_pct":    0.00003,    # 0.003% of premium, buy leg only
+        # GST: 18% on (brokerage + exchange charges + SEBI fee)
+        # Brokerage assumed flat ₹20/order — we model it as 0 here and let
+        # the user's actual broker rate appear in their P&L, not the model EV.
+        # We include GST only on the exchange charges and SEBI fee (the model-known costs).
+        "gst_rate":          0.18,       # 18% GST on exchange + SEBI charges
+    },
     # ── Intraday candle windows ───────────────────────────────────────────────
     # All window sizes as trading parameters, not magic numbers.
     # 5-minute candles: 6 candles = 30 min, 3 candles = 15 min, 18 candles = 90 min
@@ -658,6 +680,193 @@ def _run_calibration_cycle(ohlcv_df, symbol: str = "", horizon: int = 4):
                 _set_calib("intra_blend_weight", round(v_blend[1], 6), sym)
 
 
+def _bootstrap_signal_history(ohlcv_df, symbol: str = "", horizon: int = 4,
+                               min_bars: int = 60, max_bars: int = 252):
+    """Bootstrap historical calibration from past OHLCV data.
+
+    Replays a simplified factor model over up to `max_bars` of daily price/volume
+    history to produce paired (signal_score, forward_return, actual_up) observations.
+    These are written directly into the calibration session-state histories so that
+    _run_calibration_cycle immediately has real data to work with — no weeks of
+    live Load clicks required.
+
+    Signals reconstructed from OHLCV alone (no chain data needed):
+      • EMA structure  (20d vs 50d vs 200d cross)  — trend factor proxy
+      • RSI 14         (momentum / overbought-oversold)
+      • 5-day return   (short-term momentum)
+      • 20-day HV      (vol regime proxy — high HV → bearish lean)
+      • ATR percentile (trend strength proxy for ADX)
+
+    This is a deliberate approximation — it captures the directional factors
+    but omits flow and positioning (which require chain data). The result is
+    a calibrated logistic_sharpness and Brier baseline from day one rather
+    than after weeks of accumulation.
+
+    The function is idempotent: it checks whether bootstrap has already been
+    run for this symbol + bar-count combination and skips if so.
+    """
+    sym = symbol.upper() if symbol else ""
+
+    if ohlcv_df is None or ohlcv_df.empty:
+        return
+
+    try:
+        c_all = ohlcv_df["close"].astype(float).dropna().reset_index(drop=True)
+        n_all = len(c_all)
+        if n_all < min_bars + horizon:
+            return   # not enough history
+
+        # ── Idempotency guard ──────────────────────────────────────────────────
+        # Key encodes symbol + number of bars so re-loading with more data re-runs.
+        _guard_key = f"_bootstrap_done:{sym}:{n_all}"
+        if st.session_state.get(_guard_key, False):
+            return
+        st.session_state[_guard_key] = True
+
+        # ── Use at most max_bars of history ────────────────────────────────────
+        c = c_all.tail(max_bars + horizon).reset_index(drop=True)
+        n = len(c)
+
+        # Pre-compute indicators across the full window
+        # EMA series
+        e20  = c.ewm(span=20,  adjust=False).mean()
+        e50  = c.ewm(span=50,  adjust=False).mean()
+        e200 = c.ewm(span=200, adjust=False).mean()
+
+        # RSI 14
+        delta = c.diff()
+        gain  = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+        loss  = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
+        rsi_s = (100 - 100 / (1 + gain / loss.replace(0, float("nan")))).fillna(50.0)
+
+        # 20-day HV (annualised)
+        lr_s  = np.log(c / c.shift(1))
+        hv20  = lr_s.rolling(20).std() * math.sqrt(252)
+
+        # ATR 14-day proxy (using only close — no high/low in simple OHLCV schema)
+        atr_s = lr_s.abs().rolling(14).mean() * math.sqrt(252)
+        atr_pct_s = atr_s.rank(pct=True).fillna(0.5)   # percentile rank
+
+        # 5-day log return
+        ret5  = np.log(c / c.shift(5))
+
+        # Minimum warm-up: need 200 bars of EMA + 20 HV + 14 ATR
+        warmup = min(200, n // 2)
+
+        raw_scores  = []
+        prob_ups    = []
+        actual_ups  = []
+        fwd_returns = []
+
+        _sharpness_prior = _PRIOR["logistic_sharpness"]  # use prior for bootstrap
+
+        for i in range(warmup, n - horizon):
+            try:
+                spot_i  = float(c.iloc[i])
+                e20_i   = float(e20.iloc[i])
+                e50_i   = float(e50.iloc[i])
+                e200_i  = float(e200.iloc[i])
+                rsi_i   = float(rsi_s.iloc[i])
+                hv_i    = float(hv20.iloc[i]) if not math.isnan(hv20.iloc[i]) else 0.15
+                atr_i   = float(atr_pct_s.iloc[i])
+                ret5_i  = float(ret5.iloc[i]) if not math.isnan(ret5.iloc[i]) else 0.0
+
+                # ── Mini factor model (price/vol signals only) ─────────────────
+                # EMA structure: fraction of checks bullish, mapped to [-1,+1]
+                ema_checks = [spot_i > e20_i, spot_i > e50_i, e20_i > e50_i,
+                              spot_i > e200_i, e50_i > e200_i]
+                ema_z = (sum(ema_checks) / len(ema_checks)) * 2 - 1   # [-1,+1]
+
+                # RSI z-score (50 = neutral)
+                rsi_z = max(-1.0, min(1.0, (rsi_i - 50.0) / 25.0))
+
+                # 5-day momentum z-score (annualise then clamp)
+                mom_z = max(-1.0, min(1.0, ret5_i * math.sqrt(252 / 5) / 0.30))
+
+                # HV regime: high HV → vol expensive → slight bearish lean
+                hv_z  = max(-1.0, min(1.0, -(hv_i - 0.15) / 0.10))   # z around 15% baseline
+
+                # ATR percentile as trend strength (high ATR → trend is in motion)
+                atr_z = (atr_i - 0.5) * 2.0   # [-1,+1]
+
+                # Weighted composite (no flow/positioning — unavailable from OHLCV)
+                # Weights sum to 1.0; use the CFG factor weights as guide but
+                # redistribute flow+positioning weight proportionally to what's available.
+                raw = (0.40 * ema_z
+                     + 0.20 * mom_z
+                     + 0.20 * rsi_z
+                     + 0.10 * hv_z
+                     + 0.10 * atr_z)
+                raw = max(-1.0, min(1.0, raw))
+
+                prob_up_i = 1.0 / (1.0 + math.exp(-raw * _sharpness_prior))
+
+                # Forward outcome: was next-horizon-day close > today?
+                fwd_c   = float(c.iloc[i + horizon])
+                fwd_ret = math.log(fwd_c / spot_i) if spot_i > 0 else 0.0
+                act_up  = 1.0 if fwd_c > spot_i else 0.0
+
+                raw_scores.append(raw)
+                prob_ups.append(prob_up_i)
+                actual_ups.append(act_up)
+                fwd_returns.append(fwd_ret)
+
+            except Exception:
+                continue
+
+        if len(raw_scores) < _CALIB_MIN_OBS:
+            return
+
+        # ── Write into calibration histories ──────────────────────────────────
+        # Use _set_calib-style direct session-state writes (bypass _record to
+        # avoid load-id guard — we want to write unconditionally here).
+        _ns = lambda key: f"{sym}:{key}" if sym else key
+
+        def _write_hist(key, values):
+            existing = list(st.session_state.get(_ns(key), []))
+            # Prepend bootstrap observations (older), keep live ones at end
+            combined = (values + existing)[-_CALIB_WINDOW:]
+            st.session_state[_ns(key)] = combined
+            # Also write to global (no-prefix) key as fallback
+            if sym:
+                g_existing = list(st.session_state.get(key, []))
+                st.session_state[key] = (values + g_existing)[-_CALIB_WINDOW:]
+
+        _write_hist("_calib_raw_score_hist",     raw_scores)
+        _write_hist("_calib_prob_up_hist",        prob_ups)
+        _write_hist("_calib_actual_up_hist",      actual_ups)
+        _write_hist("_calib_realised_ret_hist",   fwd_returns)
+
+        # EMA and RSI histories for sub-factor calibration
+        ema_scores = []
+        rsi_scores = []
+        for i in range(warmup, n - horizon):
+            try:
+                spot_i = float(c.iloc[i])
+                ema_checks = [spot_i > float(e20.iloc[i]),  spot_i > float(e50.iloc[i]),
+                              float(e20.iloc[i]) > float(e50.iloc[i]),
+                              spot_i > float(e200.iloc[i]), float(e50.iloc[i]) > float(e200.iloc[i])]
+                ema_scores.append((sum(ema_checks) / len(ema_checks)) * 2 - 1)
+                rsi_v = float(rsi_s.iloc[i])
+                rsi_scores.append(max(-1.0, min(1.0, (rsi_v - 50.0) / 25.0)))
+            except Exception:
+                ema_scores.append(0.0); rsi_scores.append(0.0)
+
+        _write_hist("_calib_ema_score_hist", ema_scores)
+        _write_hist("_calib_rsi_trend_hist", rsi_scores)
+        # ADX proxy = ATR percentile (directional strength)
+        adx_proxy = [(float(atr_pct_s.iloc[i]) - 0.5) * 2.0
+                     for i in range(warmup, n - horizon)
+                     if not math.isnan(float(atr_pct_s.iloc[i]))]
+        _write_hist("_calib_adx_score_hist", adx_proxy[:len(raw_scores)])
+
+        # Now run the full calibration cycle with the bootstrapped data
+        _run_calibration_cycle(ohlcv_df, symbol=sym, horizon=horizon)
+
+    except Exception:
+        pass   # bootstrap is best-effort; never crash the Load flow
+
+
 def _record(key: str, val: float, symbol: str = None):
     """Append a scalar observation to a calibration history list.
     If symbol is None, auto-reads opt_symbol from session state.
@@ -1058,27 +1267,60 @@ display:flex;justify-content:space-between;margin-bottom:12px;">
 """, unsafe_allow_html=True)
 
 # ============================================================
-# TOKEN — shared with screener_pro.py
+# TOKEN — shared with Home.py and screener_pro.py
 # ============================================================
 TOKEN_FILE = ".upstox_token_scanner"
 
+# TOKEN HANDSHAKE FIX (was: always overwrite opt_access_token from file on first visit)
+#
+# The original block ran whenever "opt_token_loaded" was absent, which is true on
+# every fresh page navigation — including after the user just logged in on Home.py.
+# It unconditionally set opt_access_token from the file, wiping whatever Home.py's
+# save_token() had already written into session_state.
+#
+# Correct priority order:
+#   1. opt_access_token already in session_state and non-empty  → use it (Home.py set it)
+#   2. upstox_token in session_state and non-empty              → use it (Home.py's key)
+#   3. scanner_token in session_state and non-empty             → use it (screener key)
+#   4. TOKEN_FILE on disk and non-empty                         → use it (previous session)
+#   5. Empty string                                             → show token input
+#
+# The "opt_token_loaded" guard is kept so this runs only once per session, but it
+# no longer overwrites a token that is already live in session_state.
+
 if "opt_token_loaded" not in st.session_state:
-    if os.path.exists(TOKEN_FILE):
+    _existing = (
+        st.session_state.get("opt_access_token", "")   # already set by Home.py or a previous run
+        or st.session_state.get("upstox_token", "")    # Home.py primary key
+        or st.session_state.get("scanner_token", "")   # screener_pro key
+    )
+    if not _existing and os.path.exists(TOKEN_FILE):
         try:
             with open(TOKEN_FILE, "r") as f:
-                st.session_state.opt_access_token = f.read().strip()
+                _existing = f.read().strip()
         except:
-            st.session_state.opt_access_token = ""
-    else:
-        st.session_state.opt_access_token = ""
+            _existing = ""
+    st.session_state.opt_access_token = _existing
     st.session_state.opt_token_loaded = True
+else:
+    # On subsequent re-renders: if Home.py updated upstox_token after option.py
+    # already loaded, sync it forward so get_token() stays fresh.
+    _home_tok = (st.session_state.get("upstox_token", "")
+                 or st.session_state.get("scanner_token", ""))
+    if _home_tok and not st.session_state.get("opt_access_token", ""):
+        st.session_state.opt_access_token = _home_tok
 
 with st.sidebar:
     st.markdown("### 🔑 Upstox Token")
+    # Always show current live token (may have been set by Home.py after page load)
+    _cur_tok = st.session_state.get("opt_access_token", "")
     tok_inp = st.text_input("Access Token", type="password",
-                             value=st.session_state.opt_access_token, key="opt_tok_inp")
-    if tok_inp and tok_inp != st.session_state.opt_access_token:
+                             value=_cur_tok, key="opt_tok_inp")
+    if tok_inp and tok_inp != _cur_tok:
         st.session_state.opt_access_token = tok_inp
+        # Sync to Home.py and screener keys so all pages stay in lockstep
+        st.session_state.upstox_token  = tok_inp
+        st.session_state.scanner_token = tok_inp
         # FIX: defer cache clearing until after all cached functions are defined.
         # Calling .clear() here (before their definitions at line ~1606+) raises
         # NameError on every token save. Use a session flag instead; the actual
@@ -1403,6 +1645,94 @@ def _estimate_real_world_drift(ohlcv_df, r, q):
         return max(-1.0, min(2.0, mu))
     except Exception:
         return r - q
+
+
+def _tx_cost_per_leg(premium: float, action: str, qty: int = 1) -> float:
+    """Return total transaction cost in ₹ for ONE leg (one unit, not lot-adjusted).
+
+    Cost components applied at ENTRY (single side — exit is at intrinsic in MC,
+    which has no premium-based charges):
+      • STT:        0.0625% of premium on SELL legs (seller pays on entry)
+      • Stamp duty: 0.003%  of premium on BUY  legs (buyer pays on entry)
+      • NSE charge: 0.053%  of premium (both sides)
+      • SEBI fee:   0.0001% of premium (both sides)
+      • GST 18%:    on NSE charge + SEBI fee (not on STT or stamp duty)
+
+    qty: number of units (not lots — caller multiplies by lot_size if needed).
+    Returns ₹ cost per unit to subtract from the leg's effective premium.
+    """
+    tc  = CFG["tx_cost"]
+    pr  = max(float(premium), 0.0)
+    act = str(action).lower()
+
+    # Side-specific charges
+    stt        = pr * tc["stt_sell_pct"]   if act == "sell" else 0.0
+    stamp      = pr * tc["stamp_duty_pct"] if act == "buy"  else 0.0
+
+    # Both-side charges
+    nse_charge = pr * tc["nse_charge_pct"]
+    sebi_fee   = pr * tc["sebi_fee_pct"]
+    gst        = (nse_charge + sebi_fee) * tc["gst_rate"]
+
+    total_per_unit = (stt + stamp + nse_charge + sebi_fee + gst) * qty
+    return round(total_per_unit, 4)
+
+
+def _fit_jump_params(ohlcv_df, ann_days: int = 252):
+    """Fit Merton jump-diffusion parameters from historical OHLCV log-returns.
+
+    Method-of-moments on the empirical log-return distribution:
+      • Identify jump days as |daily_log_return| > 2σ  (extreme moves)
+      • λ  = jump_count / trading_years  (annualised jump frequency)
+      • μ_j = mean(log_returns on jump days)
+      • σ_j = std(log_returns on jump days)
+
+    Falls back to Nifty-calibrated defaults if fewer than 60 daily bars.
+    Returns (lambda, mu_j, sigma_j) as floats.
+    """
+    # Nifty-index defaults (calibrated to historical NSE data)
+    _default = (3.0, -0.02, 0.04)
+
+    if ohlcv_df is None or ohlcv_df.empty:
+        return _default
+    try:
+        c  = ohlcv_df["close"].astype(float).dropna()
+        if len(c) < 60:
+            return _default
+
+        lr = np.log(c / c.shift(1)).dropna().values
+        if len(lr) < 30:
+            return _default
+
+        # Diffusion vol from core returns (trim top/bottom 5% to exclude jumps)
+        p5, p95 = np.percentile(lr, 5), np.percentile(lr, 95)
+        core    = lr[(lr >= p5) & (lr <= p95)]
+        sigma_d = float(np.std(core)) if len(core) > 5 else float(np.std(lr))
+        if sigma_d < 1e-6:
+            return _default
+
+        # Jump days: |return| > 2σ of the core distribution
+        threshold  = 2.0 * sigma_d
+        jump_mask  = np.abs(lr) > threshold
+        jump_rets  = lr[jump_mask]
+        n_jumps    = int(jump_mask.sum())
+        n_years    = len(lr) / ann_days
+
+        if n_jumps < 3 or n_years < 0.1:
+            return _default
+
+        lam   = float(n_jumps / n_years)
+        mu_j  = float(np.mean(jump_rets))
+        sig_j = float(np.std(jump_rets)) if n_jumps > 1 else abs(mu_j) * 0.5
+
+        # Sanity clamps: λ ∈ [0.5, 20], μ_j ∈ [-0.15, 0.05], σ_j ∈ [0.01, 0.15]
+        lam   = max(0.5, min(20.0, lam))
+        mu_j  = max(-0.15, min(0.05, mu_j))
+        sig_j = max(0.01, min(0.15, sig_j))
+
+        return (lam, mu_j, sig_j)
+    except Exception:
+        return _default
 
 
 def strategy_prob_profit(legs, spot, T, r, atm_iv, q=0.0, simulations=None,
@@ -5777,15 +6107,10 @@ def ev_rank_strategies(universe, spot, T, r, atm_iv, q,
     # gap risk.  We add a Poisson-distributed jump component (Merton 1976):
     #   ln(S_T/S_0) = (μ - ½σ² - λ*κ)*T + σ√T*Z + Σ_{i=1}^{N(T)} Y_i
     # where N(T) ~ Poisson(λ*T) is the jump count and Y_i ~ N(m_j, v_j²) is
-    # the log-jump size.  Parameters calibrated to NSE index empirics:
-    #   λ  = 3  jumps/year (≈ 1 gap event per quarter — typical for Nifty)
-    #   m_j = -0.02 (-2% mean log-jump — downward bias from gap-down events)
-    #   v_j = 0.04  (4% jump vol — covers ±1SD of individual gap events)
-    # The compensator term -λ*(exp(m_j + ½v_j²) - 1) keeps the process
-    # risk-neutral (no free-lunch drift injection).
-    _jmp_lambda = 3.0          # jumps per year
-    _jmp_mu_j   = -0.02        # mean log-jump size (negative = gap-down bias)
-    _jmp_sig_j  = 0.04         # std of log-jump size
+    # the log-jump size.
+    # RECALIBRATION FIX: parameters now fitted per-symbol from OHLCV history
+    # using _fit_jump_params() instead of hardcoded Nifty-only defaults.
+    _jmp_lambda, _jmp_mu_j, _jmp_sig_j = _fit_jump_params(_ohlcv_safe, CFG["ann_days"])
     _compensator = _jmp_lambda * (math.exp(_jmp_mu_j + 0.5 * _jmp_sig_j**2) - 1.0)
 
     # Draw jump counts for each path from Poisson(λ*T)
@@ -5852,6 +6177,7 @@ def ev_rank_strategies(universe, spot, T, r, atm_iv, q,
         # A sell leg receives mid - ½spread; a buy leg pays mid + ½spread.
         # On a 4-leg Iron Condor this costs ~₹300-700/lot before entry.
         pnl = np.zeros(n_sims)
+        _total_tx_cost = 0.0   # ₹ per unit, accumulated across all legs
         for leg in s["legs"]:
             k   = float(leg["strike"])
             pr  = float(leg["premium"])
@@ -5865,6 +6191,11 @@ def ev_rank_strategies(universe, spot, T, r, atm_iv, q,
             pr_eff = pr + (_half_spread if leg["action"] == "buy" else -_half_spread)
             intr = np.maximum(prices_strat - k, 0) if leg["opt"] == "CE" else np.maximum(k - prices_strat, 0)
             pnl += d * (intr - pr_eff) * qty
+            # RECALIBRATION FIX: accumulate SEBI/NSE transaction costs per leg
+            _total_tx_cost += _tx_cost_per_leg(pr, leg["action"], qty)
+
+        # Deduct total transaction cost from every path (it's a fixed ₹ drag, path-independent)
+        pnl -= _total_tx_cost
 
         pop = float((pnl > 0).mean())
         ev  = float(pnl.mean())
@@ -6017,7 +6348,9 @@ def ev_rank_strategies(universe, spot, T, r, atm_iv, q,
             "pop":           round(pop, 4),
             "ev":            round(ev, 2),
             "ev_per_lot":    round(ev_per_lot, 2),
-            "kelly":         round(kelly_fractional, 4),   # fractional Kelly for position sizing
+            "tx_cost_unit":  round(_total_tx_cost, 2),        # ₹ tx cost per unit
+            "tx_cost_lot":   round(_total_tx_cost * lot_size, 2),  # ₹ tx cost per lot
+            "kelly":         round(kelly_fractional, 4),
             "kelly_raw":     round(kelly_raw, 4),
             "kelly_capped":  round(kelly_capped, 4),
             "max_risk":      round(max_risk, 2),
@@ -6033,6 +6366,10 @@ def ev_rank_strategies(universe, spot, T, r, atm_iv, q,
             "ev_score":      round(ev_score, 4),
             "composite":     round(composite, 4),
             "Score":         display_score,
+            # Jump params used for this strategy's simulation (fitted per symbol)
+            "jump_lambda":   round(_jmp_lambda, 2),
+            "jump_mu_j":     round(_jmp_mu_j, 4),
+            "jump_sig_j":    round(_jmp_sig_j, 4),
             # Legacy UI fields
             "Max Risk":      f"₹{max_risk:,.0f}" if max_risk < 1e5 else "Unlimited",
             "Max Reward":    f"₹{max_reward:,.0f}" if max_reward < 1e5 else "Unlimited",
@@ -6041,7 +6378,9 @@ def ev_rank_strategies(universe, spot, T, r, atm_iv, q,
             "ideal_dte_hi":  s["ideal_dte_hi"],
             "Rationale":     (
                 f"POP {pop*100:.1f}% · EV ₹{ev:+.0f} · Safety {safety_ratio:.2f}× EM · "
-                f"DTE-align {dte_align:.2f} · Dir-align {dir_align:.2f}"
+                f"DTE-align {dte_align:.2f} · Dir-align {dir_align:.2f} · "
+                f"TxCost ₹{_total_tx_cost*lot_size:.0f}/lot · "
+                f"Jump λ={_jmp_lambda:.1f} μ={_jmp_mu_j*100:.1f}% σ={_jmp_sig_j*100:.1f}%"
             ),
         })
 
@@ -6398,6 +6737,17 @@ if load_btn:
         _resolved = _resolve_outcomes(sym_sel, spot, ohlcv_df if not ohlcv_df.empty else None)
         if _resolved:
             _ingest_resolved_outcomes(sym_sel, _resolved)
+
+        # ── RECALIBRATION FIX: bootstrap historical calibration from OHLCV ────
+        # Replays the factor model over up to 252 days of past price data to
+        # produce (signal, forward_return, actual_up) pairs immediately — no
+        # weeks of live Load clicks needed. Idempotent: skips if already done
+        # for this symbol+bar-count combination this session.
+        _bootstrap_signal_history(
+            ohlcv_df if not ohlcv_df.empty else None,
+            symbol=sym_sel,
+            horizon=4
+        )
 
         # Run calibration cycle — uses real outcomes first, OHLCV fallback
         _run_calibration_cycle(
@@ -12320,9 +12670,22 @@ Collect signals daily for 2–3 months for statistically meaningful results.
                     )
 
         else:
-            st.info(f"ℹ️ Probability calibration requires at least 5 paired (score, return) observations. "
+            _sym_bs = st.session_state.get("opt_symbol", "").upper()
+            _guard_keys = [k for k in st.session_state if k.startswith(f"_bootstrap_done:{_sym_bs}:")]
+            _bootstrapped = len(_guard_keys) > 0
+            if _bootstrapped:
+                st.info(
+                    f"ℹ️ Bootstrap calibration ran from OHLCV history and seeded {n_s8} observations. "
+                    f"Needs 5 to show calibration charts. "
+                    f"Live Load clicks will add real forward-test pairs on top of the historical seed."
+                )
+            else:
+                st.info(
+                    f"ℹ️ Probability calibration requires at least 5 paired (score, return) observations. "
                     f"Currently {n_s8}. These accumulate automatically with daily use — "
-                    "each Load records a snapshot and resolves it after 4 trading days.")
+                    "each Load records a snapshot and resolves it after 4 trading days. "
+                    "Bootstrap from OHLCV history will run on next Load if OHLCV data is available."
+                )
 
 # ══════════════════════════════════════════════════════════════
 # TAB — PROBABILITY ENGINE
@@ -12630,22 +12993,26 @@ with t_prob:
         _t3_rows = []
         for _r3 in _top3:
             _t3_rows.append({
-                "Rank":     f"#{_top3.index(_r3)+1}",
-                "Strategy": _r3.get("Strategy","—"),
-                "Legs":     _r3.get("Legs","—"),
-                "Score":    f"{_r3.get('Score',0)}/100",
-                "POP":      f"{float(_r3.get('pop',0))*100:.1f}%",
-                "EV/Lot":   f"₹{float(_r3.get('ev_per_lot',0)):+,.0f}",
-                "Kelly":    f"{float(_r3.get('kelly',0))*100:.1f}%",
-                "Dir Align":f"{float(_r3.get('dir_align',0.5))*100:.0f}%",
-                "Safety":   f"{float(_r3.get('safety_ratio',1)):.2f}x",
-                "DTE Fit":  f"{float(_r3.get('dte_align',1)):.2f}",
+                "Rank":       f"#{_top3.index(_r3)+1}",
+                "Strategy":   _r3.get("Strategy","—"),
+                "Legs":       _r3.get("Legs","—"),
+                "Score":      f"{_r3.get('Score',0)}/100",
+                "POP":        f"{float(_r3.get('pop',0))*100:.1f}%",
+                "EV/Lot":     f"₹{float(_r3.get('ev_per_lot',0)):+,.0f}",
+                "TxCost/Lot": f"₹{float(_r3.get('tx_cost_lot',0)):,.0f}",
+                "Kelly":      f"{float(_r3.get('kelly',0))*100:.1f}%",
+                "Dir Align":  f"{float(_r3.get('dir_align',0.5))*100:.0f}%",
+                "Safety":     f"{float(_r3.get('safety_ratio',1)):.2f}x",
+                "DTE Fit":    f"{float(_r3.get('dte_align',1)):.2f}",
+                "Jump λ":     f"{float(_r3.get('jump_lambda',3.0)):.1f}/yr",
             })
         st.dataframe(pd.DataFrame(_t3_rows), use_container_width=True, hide_index=True)
         st.caption(
             "Source: Monte Carlo EV ranking over ALL real chain strikes. "
-            "Score = composite of EV × POP × directional alignment × DTE fit × safety. "
-            "Iron Condor wins ONLY when it genuinely has the best risk-adjusted EV."
+            "EV/Lot is net of bid-ask spread + STT + NSE charges + stamp duty + GST. "
+            "TxCost/Lot = total regulatory drag (not brokerage). "
+            "Jump λ = fitted jump frequency from this symbol's own return history. "
+            "Score = composite of EV × POP × directional alignment × DTE fit × safety."
         )
 
     # ── SECTION 6: COMPLETE DASHBOARD TABLE ──────────────────────────────────
