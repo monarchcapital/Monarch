@@ -21,7 +21,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 import yfinance as yf
 
-st.set_page_config(layout="wide", page_title="MONARCH — Global Risk Dashboard", page_icon="◼", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="MONARCH — Global Risk Dashboard", page_icon="◼")
 
 # ============================================================
 # SHARED CSS — Bloomberg dark terminal (matches screener/options)
@@ -61,7 +61,7 @@ p, span, div, label, li, td, th, caption,
 [data-testid="stMarkdownContainer"] p,
 [data-testid="stMarkdownContainer"] span,
 [data-testid="stMarkdownContainer"] li {
-    color: var(--bb-white);
+    color: var(--bb-white) !important;
     font-family: var(--bb-mono) !important;
 }
 
@@ -241,55 +241,6 @@ hr, [data-testid="stDivider"] hr { border-color: var(--bb-border) !important; }
 .scanline-wrap { position:relative; overflow:hidden; }
 .scanline-wrap::after { content:''; position:absolute; left:0; right:0; height:2px;
     background:rgba(255,140,0,0.04); animation:scanline 4s linear infinite; pointer-events:none; }
-
-/* ── HIDE keyboard_double_arrow_right ICON TEXT ──────────────────
-   stIconMaterial spans render icon names as text via Material Icons font.
-   Setting font-size:0 makes the text invisible without hiding buttons/SVGs.
-   This covers the sidebar collapse button AND page nav links. ── */
-[data-testid="stIconMaterial"] {
-    font-size: 0 !important;
-    line-height: 0 !important;
-    color: transparent !important;
-    overflow: hidden !important;
-    display: inline-block !important;
-    width: 0 !important;
-}
-
-/* ── FORCE SIDEBAR ALWAYS VISIBLE ────────────────────────────── */
-[data-testid="stSidebar"] {
-    display: block !important;
-    visibility: visible !important;
-    opacity: 1 !important;
-    transform: none !important;
-    min-width: 200px !important;
-}
-[data-testid="stSidebarCollapseButton"] {
-    display: flex !important;
-    visibility: visible !important;
-    opacity: 1 !important;
-}
-[data-testid="stSidebarCollapseButton"] svg {
-    display: block !important;
-    visibility: visible !important;
-    opacity: 1 !important;
-    width: 1rem !important;
-    height: 1rem !important;
-}
-
-/* ── PRICE DELTA COLORS ── */
-[data-testid="stMetricDeltaIcon-Up"]  { color: #00d084 !important; }
-[data-testid="stMetricDeltaIcon-Down"] { color: #ff3b3b !important; }
-[data-testid="stMetricDelta"]:has([data-testid="stMetricDeltaIcon-Up"]) span  { color: #00d084 !important; }
-[data-testid="stMetricDelta"]:has([data-testid="stMetricDeltaIcon-Down"]) span { color: #ff3b3b !important; }
-
-/* ── FONT SIZE INCREASES ── */
-[data-testid="stMetricValue"]   { font-size: 1.35rem !important; font-weight: 700 !important; }
-[data-testid="stMetricLabel"] p { font-size: 0.78rem !important; }
-[data-testid="stMetricDelta"]   { font-size: 0.82rem !important; }
-.stDataFrame thead tr th        { font-size: 0.80rem !important; }
-.stDataFrame tbody tr td        { font-size: 0.90rem !important; }
-.stButton > button              { font-size: 0.90rem !important; }
-
 </style>
 """, unsafe_allow_html=True)
 
@@ -432,6 +383,9 @@ def save_token(token):
     # Share to all other pages via session state
     st.session_state.scanner_token      = token
     st.session_state.opt_access_token   = token
+    # TOKEN HANDSHAKE FIX: mark opt_token_loaded so option.py's startup block
+    # skips its file-read and never overwrites the token we just set here.
+    st.session_state.opt_token_loaded   = True
     try:
         with open(TOKEN_FILE, "w") as f: f.write(token)
     except: pass
