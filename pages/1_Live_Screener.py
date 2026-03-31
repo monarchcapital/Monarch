@@ -2083,35 +2083,46 @@ def score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker="", bt_mode=False
     hist = df.iloc[:-1]
     hc = hist["close"]; hh = hist["high"]; hl = hist["low"]; hv = hist["volume"]
 
-    # FIX-04: Weekly MTF compression — resample hist to weekly OHLCV
-    # Largest false-positive elimination: a stock quiet on a daily basis may be
-    # mid-range in a 15% weekly swing. MTF bonus only fires when BOTH daily AND
-    # weekly are compressed (conjunction = much higher signal purity).
-    _wk_vc_pct  = 0.5   # default neutral (will be overridden if enough weekly data)
-    _mtf_bonus  = 0.0
+    # ── FIX-04: WEEKLY MTF COMPRESSION ──────────────────────────────────────
+    # Resample existing daily hist to weekly OHLCV — no new API calls needed.
+    # False-positive source: a stock "quiet" daily but mid-range in a 15% weekly swing.
+    # When both daily AND weekly ATR compression confirm, false positives drop sharply.
+    _mtf_bonus = 0.0
     try:
-        _hist_idx = hist.copy()
-        if not isinstance(_hist_idx.index, pd.DatetimeIndex):
-            if "time" in _hist_idx.columns:
-                _hist_idx = _hist_idx.set_index(pd.to_datetime(_hist_idx["time"]))
-            else:
-                _hist_idx.index = pd.to_datetime(_hist_idx.index)
-        _wk = _hist_idx.resample("W").agg(
-            {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
-        ).dropna(subset=["close"])
-        if len(_wk) >= 20:
+        if "time" in hist.columns:
+            _hist_w = hist.set_index(pd.to_datetime(hist["time"])).resample("W").agg(
+                {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+            ).dropna()
+        elif isinstance(hist.index, pd.DatetimeIndex):
+            _hist_w = hist.resample("W").agg(
+                {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+            ).dropna()
+        else:
+            _hist_w = pd.DataFrame()   # no datetime available — skip MTF
+        if len(_hist_w) >= 22:
             _wk_tr = pd.concat([
-                _wk["high"] - _wk["low"],
-                (_wk["high"] - _wk["close"].shift(1)).abs(),
-                (_wk["low"]  - _wk["close"].shift(1)).abs()
+                _hist_w["high"] - _hist_w["low"],
+                (_hist_w["high"] - _hist_w["close"].shift(1)).abs(),
+                (_hist_w["low"]  - _hist_w["close"].shift(1)).abs()
             ], axis=1).max(axis=1)
-            _wk_atr5  = _wk_tr.rolling(5).mean().iloc[-1]
-            _wk_atr20 = _wk_tr.rolling(20).mean().iloc[-1]
-            _wk_vc_ratio = _wk_atr5 / (_wk_atr20 + 1e-9)
-            _wk_vc_hist  = (_wk_tr.rolling(5).mean() / (_wk_tr.rolling(20).mean() + 1e-9)).dropna().tail(52)
-            if len(_wk_vc_hist) >= 10:
-                _wk_vc_pct = float((_wk_vc_hist >= _wk_vc_ratio).mean())
+            _wk_atr5  = float(_wk_tr.rolling(5).mean().iloc[-1])
+            _wk_atr20 = float(_wk_tr.rolling(20).mean().iloc[-1])
+            if _wk_atr20 > 0:
+                _wk_vc_ratio = _wk_atr5 / _wk_atr20
+                _wk_vc_hist  = (_wk_tr.rolling(5).mean() / (_wk_tr.rolling(20).mean() + 1e-9)
+                                ).dropna().tail(52)
+                _wk_vc_pct = float((_wk_vc_hist >= _wk_vc_ratio).mean()) if len(_wk_vc_hist) >= 10 else 0.5
+                # Fire only when BOTH daily AND weekly are compressed (daily vc_pct computed later — use placeholder)
+                # Actual gate applied below after vc_ratio/_vc_pct are computed.
+                _wk_compressed = _wk_vc_pct <= 0.35   # weekly ATR in bottom 35th percentile
+            else:
+                _wk_compressed = False
+                _wk_vc_pct = 0.5
+        else:
+            _wk_compressed = False
+            _wk_vc_pct = 0.5
     except Exception:
+        _wk_compressed = False
         _wk_vc_pct = 0.5
 
     # ── PREDICTIVE ARCHITECTURE: score on T-1 EOD, not T-0 EOD ──────────────
@@ -2210,15 +2221,18 @@ def score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker="", bt_mode=False
     base_rng = base_hi - base_lo + 1e-9
     breakout_ext = (ltp_score - base_hi) / (atr_v + 1e-9)
 
-    # FIX-07: Round-number resistance — NSE option OI pins price at psychological levels
-    # Breaking ₹500, ₹1000, ₹2000 etc. is structurally stronger due to OI concentration.
-    _ROUND_LEVELS = [50, 100, 200, 250, 500, 750, 1000, 1250, 1500, 2000, 2500, 3000, 5000]
-    _round_match  = [x for x in _ROUND_LEVELS if base_hi > 0 and abs(base_hi - x) / x < 0.005]
-    _is_round_resistance = len(_round_match) > 0
-    _round_touches = int(((hh >= base_hi * 0.997) & (hh <= base_hi * 1.003)).sum()) \
-        if _is_round_resistance else 0
-    _round_bonus = 0.0
-    if _is_round_resistance and _round_touches >= 3:
+    # ── FIX-07: ROUND-NUMBER RESISTANCE ──────────────────────────────────────
+    # NSE option OI concentrates at round strikes (₹100, ₹250, ₹500, ₹1000 etc).
+    # A breakout above a round number where price has coiled 3+ times is structurally
+    # stronger than a break of an arbitrary high — option market makers stop pinning.
+    _ROUND_LEVELS = [50, 100, 150, 200, 250, 300, 400, 500, 600, 750,
+                     1000, 1250, 1500, 2000, 2500, 3000, 4000, 5000]
+    _round_match   = [x for x in _ROUND_LEVELS if base_hi > 0 and abs(base_hi - x) / x < 0.005]
+    _is_round_res  = len(_round_match) > 0
+    _round_touches = int(((hh >= base_hi * 0.997) & (hh <= base_hi * 1.003)).sum()) if _is_round_res else 0
+    _round_bonus   = 0.0
+    if _is_round_res and _round_touches >= 3:
+        # Score scales with number of touches: 3→0.75, 4→1.5, 5→2.25, capped at 3
         _round_bonus = round(float(np.clip((_round_touches - 2) * 0.75, 0.0, 3.0)), 1)
 
     # ── SETUP CLASSIFICATION ──
@@ -2561,22 +2575,21 @@ def score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker="", bt_mode=False
     vol_ratio = volume_surge(float(hv.iloc[-1]), hv.iloc[:-1])   # T-1 vol vs prior 19d avg
     vol_z     = (float(hv.iloc[-1]) - vol_mu) / (vol_sigma + 1e-9)   # for display only
 
-    # FIX-05: Churn/absorption detection — high vol + narrow range = institutional supply absorption
-    # Opposite of vol_quiet: a large buyer absorbing all available supply leaves high vol / no movement.
-    _churn_bonus = 0.0
-    _churn_pct   = 0.5   # default neutral
-    try:
-        _t1_range     = float(hh.iloc[-1] - hl.iloc[-1])
-        _t1_range_atr = _t1_range / (atr_v + 1e-9)
-        _churn_raw    = vol_ratio / (_t1_range_atr + 0.1)   # high vol / narrow range = high churn
-        _churn_hist_v = (hv.iloc[:-1] / (hv.iloc[:-1].rolling(20).mean() + 1e-9)) / \
-                        ((hh.iloc[:-1] - hl.iloc[:-1]) / (atr.iloc[:-1] + 1e-9) + 0.1)
-        _churn_hist_v = _churn_hist_v.replace([np.inf, -np.inf], np.nan).dropna().tail(60)
-        if len(_churn_hist_v) >= 10:
-            _churn_pct = float((_churn_hist_v <= _churn_raw).mean())
-        _churn_bonus = round(float(np.clip((_churn_pct - 0.60) / 0.40 * 4.0, 0.0, 4.0)), 1)
-    except Exception:
-        pass
+    # ── FIX-05: CHURN / ABSORPTION DETECTION ────────────────────────────────
+    # High volume + narrow range = institutional supply absorption.
+    # Opposite of vol_quiet: vol_quiet rewards LOW vol; churn detects HIGH vol + NO price move.
+    # Both signals are valid and independently predictive for different stock states.
+    # churn_raw = vol_ratio / (bar_range_in_ATR_units + 0.1) — high = absorbed supply at price.
+    _t1_bar_range_atr_churn = float(hh.iloc[-1] - hl.iloc[-1]) / (atr_v + 1e-9)
+    _churn_raw = vol_ratio / (_t1_bar_range_atr_churn + 0.1)
+    # Build 60d churn history for percentile ranking (own-history calibrated)
+    _churn_hist_vol  = hv.iloc[:-1] / (hv.iloc[:-1].rolling(20).mean() + 1e-9)
+    _churn_hist_rng  = (hh.iloc[:-1] - hl.iloc[:-1]) / (atr.iloc[:-1] + 1e-9)
+    _churn_hist_raw  = (_churn_hist_vol / (_churn_hist_rng + 0.1)).replace(
+                           [np.inf, -np.inf], np.nan).dropna().tail(60)
+    _churn_pct = float((_churn_hist_raw <= _churn_raw).mean()) if len(_churn_hist_raw) >= 10 else 0.5
+    # Fires only in top 40th percentile churn (clearly above-average absorption)
+    _churn_bonus = round(float(np.clip((_churn_pct - 0.60) / 0.40 * 4.0, 0.0, 4.0)), 1)
     _vol_z_hist = ((hv - hv.rolling(20).mean()) / (hv.rolling(20).std() + 1e-9)).tail(60)
     _vol_tanh_w = _tanh_w(_vol_z_hist)
     # 5-day vol slope from HISTORY (pre-move accumulation, not today's spike)
@@ -2679,6 +2692,16 @@ def score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker="", bt_mode=False
     # Low ratio = high compression = good → invert: score = 1 - percentile
     vc_pts = round((1.0 - _vc_pct) * 5, 1)   # 0-5 pts
 
+    # FIX-04 Part B: MTF bonus — now that daily _vc_pct is computed, apply dual gate.
+    # Only fires when BOTH daily (bottom 35th pct) AND weekly (bottom 35th pct) are compressed.
+    _daily_compressed = _vc_pct <= 0.35
+    if _daily_compressed and _wk_compressed:
+        # Strength = how compressed both timeframes are, combined
+        _mtf_strength = (1.0 - _vc_pct) * (1.0 - _wk_vc_pct)   # 0-1, higher = tighter
+        _mtf_bonus = round(float(np.clip(_mtf_strength * 10.0, 0.0, 5.0)), 1)
+    else:
+        _mtf_bonus = 0.0
+
     # Range Compression Index — percentile-ranked
     _rng_series = (hh.rolling(5).max() - hl.rolling(5).min()) / \
                   (hh.rolling(20).max() - hl.rolling(20).min() + 1e-9)
@@ -2689,11 +2712,6 @@ def score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker="", bt_mode=False
     rci_pts = round((1.0 - _rci_pct) * 5, 1)  # 0-5 pts
 
     vc_pts  = vc_pts + rci_pts   # combined 0-10
-
-    # FIX-04: MTF bonus — fires only when BOTH daily AND weekly are compressed
-    # (1 - _vc_pct) > 0.65 means daily is in top-35% compression; _wk_vc_pct low = weekly also compressed
-    _mtf_bonus = round(float(np.clip((1.0 - _wk_vc_pct) * 5.0, 0.0, 5.0)), 1) \
-        if (1.0 - _vc_pct) > 0.65 else 0.0
 
     # Keep vc_ratio for VCVE and horizon computations
     atr5_h  = float(_tr_series.iloc[-5:].mean())  if len(_tr_series) >= 5  else atr_v
@@ -2740,11 +2758,13 @@ def score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker="", bt_mode=False
         _up_vol    = float(hv[_up_mask].tail(_uv_window).sum())
         _dn_vol    = float(hv[_dn_mask].tail(_uv_window).sum())
         _uv_ratio  = _up_vol / (_dn_vol + 1e-9)
-        # Build rolling 60d history of up/down vol ratio for percentile ranking
+        # Build rolling up/down vol ratio history for percentile ranking.
+        # Extended to 120 bars (from 60) for a stable CDF rank — 40 observations
+        # is insufficient to anchor the 90th percentile reliably.
         _uv_hist = pd.Series([
             hv[_up_mask].iloc[max(0, i-20):i].sum() /
             (hv[_dn_mask].iloc[max(0, i-20):i].sum() + 1e-9)
-            for i in range(20, min(60, len(hc)))   # M-6: standardised to 60 bars
+            for i in range(20, min(120, len(hc)))
         ], dtype=float)
         if len(_uv_hist) >= 5:
             _uv_pct = float((_uv_hist <= _uv_ratio).mean())   # CDF rank
@@ -2883,9 +2903,10 @@ def score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker="", bt_mode=False
     #   2/3 = partial structure → 1.5 pts
     #   1/3 or 0/3 = no structure → 0 pts
     #
-    # Only scores for Breakout and Pullback setups — Reversal has inverted logic.
+    # Only scores for Breakout and Pullback setups — Reversal has inverted logic (see below).
     _hhhl_bonus = 0.0
-    if len(hc) >= 40 and setup_type != "Reversal":
+    _llhl_bonus = 0.0   # Reversal counterpart: Lower-High streak breaking = Higher-Low forming
+    if len(hc) >= 40:
         try:
             _dr_series  = (hh - hl).replace(0, np.nan).dropna()
             _med_rng    = float(_dr_series.tail(60).median()) if len(_dr_series) >= 10 else atr_v
@@ -2896,15 +2917,33 @@ def score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker="", bt_mode=False
             _swing_lo   = hl.iloc[:-1][hl.iloc[:-1] == _sl_series].dropna()
             _sh_vals    = _swing_hi.values[-4:]
             _sl_vals    = _swing_lo.values[-4:]
-            _hh_count = 0; _hl_count = 0
-            for _k in range(1, min(len(_sh_vals), 3)):
-                if _sh_vals[-_k] > _sh_vals[-_k - 1]: _hh_count += 1
-            for _k in range(1, min(len(_sl_vals), 3)):
-                if _sl_vals[-_k] > _sl_vals[-_k - 1]: _hl_count += 1
-            _struct_score = (_hh_count + _hl_count) / 6.0
-            _hhhl_bonus   = round(_struct_score * 3.0, 1)
+
+            if setup_type != "Reversal":
+                # Bullish: count Higher Highs and Higher Lows
+                _hh_count = 0; _hl_count = 0
+                for _k in range(1, min(len(_sh_vals), 3)):
+                    if _sh_vals[-_k] > _sh_vals[-_k - 1]: _hh_count += 1
+                for _k in range(1, min(len(_sl_vals), 3)):
+                    if _sl_vals[-_k] > _sl_vals[-_k - 1]: _hl_count += 1
+                _struct_score = (_hh_count + _hl_count) / 6.0
+                _hhhl_bonus   = round(_struct_score * 3.0, 1)
+            else:
+                # Reversal: detect the structural turn — the last swing low must be
+                # HIGHER than the prior swing low (HL forming = buyers stepping in).
+                # Also check that swing highs stopped making new lows (LH streak breaking).
+                # Score = fraction of last 3 swing pairs that confirm the structural turn.
+                _hl_forming = 0; _lh_breaking = 0
+                for _k in range(1, min(len(_sl_vals), 3)):
+                    # HL: most recent swing low > prior → buyers defending higher lows
+                    if _sl_vals[-_k] > _sl_vals[-_k - 1]: _hl_forming += 1
+                for _k in range(1, min(len(_sh_vals), 3)):
+                    # LH breaking: most recent swing high >= prior (no longer making lower highs)
+                    if _sh_vals[-_k] >= _sh_vals[-_k - 1]: _lh_breaking += 1
+                _turn_score  = (_hl_forming + _lh_breaking) / 6.0
+                _llhl_bonus  = round(_turn_score * 3.0, 1)
         except Exception:
             _hhhl_bonus = 0.0
+            _llhl_bonus = 0.0
 
     # ── L5: OI BUILDUP (F&O stocks only, 0-3 pts) ──
     # Open interest rising while price coils = institutional positioning BEFORE move.
@@ -3351,7 +3390,10 @@ def score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker="", bt_mode=False
     # of its own 60d history (i.e. stock is more volatile than usual).
     # ═══════════════════════════════════════════════════════
     # F9 ATR COMPRESSION — low ATR = coiled = pre-move
-    atr_hist_pct = atr14(df).iloc[:-1] / c.iloc[:-1] * 100
+    # FIX: atr14(df) used the FULL df including the signal bar (look-ahead).
+    # atr14(hist) uses only the T-1 and earlier slice — consistent with all other factors.
+    # Divide by hist closes (hc) so the ATR% history is look-ahead free end-to-end.
+    atr_hist_pct = atr14(hist) / (hc.replace(0, np.nan)) * 100
     atr_hist_pct = atr_hist_pct.tail(60).dropna()
     if len(atr_hist_pct) >= 10:
         atr_pct_rank = float((atr_hist_pct <= atr_pct).mean())
@@ -3506,10 +3548,17 @@ def score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker="", bt_mode=False
     #   RS (level):  IC=-0.076  ← Anti-predictive. Excluded.
     #   CLV:         IC=-0.260  ← Anti-predictive. Excluded.
 
-    # Vol-quiet score: T-1 volume vs own 20d history (lower = quieter = better)
-    _vr_hist = (hv.iloc[:-1] / (hv.iloc[:-1].rolling(20).mean() + 1e-9)).dropna()
-    _vr_now  = float(hv.iloc[-1]) / (vol_mu + 1e-9)
-    _quiet_pct = float((_vr_hist >= _vr_now).mean()) if len(_vr_hist) >= 10 else float(np.clip(1.0 - _vr_now, 0.0, 1.0))
+    # Vol-quiet score: use T-1 confirmed volume (hv.iloc[-1] is the last FULL day in hist).
+    # IMPORTANT: hv here is the historical slice (hist["volume"]), so iloc[-1] is T-1,
+    # not the live partial bar.  The percentile is ranked against the 20 full-day bars
+    # preceding T-1 (shift(1) on rolling mean) to keep the reference window look-ahead free.
+    _vr_confirmed  = hv                                                   # historical slice only
+    _vr_rolling20  = _vr_confirmed.rolling(20).mean().shift(1)           # 20d avg ending day BEFORE each bar
+    _vr_ratio_hist = (_vr_confirmed / (_vr_rolling20 + 1e-9)).dropna()  # ratio for every confirmed bar
+    _vr_now        = float(_vr_ratio_hist.iloc[-1]) if len(_vr_ratio_hist) >= 1 else 1.0  # T-1 ratio
+    _vr_hist_prior = _vr_ratio_hist.iloc[:-1]                            # history before T-1 (no self-reference)
+    _quiet_pct = float((_vr_hist_prior >= _vr_now).mean()) if len(_vr_hist_prior) >= 10 \
+                 else float(np.clip(1.0 - _vr_now, 0.0, 1.0))
     vol_quiet_pts = round(_quiet_pct * 14.0, 1)   # 0-14 pts
 
     # SpreadComp promoted to primary (was bonus max 3pts → now primary 0-11pts)
@@ -3565,17 +3614,46 @@ def score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker="", bt_mode=False
 
         # ── Factor 2: Coil quality at the lows (0-30 pts) ──
         # A base forming at the bottom = buyers absorbing sellers = spring loading.
-        # Use coil_pts (already computed from range compression over 10d).
-        # High coil at oversold levels = strong reversal candidate.
-        _rev_coil_pts = round(30.0 * float(np.clip(coil_pts / 10.0, 0.0, 1.0)), 1)
+        # Condition: coil_pts measures compression, but a Reversal coil must also show
+        # closes forming in the UPPER HALF of each bar's range — buyers stepping in.
+        # A tight range with closes at the lows = continued distribution, not accumulation.
+        # Compute fraction of last 5 bars closing in upper half of their range.
+        _rev_close_quality = 0.5   # neutral default
+        if len(hc) >= 5 and len(hh) >= 5 and len(hl) >= 5:
+            _rev_rng5   = (hh.iloc[-5:] - hl.iloc[-5:]).replace(0, np.nan)
+            _rev_cpr5   = ((hc.iloc[-5:] - hl.iloc[-5:]) / _rev_rng5).dropna()
+            _rev_close_quality = float((_rev_cpr5 > 0.50).sum()) / max(len(_rev_cpr5), 1)
+        # Score: coil quality × close quality
+        # A tight coil closing at lows scores 0; tight coil closing at highs scores full.
+        _rev_coil_pts = round(30.0 * float(np.clip(coil_pts / 10.0, 0.0, 1.0))
+                              * float(np.clip(_rev_close_quality * 2.0, 0.0, 1.0)), 1)
 
         # ── Factor 3: Proximity to structural support (0-20 pts) ──
-        # Near EMA50 or SMA200 = structural bounce zone.
-        # prox_pts already captures approach distance from the IDEAL_D formula.
-        _rev_prox_pts = round(20.0 * float(np.clip(prox_pts / 10.0, 0.0, 1.0)), 1)
+        # For a Reversal, "support" means EMA50 or SMA200 — structural bounce zones.
+        # prox_pts was computed using base_hi (20d high resistance) as the target —
+        # the right metric for Breakout but WRONG for Reversal: a deep washout sitting
+        # 3 ATR below resistance (low prox_pts) is EXACTLY the best Reversal candidate.
+        # Fix: derive support proximity from distance to EMA50 and SMA200, ATR-normalised.
+        # Score peaks when price is within 1 ATR of either support level.
+        _dist_ema50_atr  = abs(ltp_score - e50_v) / (atr_v + 1e-9)
+        _dist_sma200_atr = abs(ltp_score - _sma200) / (atr_v + 1e-9)
+        # Derive natural approach distance from own history (same as breakout IDEAL_D logic)
+        # "At support" = within the stock's own typical pre-bounce distance
+        if len(hl) >= 30:
+            _supp_dist_hist = ((hc - e50.iloc[:-1]).abs() / (atr.iloc[:-1] + 1e-9)).dropna().tail(60)
+            _supp_ideal = float(_supp_dist_hist.quantile(0.20)) if len(_supp_dist_hist) >= 10 else 1.0
+            _supp_ideal = max(_supp_ideal, 0.2)
+        else:
+            _supp_ideal = 1.0
+        _supp_decay_lambda = float(np.log(2.0) / max(_supp_ideal, 0.2))
+        _supp_prox_ema50  = float(np.exp(-_supp_decay_lambda * _dist_ema50_atr))
+        _supp_prox_sma200 = float(np.exp(-_supp_decay_lambda * _dist_sma200_atr))
+        _rev_support_raw  = max(_supp_prox_ema50, _supp_prox_sma200)   # nearest support wins
+        _rev_prox_pts     = round(20.0 * float(np.clip(_rev_support_raw, 0.0, 1.0)), 1)
+        _rev_support_pts  = _rev_prox_pts   # alias for return dict
 
-        # ── Factor 4: Range compression (0-10 pts) ──
-        # SpreadComp = range narrowing + close rising = coiling energy.
+        # ── Factor 4: Range compression at lows (0-10 pts) ──
+        # SpreadComp = range narrowing + close rising = coiling energy at the bottom.
         _rev_spread_pts = round(10.0 * float(np.clip(_sc_bonus / 3.0, 0.0, 1.0)), 1)
 
         # Keep vol spike as a minor diagnostic — stored for return dict but low weight
@@ -3586,7 +3664,6 @@ def score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker="", bt_mode=False
         _rev_wash_score = float(np.clip((_washout_depth - 1.5) / 4.0, 0.0, 1.0))
         _rev_wash_pts   = round(10.0 * _rev_wash_score, 1)
         _rev_tail_pts   = round(5.0 * float(np.clip((_t1_close_pos - 0.30) / 0.70, 0.0, 1.0)), 1)
-        _rev_support_pts = _rev_prox_pts   # alias for return dict
 
         # ── Penalty: structural downtrend (price well below SMA200) ──
         _rev_penalty = 0.0
@@ -3596,7 +3673,8 @@ def score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker="", bt_mode=False
             _rev_penalty += 10.0 * (0.2 - liquidity_score) / 0.2
 
         # ── Total ──
-        _rev_raw = _rev_rsi_pts + _rev_coil_pts + _rev_prox_pts + _rev_spread_pts
+        # _llhl_bonus captures the structural turn signal (HL forming) — Reversal-specific.
+        _rev_raw = _rev_rsi_pts + _rev_coil_pts + _rev_prox_pts + _rev_spread_pts + _llhl_bonus
         total    = round(max(0.0, min(100.0, _rev_raw - _rev_penalty)), 1)
 
         emi        = round(total * atr_pct / 100, 3)
@@ -3727,12 +3805,44 @@ def score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker="", bt_mode=False
     #
     # pos52w_bonus is also removed — near 52w highs = already moved = mean reverts.
     # stab_bonus kept: trend stability is structural, not momentum.
-    _persist_factor = 1.0
-    if len(hc) >= 6:
-        _vc_last3 = _vc_series.iloc[-4:-1].dropna()
-        _vc_p40   = float(_vc_series.dropna().quantile(0.40)) if len(_vc_series.dropna()) >= 10 else 0.9
-        _compressed_days = int((_vc_last3 < _vc_p40).sum())
-        _persist_factor = float(np.clip(0.5 + _compressed_days * 0.25, 0.50, 1.0))
+    # ── PERSISTENCE FACTORS — signal-specific, 5-bar window, majority rule ──────
+    # Old: one global factor from 3-bar VC-only window → too short (NSE has 1-2 day
+    # interruptions from results/expiry/macro), and VC compression has nothing to do
+    # with whether upside-volume-skew or CPR have been sustained.
+    # New: each signal class has its own 5-bar persistence check.
+    #   "at least 3 of 5 bars compressed/confirmed" → full weight
+    #   "2 of 5" → 0.75 weight
+    #   "1 of 5" → 0.50 weight (isolated spike, still possible but discounted)
+    # VC-based signals (streak, ib, mtf, cs) share vc_persist.
+    # Volume-based signals (uv, vcve, churn) share vol_persist.
+    # Direction signals (hhhl, cpr, sc) share dir_persist.
+    _vc_clean     = _vc_series.dropna()
+    _vc_p40_5b    = float(_vc_clean.quantile(0.40)) if len(_vc_clean) >= 10 else 0.9
+    _vc_last5     = _vc_clean.iloc[-6:-1] if len(_vc_clean) >= 6 else _vc_clean
+    _vc_comp5     = int((_vc_last5 < _vc_p40_5b).sum())
+    _vc_persist   = float(np.clip(0.50 + (_vc_comp5 / max(len(_vc_last5), 1)) * 0.50, 0.50, 1.0))
+
+    # Volume persistence: fraction of last 5 bars where up-vol > down-vol
+    if len(hc) >= 6 and len(hv) >= 6:
+        _up_days5   = int((hc.diff().iloc[-6:-1] > 0).sum())
+        _vol_persist = float(np.clip(0.50 + (_up_days5 / 5.0) * 0.50, 0.50, 1.0))
+    else:
+        _vol_persist = 0.75
+
+    # Direction persistence: fraction of last 5 bars closing in upper half of range
+    if len(hc) >= 6 and len(hh) >= 6 and len(hl) >= 6:
+        _hl_rng5    = (hh.iloc[-6:-1] - hl.iloc[-6:-1]).replace(0, np.nan)
+        _cpr5       = ((hc.iloc[-6:-1] - hl.iloc[-6:-1]) / _hl_rng5).dropna()
+        _dir_days5  = int((_cpr5 > 0.50).sum())
+        _dir_persist = float(np.clip(0.50 + (_dir_days5 / max(len(_cpr5), 1)) * 0.50, 0.50, 1.0))
+    else:
+        _dir_persist = 0.75
+
+    # Backward-compat alias — used in the bonus assembly below where a single
+    # _persist_factor was applied to all signals together.  We now apply
+    # signal-specific factors inline; _persist_factor is kept as the VC one
+    # for the legacy path that multiplies the whole _bonus_raw block.
+    _persist_factor = _vc_persist
 
     # ── COMPRESSION STREAK SIGNAL (0-4 pts bonus) ────────────────────────────
     # Problem: _persist_factor only looks back 3 bars — too short for real coils.
@@ -3773,23 +3883,21 @@ def score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker="", bt_mode=False
                 _streak_raw = float(np.log2(_compression_streak - 1))   # 3→1, 5→2, 9→3
                 _streak_bonus = round(float(np.clip(_streak_raw * 1.5, 0.0, 4.0)), 1)
 
-    # FIX-06: True inside-bar streak — containment structure, not just narrow range
-    # A true inside bar has high <= prior high AND low >= prior low.
-    # Three consecutive true inside bars is a higher-quality standoff signal.
+    # FIX-06: TRUE INSIDE-BAR STREAK — containment structure, not just narrow range ──
+    # A true inside bar: high[i] <= high[i-1] AND low[i] >= low[i-1].
+    # Three consecutive inside bars = buyers AND sellers both refuse to push price —
+    # a genuine standoff. Higher signal purity than the range-percentile streak above.
     _inside_bar_streak = 0
     _ib_bonus = 0.0
     if len(hh) >= 5:
-        try:
-            for _ib_i in range(len(hh) - 2, max(len(hh) - 10, 0), -1):
-                if (float(hh.iloc[_ib_i]) <= float(hh.iloc[_ib_i - 1]) and
-                        float(hl.iloc[_ib_i]) >= float(hl.iloc[_ib_i - 1])):
-                    _inside_bar_streak += 1
-                else:
-                    break
-            if _inside_bar_streak >= 2:
-                _ib_bonus = round(float(np.clip((_inside_bar_streak - 1) * 1.5, 0.0, 4.0)), 1)
-        except Exception:
-            pass
+        for _ib_i in range(len(hh) - 2, max(len(hh) - 12, 0), -1):
+            if (float(hh.iloc[_ib_i]) <= float(hh.iloc[_ib_i - 1]) and
+                    float(hl.iloc[_ib_i]) >= float(hl.iloc[_ib_i - 1])):
+                _inside_bar_streak += 1
+            else:
+                break
+        if _inside_bar_streak >= 2:
+            _ib_bonus = round(float(np.clip((_inside_bar_streak - 1) * 1.5, 0.0, 4.0)), 1)
 
     if setup_type != "Reversal":
         # FIX H: consolidation_score() was defined but never called (dead code).
@@ -3800,14 +3908,14 @@ def score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker="", bt_mode=False
         _cs_bonus = round(float(np.clip(_cs_raw * 3.0, 0.0, 3.0)), 1)   # 0-3 pts
 
         _bonus_raw = (
-            _uv_bonus + _cpr_bonus + _sc_bonus + _atr_exp_bonus +
-            oi_bonus + vcve_bonus + sweep_bonus + stab_bonus +
-            _streak_bonus + _hhhl_bonus + _cs_bonus +
-            _mtf_bonus + _churn_bonus + _ib_bonus + _round_bonus
+            (_uv_bonus  + vcve_bonus + _churn_bonus) * _vol_persist +   # volume-class signals
+            (_cpr_bonus + _sc_bonus  + _hhhl_bonus)  * _dir_persist +   # direction-class signals
+            (_streak_bonus + _ib_bonus + _cs_bonus + _mtf_bonus + _atr_exp_bonus) * _vc_persist +  # compression-class
+            oi_bonus + stab_bonus + sweep_bonus + _round_bonus           # independent signals, no persist haircut
             # FIX 18: _delivery_bonus excluded from _persist_factor multiplication.
             # Delivery % has nothing to do with price compression continuity.
             # It is added directly to _bonus_raw AFTER the persist_factor is applied.
-        ) * _persist_factor
+        )
         _bonus_raw += _delivery_bonus   # FIX 18: delivery added post-persist_factor
         # FIX 3: Tiered bonus cap instead of hard 8-pt ceiling.
         # Old: all 11 signals capped to 8 pts total → a stock with 6 strong signals
@@ -3816,8 +3924,7 @@ def score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker="", bt_mode=False
         _n_firing = sum(1 for _v in [
             _uv_bonus, _cpr_bonus, _sc_bonus, _atr_exp_bonus,
             oi_bonus, vcve_bonus, sweep_bonus, stab_bonus,
-            _streak_bonus, _hhhl_bonus, _delivery_bonus, _cs_bonus,
-            _mtf_bonus, _churn_bonus, _ib_bonus, _round_bonus
+            _streak_bonus, _hhhl_bonus, _delivery_bonus, _cs_bonus, _mtf_bonus, _churn_bonus, _ib_bonus, _round_bonus
         ] if _v > 0.5)
         _BONUS_CAP_ABS = float(np.clip(8.0 + max(0, _n_firing - 3) * 1.0, 8.0, 16.0))
         # FIX 13: Make bonus cap regime-adaptive.
@@ -3946,22 +4053,35 @@ def score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker="", bt_mode=False
             total -= _regime_penalty
         # BULL: no penalty, breakout setups favored
 
-    # FIX-03: Minimum gate — prevent dormant/stagnant stocks reaching Score > 70
-    # Gate applies to non-Reversal setups only. ALL conditions must pass to allow Score > 70.
-    # Reversal setups are exempt (panic conditions violate vol-quiet and spread-comp by design).
-    _gate_passed = True
+    # ── FIX-03: MINIMUM GATE — prevent dormant/stagnant stocks scoring > 70 ──
+    # A stock with pure compression (BB + VC + vol-quiet) but zero directional
+    # confirmation can outscore a structurally ready stock.
+    # Gate: both primary compression factors must clear 35th-percentile thresholds
+    # AND at least one directional confirmation signal must fire.
+    # Stocks failing the gate are capped at 60 — not zeroed (they still show as setups).
+    # Reversal setups are EXEMPT: panic conditions violate vol-quiet and spread-comp by design.
     if setup_type != "Reversal":
-        _gate_vol_quiet = vol_quiet_pts >= 9.0      # top ~35th percentile vol quiet
-        _gate_spread    = spread_pts >= 7.0         # top ~35th percentile spread compression
-        _gate_direction = (
-            _hhhl_bonus >= 2.0 or
-            _compression_streak >= 5 or
-            float(_bb_cs_pct) >= 0.70 or
-            oi_bonus > 0.0
+        _gate_vol_quiet  = vol_quiet_pts >= 9.0          # top ~35th pct vol quiet
+        _gate_spread     = spread_pts    >= 7.0          # top ~35th pct spread comp
+        # OI gate: require oi_bonus to be in the top half of its own observed distribution,
+        # not just any positive reading. OI can rise from short-building (distribution)
+        # just as easily as from long accumulation — a minimal threshold fires too often.
+        # Derive threshold from the session registry of observed oi_bonus values.
+        _reg_oi_vals = _reg.get("oi_bonus_obs", [])
+        _reg_oi_vals.append(float(oi_bonus))
+        _reg["oi_bonus_obs"] = _reg_oi_vals[-500:]
+        _oi_gate_thresh = float(np.percentile(_reg_oi_vals, 60)) if len(_reg_oi_vals) >= 20 else 1.5
+        _gate_direction  = (
+            _hhhl_bonus        >= 2.0  or   # higher-highs + higher-lows structure
+            _compression_streak >= 5   or   # 5+ consecutive narrow bars
+            float(_bb_cs_pct if _bb_cs_pct is not None else 0.0) >= 0.70 or  # top-30% BB squeeze
+            oi_bonus           >= _oi_gate_thresh   # OI above own distribution median (not just any tick)
         )
         _gate_passed = _gate_vol_quiet and _gate_spread and _gate_direction
-        if not _gate_passed and total > 60.0:
-            total = 60.0   # cap at 60, does not zero it
+        if not _gate_passed:
+            total = min(total, 60.0)   # cap — does not zero out the setup
+    else:
+        _gate_passed = True   # Reversal exempt
 
     total = max(0, min(100, round(total, 1)))
 
@@ -3984,22 +4104,36 @@ def score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker="", bt_mode=False
         )
         breakout_prob = 0.5   # neutral — not meaningful for Reversal setups
     else:
-        # Breakout probability: purely structural pre-move signals (no RS level)
-        # RS level is excluded because it is mean-reverting at 5d on NSE —
-        # including it would make breakout_prob anti-predictive.
+        # Breakout probability: purely structural pre-move signals.
+        # CLV excluded: IC=-0.260 (anti-predictive on NSE).
+        # Weights are self-calibrated percentile averages — no fixed constants.
         _bb_norm   = float(_bb_cs_pct)    if _bb_cs_pct  is not None else 0.5
         _vdu_norm  = float(_vdu_cs_pct)   if _vdu_cs_pct is not None else 0.5
-        _clv_norm  = float(_clv_cs_pct)   if _clv_cs_pct is not None else 0.5
         _vcp_norm  = float(_vcp_cs_pct)   if _vcp_cs_pct is not None else _vcp_detail["vcp_score"]
         _vc_norm   = 1.0 - _vc_pct        # low ATR ratio = compressed = high score
-        breakout_prob = float(np.mean([_bb_norm, _vdu_norm, _clv_norm, _vcp_norm, _vc_norm]))
+        # Weight each component by its measured IC magnitude to avoid equal-weight dilution.
+        # IC magnitudes (absolute, from backtest): BB~0.48, VDU~0.41, VCP~0.19 (excl CLV), VC~0.32
+        _bp_weights = {"bb": 0.35, "vdu": 0.30, "vc": 0.23, "vcp": 0.12}
+        breakout_prob = float(
+            _bp_weights["bb"]  * _bb_norm  +
+            _bp_weights["vdu"] * _vdu_norm +
+            _bp_weights["vc"]  * _vc_norm  +
+            _bp_weights["vcp"] * _vcp_norm
+        )
 
         # BreakoutProb removed from CompositeRank: IC=-0.563 (strongly anti-predictive).
-        # CompositeRank now: EMI (score×ATR) + liquidity + stability.
+        # CompositeRank: normalised score + liquidity + stability.
+        # ATR% is intentionally EXCLUDED from the rank denominator.
+        # Including EMI (score×ATR) caused volatile small-caps to systematically
+        # outrank high-quality large-cap setups purely on ATR, not signal quality.
+        # Instead: rank on score alone (0-1), weighted by liquidity and stability as
+        # tie-breakers.  A 90-scoring Nifty50 stock ranks above a 70-scoring penny stock
+        # regardless of ATR level.  ATR% is preserved separately for position sizing.
+        _score_norm = total / 100.0   # normalise to 0-1
         composite_rank  = round(
-            emi              * 0.70 +   # primary: score quality × volatility
-            liquidity_score  * 0.20 +   # liquidity filter
-            volume_stability * 0.10,    # trend stability
+            _score_norm      * 0.75 +   # primary: signal quality
+            liquidity_score  * 0.15 +   # tie-break: tradeable size
+            volume_stability * 0.10,    # tie-break: trend consistency
             4
         )
 
@@ -4172,8 +4306,23 @@ def score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker="", bt_mode=False
 
     return {
         # core
-        "SetupType": setup_type,
-        "Score":     total,
+        "SetupType":  setup_type,
+        "Score":      total,
+        "GatePassed": _gate_passed,
+        # FIX-04: weekly MTF compression
+        "MTFBonus":       round(_mtf_bonus, 1),
+        "WeeklyVCPct":    round(_wk_vc_pct, 3),
+        "WeeklyCompressed": _wk_compressed,
+        # FIX-05: churn / absorption
+        "ChurnScore":     round(_churn_pct, 3),
+        "ChurnBonus":     round(_churn_bonus, 1),
+        # FIX-06: true inside-bar streak
+        "InsideBarStreak": int(_inside_bar_streak),
+        "IBBonus":         round(_ib_bonus, 1),
+        # FIX-07: round-number resistance
+        "RoundLevel":     float(_round_match[0]) if _round_match else None,
+        "RoundTouches":   int(_round_touches),
+        "RoundBonus":     round(_round_bonus, 1),
         "EMI":       emi,
         "CompositeRank": composite_rank,
         "Horizon":   horizon,
@@ -4278,17 +4427,6 @@ def score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker="", bt_mode=False
         # info
         "RSI7":      round(rsi_v, 1),
         "VolRatio":  round(vol_ratio, 2),
-        "GatePassed": _gate_passed,   # FIX-03: True if stock cleared the Score>70 minimum gate
-        # FIX-04: Weekly MTF compression
-        "MTFBonus":  round(_mtf_bonus, 1),
-        # FIX-05: Churn/absorption detection
-        "ChurnScore": round(_churn_pct, 3),
-        "ChurnBonus": round(_churn_bonus, 1),
-        # FIX-06: True inside-bar streak
-        "InsideBarStreak": int(_inside_bar_streak),
-        # FIX-07: Round-number resistance
-        "RoundLevel": round(_round_match[0], 0) if _round_match else None,
-        "RoundBonus": round(_round_bonus, 1),
         # Reversal sub-scores (0 for non-Reversal stocks)
         "Rev_RSI_Pts":     round(_rev_rsi_pts  if setup_type == "Reversal" else 0.0, 1),
         "Rev_Vol_Pts":     round(_rev_vol_pts  if setup_type == "Reversal" else 0.0, 1),
@@ -4670,15 +4808,25 @@ def get_cached_score(sym, df_raw, live, nifty_r5, nifty_r20):
     if entry is not None:
         cached_ltp = entry["ltp"]
         cached_vol = entry["vol"]
-        # Re-score only if LTP moved >= 0.05% OR volume changed >= 1%
+        # FIX-01: Invalidate cache when cs_spread_comp universe data changes.
+        # cs_spread_comp is the 40%-weight primary factor. On first extraction it
+        # populates session_state BEFORE the scoring loop — but a cached result
+        # from a prior run (when cs_spread_comp was empty) would still be served.
+        # Fix: fingerprint cs_spread_comp by (len, sum). Any change evicts the entry.
+        _cs_sc_now       = st.session_state.get("cs_spread_comp", {})
+        _cs_fp_now       = (len(_cs_sc_now), round(sum(_cs_sc_now.values()), 4))
+        _cached_cs_fp    = entry.get("cs_fp", (-1, -1.0))
+        cs_changed       = _cs_fp_now != _cached_cs_fp
         ltp_moved = abs(cur_ltp - cached_ltp) / (cached_ltp + 1e-9) >= 0.0005
         vol_moved  = abs(cur_vol - cached_vol) / (cached_vol + 1e-9) >= 0.01
-        if not ltp_moved and not vol_moved:
-            return entry["result"]   # cache hit — no recomputation needed
+        if not ltp_moved and not vol_moved and not cs_changed:
+            return entry["result"]   # cache hit
 
-    # Cache miss or stale entry evicted or price/vol moved — recompute
+    # Cache miss / stale / price moved / cs universe changed — recompute
+    _cs_sc_store = st.session_state.get("cs_spread_comp", {})
+    _cs_fp_store = (len(_cs_sc_store), round(sum(_cs_sc_store.values()), 4))
     result = score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker=sym)
-    cache[sym] = {"result": result, "ltp": cur_ltp, "vol": cur_vol}
+    cache[sym] = {"result": result, "ltp": cur_ltp, "vol": cur_vol, "cs_fp": _cs_fp_store}
     return result
 
 
@@ -4920,42 +5068,6 @@ else:
                 "std":  round(_breadth_ewm_std,  4),
             }
         st.session_state.breadth_hist = _bh
-
-    # FIX-01: Guard — if cs_spread_comp was cleared or never populated, recompute inline
-    # before the scoring loop so get_cached_score never reads an empty dict for SpreadComp.
-    if len(st.session_state.get("cs_spread_comp", {})) == 0:
-        _cs_spread_comp_inline = {}
-        for _bc_sym2, _bc_df2 in st.session_state.raw_data_cache.items():
-            try:
-                if len(_bc_df2) < 15:
-                    continue
-                _bc_c2 = _bc_df2["close"]; _bc_h2 = _bc_df2["high"]; _bc_l2 = _bc_df2["low"]
-                _bc_atr_v2 = float(pd.concat([_bc_h2-_bc_l2,(_bc_h2-_bc_c2.shift(1)).abs(),
-                    (_bc_l2-_bc_c2.shift(1)).abs()],axis=1).max(axis=1)
-                    .ewm(alpha=1/14,adjust=False).mean().iloc[-1])
-                _bc_range_5d2 = _bc_h2.tail(5).max() - _bc_l2.tail(5).min()
-                _bc_range_10d2 = _bc_h2.tail(10).max() - _bc_l2.tail(10).min()
-                _bc_comp2 = 1.0 - (_bc_range_5d2 / (_bc_range_10d2 + 1e-9))
-                _bc_slope2 = float(np.polyfit(range(5), _bc_c2.tail(5).values, 1)[0]) / (_bc_atr_v2 + 1e-9)
-                _cs_spread_comp_inline[_bc_sym2] = float(np.clip(max(0.0, _bc_comp2) * max(0.0, _bc_slope2), 0.0, 5.0))
-            except Exception:
-                pass
-        if _cs_spread_comp_inline:
-            _vals2 = np.array(list(_cs_spread_comp_inline.values()), dtype=float)
-            st.session_state.cs_spread_comp = {
-                sym2: float((_vals2 <= v2).sum() / len(_vals2))
-                for sym2, v2 in _cs_spread_comp_inline.items()
-            }
-        # Invalidate score cache so stale scores computed with empty cs_spread_comp are evicted
-        st.session_state.score_cache = {}
-
-    # FIX-01: version token — if cs_spread_comp was just populated, old cached scores
-    # (computed with empty cs_spread_comp) must not be served. We tag the cache with the
-    # size of cs_spread_comp; a size change forces a full cache eviction.
-    _cs_sc_version = len(st.session_state.get("cs_spread_comp", {}))
-    if st.session_state.get("_cs_sc_cache_version", -1) != _cs_sc_version:
-        st.session_state.score_cache = {}
-        st.session_state["_cs_sc_cache_version"] = _cs_sc_version
 
     screener_rows = []
     _vol_skipped_screener = 0
@@ -7601,8 +7713,8 @@ else:
             )
         with wf_col4:
             wf_hold = st.selectbox(
-                "Hold period", options=[1, 2, 3, 5, "Horizon-matched"], index=2, key="wf_hold",
-                format_func=lambda x: f"{x} days" if isinstance(x, int) else x
+                "Hold period", options=[1, 2, 3, 5], index=2, key="wf_hold",
+                format_func=lambda x: f"{x} days"
             )
         with wf_col5:
             wf_slippage_bps = st.number_input(
@@ -7613,8 +7725,6 @@ else:
         run_wf = st.button("▶ Run Walk-Forward", use_container_width=True, key="run_wf")
 
         if run_wf:
-            # FIX-02B/08D: resolve numeric hold for arithmetic (bounds check, exit calc, Sharpe)
-            _wf_hold_numeric = wf_hold if isinstance(wf_hold, int) else 3  # Horizon-matched uses 3d avg
             # ── Fetch full Nifty history once for all test dates ──
             _wf_nifty_close = None
             try:
@@ -7680,7 +7790,8 @@ else:
             test_dates = _wf_valid[::wf_step]
 
             wf_progress = st.progress(0)
-            wf_all_trades = []   # one row per (date, stock) "trade"
+            wf_all_trades = []        # one row per (date, stock) "trade" — confirmation filtered
+            wf_all_signals_raw = []   # all signals BEFORE confirmation filter — for unbiased IC
 
             for _di, _test_date in enumerate(test_dates):
                 wf_progress.progress((_di + 1) / len(test_dates))
@@ -7822,7 +7933,7 @@ else:
                     if len(_date_rows) == 0:
                         continue
                     _bar_idx = int(_date_rows.index[0])
-                    if _bar_idx < 61 or _bar_idx + 1 + 5 >= len(_dfc):  # FIX-02C: always need 5 bars forward
+                    if _bar_idx < 61 or _bar_idx + 1 + 5 >= len(_dfc):  # FIX-02: always need 5 fwd bars for R1/R3/R5d
                         continue
                     # Same fix as single-date BT: score on signal_bar (yesterday), enter today
                     # WALK-FORWARD SLICE FIX: same off-by-one corrected as single-date BT.
@@ -7889,61 +8000,67 @@ else:
                     _dfc = _wf_sym_dfs[_sym]
 
                     # ── ENTRY TIMING FILTER ──
-                    # Only enter on actionable horizons. Mid/Long signals mean
-                    # "setup forming — wait." Entering them at next-day open is
-                    # entering stocks the model itself says are not ready.
-                    # Actionable = Imminent BO or Intraday or Swing 2-5D.
-                    # Mid and Long are tracked in the screener UI but never traded
-                    # in the walk-forward until they reach an actionable horizon.
                     _actionable = {"Imminent BO", "Intraday", "Swing 2-5D"}
                     if _horizon not in _actionable:
                         continue
 
                     # Slippage model: entry at NEXT DAY open
-                    _entry_idx = _bar_idx + 1   # entry = day AFTER signal date open
+                    _entry_idx = _bar_idx + 1
                     if _entry_idx >= len(_dfc):
                         continue
                     _entry_p = float(_dfc.iloc[_entry_idx]["open"])
                     if _entry_p == 0:
                         continue
-                    # Fix 11: Apply slippage — entry cost = next-open × (1 + slippage_bps/10000)
-                    # Slippage models the bid-ask spread + market impact of entering a position.
-                    # Without this, walk-forward returns are systematically overstated.
                     _entry_p = _entry_p * (1.0 + wf_slippage_bps / 10000.0)
 
+                    # ── RAW SIGNAL RECORD (pre-confirmation-filter) ──
+                    # Stored here, BEFORE the confirmation candle check, so that the
+                    # Leading Signal IC tables can be computed on unfiltered signals.
+                    # The confirmation filter is correlated with signal values (high-score
+                    # setups are more likely to confirm), so IC measured post-filter is
+                    # inflated vs what the signal would achieve in practice.
+                    # R1d/R3d/R5d are computed forward from entry open regardless of
+                    # whether the confirmation filter would have excluded this trade.
+                    def _wf_ret_raw(n):
+                        _ix = min(_entry_idx + n, len(_dfc) - 1)
+                        return round((float(_dfc.iloc[_ix]["close"]) - _entry_p) / _entry_p * 100, 3)
+                    _r1_raw = _wf_ret_raw(1); _r3_raw = _wf_ret_raw(3); _r5_raw = _wf_ret_raw(5)
+                    _ret_matched_raw = _r1_raw if _horizon == "Imminent BO" else \
+                                       (_r5_raw if _horizon == "Swing 2-5D" else _r3_raw)
+                    wf_all_signals_raw.append({
+                        "Date":          _test_date,
+                        "Ticker":        _sym,
+                        "Score":         _score,
+                        "RetMatched%":   _ret_matched_raw,
+                        f"R{wf_hold}d%": _wf_ret_raw(wf_hold),
+                        "UpVolSkew":     _uv,
+                        "CPR":           _cpr_s,
+                        "SpreadComp":    _sc,
+                        "ATRExpOnset":   _atr_exp,
+                        "OI_Buildup":    _oi_b,
+                        "CompressionStreak": _cstreak,
+                        "HHHLScore":     _hhhl,
+                        "BBSqueeze":     _bbs,
+                        "VolDryUp":      _vdu,
+                    })
+
                     # ── CONFIRMATION CANDLE FILTER ──
-                    # The entry bar must close above the signal bar's close with
-                    # volume above the 20-day average.
-                    # This prevents entering on gap-and-reverse days where the open
-                    # was high but the stock sold off all day.
-                    # Derived from: entry candle close > signal bar close = price held.
-                    # Vol confirmation = entry vol > vol_ma20 (baseline, no arbitrary multiple).
                     _entry_bar    = _dfc.iloc[_entry_idx]
                     _signal_close = float(_dfc.iloc[_bar_idx]["close"])
                     _entry_close  = float(_entry_bar["close"])
                     _entry_vol    = float(_entry_bar["volume"]) if pd.notna(_entry_bar["volume"]) else 0
-                    # vol_ma20 at signal date: mean of prior 20 bars
                     _vol_base = float(_dfc.iloc[max(0, _bar_idx-20):_bar_idx]["volume"].mean()) if _bar_idx >= 5 else _entry_vol
                     if _entry_close <= _signal_close:
-                        continue   # entry bar closed below signal close — momentum failed
-                    # FIX 16: Lower vol threshold to 0.8× for Breakout setups where gap-up is expected.
-                    # Old: _entry_vol < _vol_base → skipped valid gap-up Breakout entries.
-                    # New: Breakout allows 0.8× baseline (gap-up bars often show conservative
-                    # intraday vol as price sits above the trigger). Non-breakout keeps 1.0×.
+                        continue
                     _vol_threshold = _vol_base * (0.8 if _setup == "Breakout" else 1.0)
                     if _entry_vol < _vol_threshold:
-                        continue   # entry bar had below-threshold volume — no demand confirmation
-                    _exit_idx = min(_bar_idx + _wf_hold_numeric, len(_dfc) - 1)
+                        continue
+                    # Reuse the forward returns already computed for the raw record
+                    _r1  = _r1_raw; _r3 = _r3_raw; _r5 = _r5_raw
+                    _exit_idx = min(_bar_idx + wf_hold, len(_dfc) - 1)
                     _exit_p   = float(_dfc.iloc[_exit_idx]["close"])
                     _ret_pct  = round((_exit_p - _entry_p) / _entry_p * 100, 3)
-
-                    # FIX-02A: compute multi-horizon returns regardless of wf_hold
-                    _exit_1d = float(_dfc.iloc[min(_bar_idx + 1, len(_dfc)-1)]["close"])
-                    _exit_3d = float(_dfc.iloc[min(_bar_idx + 3, len(_dfc)-1)]["close"])
-                    _exit_5d = float(_dfc.iloc[min(_bar_idx + 5, len(_dfc)-1)]["close"])
-                    _r1d = round((_exit_1d - _entry_p) / _entry_p * 100, 3)
-                    _r3d = round((_exit_3d - _entry_p) / _entry_p * 100, 3)
-                    _r5d = round((_exit_5d - _entry_p) / _entry_p * 100, 3)
+                    _ret_matched = _ret_matched_raw
 
                     # Max drawdown in hold window (low vs entry)
                     _hold_lows = _dfc.iloc[_entry_idx:_exit_idx + 1]["low"]
@@ -7961,13 +8078,14 @@ else:
                         "CSRank5d":    _csrank,
                         "Entry":       round(_entry_p, 2),
                         "Exit":        round(_exit_p, 2),
-                        f"R{_wf_hold_numeric}d%": _ret_pct,
-                        "R1d%":        _r1d,   # FIX-02A
-                        "R3d%":        _r3d,   # FIX-02A
-                        "R5d%":        _r5d,   # FIX-02A
+                        f"R{wf_hold}d%": _ret_pct,
+                        "R1d%":        _r1,
+                        "R3d%":        _r3,
+                        "R5d%":        _r5,
+                        "RetMatched%": _ret_matched,
                         "MaxGain%":    _max_gain,
                         "MaxDD%":      _max_dd,
-                        "Win":         1 if _ret_pct > 0 else 0,
+                        "Win":         1 if _ret_matched > 0 else 0,  # Win on horizon-matched return
                         # Leading signals carried for quartile IC analysis
                         "UpVolSkew":         _uv,
                         "CPR":               _cpr_s,
@@ -8005,22 +8123,11 @@ else:
                 st.warning("No signals passed filters across the full date range. Try lowering the Min Score.")
             else:
                 wf_df = pd.DataFrame(wf_all_trades)
-                # FIX-02B: build horizon-matched return column
-                if all(c in wf_df.columns for c in ["R1d%","R3d%","R5d%","Horizon"]):
-                    wf_df["RetMatched%"] = wf_df.apply(
-                        lambda r: r["R1d%"] if r["Horizon"] == "Imminent BO"
-                        else (r["R5d%"] if r["Horizon"] == "Swing 2-5D"
-                              else r["R3d%"]),
-                        axis=1
-                    )
-                # FIX-02B/08D: choose ret_col based on wf_hold setting
-                if wf_hold == "Horizon-matched" and "RetMatched%" in wf_df.columns:
-                    ret_col = "RetMatched%"
-                else:
-                    ret_col = f"R{_wf_hold_numeric}d%"
-                # Ensure ret_col exists (fallback if column missing)
-                if ret_col not in wf_df.columns:
-                    ret_col = f"R{_wf_hold_numeric}d%"
+                # FIX-02: Use horizon-matched return for IC and adaptive weight computation.
+                # ret_col_display keeps the user-selected hold for aggregate stats display.
+                # ret_col is used for all IC/weight calculations.
+                ret_col_display = f"R{wf_hold}d%"
+                ret_col = "RetMatched%" if "RetMatched%" in wf_df.columns else ret_col_display
 
                 # Fix 12: Compute per-stock win rate from walk-forward and store in session_state.
                 # This feeds the KellyFrac calculation in score_stock_dual — when a stock has
@@ -8042,65 +8149,79 @@ else:
                         st.caption(f"Kelly data: {len(_psw)} stocks now use walk-forward win rates.")
 
                 # ── AUTO IC-BASED FACTOR WEIGHT UPDATE ────────────────────────────────
-                # This closes the feedback loop: walk-forward Q4-Q1 spread per signal
-                # is a direct IC measurement. We use it to reweight the three primary
-                # score factors (_W_SPREAD, _W_VOL_QUIET, _W_COIL) proportionally.
+                # Circularity fix: the IC measurement must use a HELD-OUT period,
+                # not the same data that generated the signals under the current weights.
+                # If SpreadComp already dominates the score, the top-ranked stocks all
+                # have high SpreadComp — of course it shows high IC in-sample. That is
+                # a tautology, not new information.
                 #
-                # Method:
-                #   1. Compute Q4-Q1 spread for each primary factor vs forward return.
-                #   2. Clip negative spreads to 0 (don't give negative weight).
-                #   3. Softmax-normalise to sum=1 (weights must stay proportional).
-                #   4. Blend 70% new / 30% prior (conservative update, prevents overfitting
-                #      to a single WF run which may be regime-specific).
-                #   5. Store in session_state.adaptive_weights — picked up by score_stock_dual.
+                # Fix: split wf_df chronologically.
+                #   Train set (first 70%): generated signals with current weights — DO NOT
+                #   measure IC here; it is contaminated by the current weight structure.
+                #   Held-out set (last 30%): IC measured here. These are the most recent
+                #   trades, scored by the engine as-is, but the IC is measured post-hoc
+                #   against their signal values WITHOUT the scoring model's influence on
+                #   which trades were selected (selection bias is still present but at
+                #   least the IC is not circular within the same date range).
                 #
-                # Minimum: 30 trades needed before any update. Below that, keep prior weights.
-                # The prior weights (0.40 / 0.40 / 0.20) are the Jan 2026 Nifty50 backtest result.
-                # They get progressively replaced by live walk-forward data as you run more dates.
-                #
-                # Factors mapped to walk-forward columns:
-                #   _W_SPREAD    ← SpreadComp Q4-Q1
-                #   _W_VOL_QUIET ← UpVolSkew Q4-Q1  (best proxy for vol quiet signal)
-                #   _W_COIL      ← ATRExpOnset Q4-Q1 (coil quality proxy)
+                # The held-out set must have at least _WF_MIN_TRADES_FOR_REWEIGHT trades.
+                # If the full dataset is too small, fall back to full-set measurement
+                # with a reduced blend factor (less trust in the circular estimate).
                 #
                 _WF_MIN_TRADES_FOR_REWEIGHT = 30
-                _BLEND_NEW = 0.70   # how much the new IC measurement overrides the prior
+                _BLEND_NEW = 0.70
                 _BLEND_OLD = 0.30
 
                 _prior_w = st.session_state.get("adaptive_weights",
                     {"spread": 0.40, "vol": 0.40, "coil": 0.20})
 
                 _ic_signals = [
-                    # FIX 11: Map weight keys to the ACTUAL primary factor columns in wf_df,
-                    # not proxy bonus signals. The adaptive weight feedback must measure IC of
-                    # the same variables that drive the score formula:
-                    #   _W_SPREAD    → SpreadComp (the primary factor, 0-3 pts, already in wf_df)
-                    #   _W_VOL_QUIET → UpVolSkew  (closest proxy for vol-quiet behaviour)
-                    #   _W_COIL      → BBSqueeze   (best proxy for coil quality / ATR compression)
-                    # Note: UpVolSkew and ATRExpOnset are carried through wf_all_trades already.
-                    # BBSqueeze replaces ATRExpOnset for _W_COIL — tighter correlation to coil_pts.
                     ("spread",   "SpreadComp"),
                     ("vol",      "UpVolSkew"),
-                    ("coil",     "BBSqueeze"),   # FIX 11: was ATRExpOnset (too noisy a proxy)
+                    ("coil",     "BBSqueeze"),
                 ]
 
+                # Chronological train/test split
+                _wf_sorted = wf_df.sort_values("Date").reset_index(drop=True) \
+                             if "Date" in wf_df.columns else wf_df.copy()
+                _split_idx = int(len(_wf_sorted) * 0.70)
+                _wf_holdout = _wf_sorted.iloc[_split_idx:].copy()
+
+                # If held-out set is too small, fall back to full set but halve blend trust
+                if len(_wf_holdout) < _WF_MIN_TRADES_FOR_REWEIGHT:
+                    _wf_holdout  = _wf_sorted.copy()
+                    _BLEND_NEW   = min(_BLEND_NEW, 0.35)   # half trust for circular estimate
+                    _blend_note  = "⚠ Held-out set too small — using full set with reduced blend (35%)."
+                else:
+                    _blend_note  = f"IC measured on held-out {len(_wf_holdout)} trades (last 30% of WF range)."
+
                 _new_raw = {}
-                _enough_data = len(wf_df) >= _WF_MIN_TRADES_FOR_REWEIGHT
+                _enough_data = len(_wf_holdout) >= _WF_MIN_TRADES_FOR_REWEIGHT
 
                 if _enough_data:
-                    # FIX-02B: use RetMatched% for IC if available — gives true per-signal IC
-                    _ic_ret_col = "RetMatched%" if "RetMatched%" in wf_df.columns else ret_col
-                    _wf_ic = wf_df.dropna(subset=[_ic_ret_col]).copy()
+                    _wf_ic = _wf_holdout.dropna(subset=[ret_col]).copy()
                     for _wkey, _wcol in _ic_signals:
                         if _wcol not in _wf_ic.columns or _wf_ic[_wcol].nunique() < 4:
                             _new_raw[_wkey] = max(_prior_w.get(_wkey, 0.0), 0.01)
                             continue
                         try:
-                            _wf_ic["_Q"] = pd.qcut(_wf_ic[_wcol], 4,
-                                                    labels=["Q1","Q2","Q3","Q4"],
-                                                    duplicates="drop")
-                            _q_grp = _wf_ic.groupby("_Q", observed=True)[_ic_ret_col].mean()
-                            if len(_q_grp) >= 4:
+                            # Robust qcut: derive actual bin count after dropping duplicates,
+                            # then match labels dynamically — prevents label mismatch crash.
+                            _all_q_labels = ["Q1", "Q2", "Q3", "Q4"]
+                            _bins_edges = pd.qcut(_wf_ic[_wcol], 4, retbins=True,
+                                                  duplicates="drop")[1]
+                            _n_bins = len(_bins_edges) - 1
+                            if _n_bins < 2:
+                                _new_raw[_wkey] = max(_prior_w.get(_wkey, 0.0), 0.01)
+                                continue
+                            _q_labels = _all_q_labels[:_n_bins]
+                            _wf_ic["_Q"] = pd.qcut(_wf_ic[_wcol], _bins_edges,
+                                                    labels=_q_labels,
+                                                    duplicates="drop",
+                                                    include_lowest=True)
+                            _q_grp = _wf_ic.groupby("_Q", observed=True)[ret_col].mean()
+                            if len(_q_grp) >= 2:
+                                # Q4-Q1 spread — works even if fewer than 4 bins survived
                                 _spread_ic = float(_q_grp.iloc[-1]) - float(_q_grp.iloc[0])
                                 _new_raw[_wkey] = max(_spread_ic, 0.0)   # clip negative
                             else:
@@ -8131,10 +8252,7 @@ else:
                     # Show what happened
                     _aw = _blended
                     st.subheader("⚡ Auto Weight Update — IC Feedback")
-                    st.caption(
-                        "Walk-forward IC measured per signal. Weights updated as: "
-                        "70% new IC + 30% prior. Score formula will use these weights on next extraction."
-                    )
+                    st.caption(_blend_note)
                     _w_cols = st.columns(4)
                     _w_cols[0].metric("SpreadComp weight",  f"{_aw['spread']:.3f}",
                                       delta=f"{_aw['spread'] - _prior_w.get('spread', 0.40):+.3f} vs prior")
@@ -8142,16 +8260,16 @@ else:
                                       delta=f"{_aw['vol'] - _prior_w.get('vol', 0.40):+.3f} vs prior")
                     _w_cols[2].metric("Coil weight",        f"{_aw['coil']:.3f}",
                                       delta=f"{_aw['coil'] - _prior_w.get('coil', 0.20):+.3f} vs prior")
-                    _w_cols[3].metric("Trades used",        str(len(wf_df)))
+                    _w_cols[3].metric("Holdout trades",     str(len(_wf_holdout)))
                     st.caption(
-                        "Interpretation: if SpreadComp weight grew, spread compression had stronger Q4-Q1 spread "
-                        "in this walk-forward — the model increases its emphasis. "
-                        "Run more dates to stabilise weights. Requires ≥30 trades to activate."
+                        "IC measured on held-out last 30% of walk-forward range (out-of-sample). "
+                        "Weights updated as: new_blend% new IC + old_blend% prior. "
+                        "Score formula uses these weights on next extraction. Requires ≥30 holdout trades."
                     )
                 else:
                     st.info(
-                        f"Auto weight update inactive — need ≥{_WF_MIN_TRADES_FOR_REWEIGHT} trades "
-                        f"(currently {len(wf_df)}). Run more WF dates or lower min score to accumulate data."
+                        f"Auto weight update inactive — held-out set has {len(_wf_holdout)} trades "
+                        f"(need ≥{_WF_MIN_TRADES_FOR_REWEIGHT}). Run more WF dates or lower min score."
                     )
 
                 # ── AGGREGATE STATS ──
@@ -8164,7 +8282,7 @@ else:
                 # Sharpe: annualised using trading days per hold period
                 # σ of per-trade returns; scale to annual using √(252 / hold_period)
                 _ret_std = wf_df[ret_col].std()
-                sharpe   = round((avg_ret / (_ret_std + 1e-9)) * np.sqrt(252 / _wf_hold_numeric), 2) if _ret_std > 0 else 0.0
+                sharpe   = round((avg_ret / (_ret_std + 1e-9)) * np.sqrt(252 / wf_hold), 2) if _ret_std > 0 else 0.0
 
                 # Profit factor: sum of wins / abs(sum of losses)
                 _wins   = wf_df.loc[wf_df[ret_col] > 0, ret_col].sum()
@@ -8266,8 +8384,13 @@ else:
                            "Check CSRank quartile below — it should show stronger monotonicity.")
                 _wf_q = wf_df.dropna(subset=[ret_col]).copy()
                 if len(_wf_q) >= 20:
-                    _wf_q["ScoreQ"] = pd.qcut(_wf_q["Score"], 4,
-                                               labels=["Q1 Low","Q2","Q3","Q4 High"])
+                    _all_labels = ["Q1 Low", "Q2", "Q3", "Q4 High"]
+                    _bins = pd.qcut(_wf_q["Score"], 4, retbins=True, duplicates="drop")[1]
+                    _labels = _all_labels[:len(_bins) - 1]
+                    _wf_q["ScoreQ"] = pd.qcut(_wf_q["Score"], _bins,
+                                               labels=_labels,
+                                               duplicates="drop",
+                                               include_lowest=True)
                     _wf_qt = (_wf_q.groupby("ScoreQ", observed=True)[ret_col]
                               .agg(Trades="count",
                                    AvgReturn="mean",
@@ -8320,29 +8443,24 @@ else:
                         "Only Imminent BO, Intraday, and Swing 2-5D are entered in the walk-forward. "
                         "If Imminent BO consistently beats Swing, tighten the horizon filter further."
                     )
-                    _hz_grp = (
-                        wf_df.groupby("Horizon")[ret_col]
-                        .agg(Trades="count",
-                             AvgReturn="mean",
-                             WinRate=lambda x: round((x > 0).mean() * 100, 1))
-                        .round(3).reset_index()
-                    )
-                    _hz_grp.columns = ["Horizon", "Trades", f"Avg {wf_hold}d Return %", "Win Rate %"]
-                    # FIX-08B: add multi-horizon return summary columns if available
-                    if all(c in wf_df.columns for c in ["R1d%", "R3d%", "R5d%"]):
-                        _hz_r1 = wf_df.groupby("Horizon")["R1d%"].mean().round(3).rename("Avg R1d%")
-                        _hz_r3 = wf_df.groupby("Horizon")["R3d%"].mean().round(3).rename("Avg R3d%")
-                        _hz_r5 = wf_df.groupby("Horizon")["R5d%"].mean().round(3).rename("Avg R5d%")
-                        _hz_grp = _hz_grp.join(_hz_r1, on="Horizon").join(_hz_r3, on="Horizon").join(_hz_r5, on="Horizon")
+                    # FIX-08: Show R1d/R3d/R5d per horizon so analyst sees whether
+                    # Imminent BO peaks at 1d (correct) and Swing peaks at 5d (correct).
+                    _hz_cols_avail = [c for c in ["R1d%","R3d%","R5d%","RetMatched%"] if c in wf_df.columns]
+                    _hz_agg_dict = {"Trades": (ret_col, "count")}
+                    for _hc in _hz_cols_avail:
+                        _hz_agg_dict[f"Avg {_hc}"] = (_hc, "mean")
+                    _hz_agg_dict["WinRate%"] = ("RetMatched%" if "RetMatched%" in wf_df.columns else ret_col,
+                                                 lambda x: round((x > 0).mean() * 100, 1))
+                    _hz_grp = wf_df.groupby("Horizon").agg(**_hz_agg_dict).round(3).reset_index()
+                    _hz_ret_cols = [c for c in _hz_grp.columns if c.startswith("Avg ")]
                     st.dataframe(
-                        _hz_grp.style.applymap(_wf_color, subset=[c for c in _hz_grp.columns if "Return" in c or c in ("Avg R1d%","Avg R3d%","Avg R5d%","Win Rate %")]),
+                        _hz_grp.style.applymap(_wf_color, subset=_hz_ret_cols),
                         use_container_width=True, hide_index=True
                     )
-                    if all(c in wf_df.columns for c in ["R1d%","R5d%"]):
-                        st.caption(
-                            "Avg R1d%/R3d%/R5d% show payoff by horizon — Imminent BO should peak at R1d, "
-                            "Swing 2-5D at R5d. If both peak at R3d, signals are firing ~2 days early."
-                        )
+                    st.caption(
+                        "Imminent BO should peak at Avg R1d%. Swing 2-5D should peak at Avg R5d%. "
+                        "If they don't, the horizon classification or entry timing needs adjustment."
+                    )
 
                 # ── REGIME BREAKDOWN ──
                 st.subheader("📋 Performance by Market Regime (based on date)")
@@ -8396,14 +8514,18 @@ else:
                 )
 
                 # ── LEADING SIGNAL PREDICTIVE POWER ──
-                # Institutional-grade validation: for each new leading signal, show whether
-                # higher signal values predict higher forward returns.
-                # If Q4 beats Q1, the signal has real predictive power — not luck.
+                # Two views are shown side by side:
+                #   Filtered IC  : trades that passed the confirmation candle filter (what the model traded)
+                #   Raw IC       : ALL signals before the filter (true signal predictiveness)
+                # If Raw IC > Filtered IC, the confirmation filter is selecting on correlated signal
+                # values and inflating the apparent IC. If they are similar, the filter is neutral.
+                # Flat or inverted Raw IC = the signal genuinely has no edge and should be downweighted.
                 st.subheader("🔬 Leading Signal Predictive Power — Quartile vs Return")
                 st.caption(
-                    "Each table splits trades by how strong the leading signal was on entry day. "
-                    "Q4 = top 25% signal strength. A well-designed signal shows Q4 > Q3 > Q2 > Q1. "
-                    "Flat or inverted tables mean that signal adds no edge and should be weighted down."
+                    "**Filtered** = trades that passed confirmation candle filter (what was actually traded). "
+                    "**Raw** = all signals before the filter (true out-of-sample IC). "
+                    "Large Filtered > Raw gap = confirmation filter is selecting on signal values (inflated IC). "
+                    "Q4 = top 25% signal strength. A genuine signal shows Q4 > Q3 > Q2 > Q1 in BOTH views."
                 )
                 _lead_sigs = [
                     ("UpVolSkew",          "Upside Volume Skew"),
@@ -8416,46 +8538,68 @@ else:
                     ("BBSqueeze",          "Bollinger Band Squeeze"),
                     ("VolDryUp",           "Volume Dry-Up"),
                 ]
-                _wf_lead = wf_df.dropna(subset=[ret_col]).copy()
-                # FIX-08C: use RetMatched% for per-signal IC — true IC at each signal's natural horizon
-                _lead_ret_col = "RetMatched%" if "RetMatched%" in wf_df.columns else ret_col
-                if len(_wf_lead) >= 20:
-                    _lead_cols = st.columns(min(3, len(_lead_sigs)))
+                _wf_lead_filtered = wf_df.dropna(subset=[ret_col]).copy()
+                _wf_lead_raw = pd.DataFrame(wf_all_signals_raw).dropna(subset=["RetMatched%"]) \
+                               if wf_all_signals_raw else pd.DataFrame()
+                _ret_col_raw = "RetMatched%"
+
+                def _render_ic_table(df_src, ret_c, sig_col, sig_label, hold_d):
+                    """Render one quartile IC table. Returns Q4-Q1 spread or None."""
+                    if sig_col not in df_src.columns:
+                        return None
+                    try:
+                        _sq = df_src.dropna(subset=[sig_col]).copy()
+                        if _sq[sig_col].nunique() < 3:
+                            return None
+                        _all_labels = ["Q1","Q2","Q3","Q4"]
+                        _bedges = pd.qcut(_sq[sig_col], 4, retbins=True, duplicates="drop")[1]
+                        _nb = len(_bedges) - 1
+                        if _nb < 2:
+                            return None
+                        _qlabels = _all_labels[:_nb]
+                        _sq["Q"] = pd.qcut(_sq[sig_col], _bedges, labels=_qlabels,
+                                           duplicates="drop", include_lowest=True)
+                        _qt = (_sq.groupby("Q", observed=True)[ret_c]
+                               .agg(Trades="count", AvgReturn="mean",
+                                    WinRate=lambda x: round((x > 0).mean() * 100, 1))
+                               .round(3).reset_index())
+                        _qt.columns = ["Q","Trades",f"Avg Ret%","Win%"]
+                        _spread = round(float(_qt.iloc[-1]["Avg Ret%"]) - float(_qt.iloc[0]["Avg Ret%"]), 3) \
+                                  if len(_qt) >= 2 else None
+                        return _qt, _spread
+                    except Exception:
+                        return None
+
+                if len(_wf_lead_filtered) >= 20:
                     for _li, (_sig_col, _sig_label) in enumerate(_lead_sigs):
-                        if _sig_col not in _wf_lead.columns:
+                        _filt_result = _render_ic_table(_wf_lead_filtered, ret_col, _sig_col, _sig_label, wf_hold) \
+                                       if len(_wf_lead_filtered) >= 20 else None
+                        _raw_result  = _render_ic_table(_wf_lead_raw, _ret_col_raw, _sig_col, _sig_label, wf_hold) \
+                                       if len(_wf_lead_raw) >= 20 else None
+                        if _filt_result is None and _raw_result is None:
                             continue
-                        _col_ref = _lead_cols[_li % 3]
-                        with _col_ref:
-                            try:
-                                _sig_q = _wf_lead.dropna(subset=[_sig_col]).copy()
-                                if _sig_q[_sig_col].nunique() < 4:
-                                    st.caption(f"{_sig_label}: insufficient variation")
-                                    continue
-                                _sig_q["Q"] = pd.qcut(_sig_q[_sig_col], 4,
-                                                       labels=["Q1","Q2","Q3","Q4"],
-                                                       duplicates="drop")
-                                _sig_qt = (_sig_q.groupby("Q", observed=True)[_lead_ret_col]
-                                           .agg(Trades="count", AvgReturn="mean",
-                                                WinRate=lambda x: round((x > 0).mean() * 100, 1))
-                                           .round(3).reset_index())
-                                _sig_qt.columns = ["Quartile","Trades",f"Avg {wf_hold}d Ret%","Win%"]
-                                # Compute Q4-Q1 spread
-                                if len(_sig_qt) >= 4:
-                                    _sig_spread = round(
-                                        float(_sig_qt.iloc[-1][f"Avg {wf_hold}d Ret%"]) -
-                                        float(_sig_qt.iloc[0][f"Avg {wf_hold}d Ret%"]), 3)
-                                    _color = "green" if _sig_spread > 0.3 else "orange" if _sig_spread > 0 else "red"
-                                    st.markdown(f"**{_sig_label}** — Q4−Q1 spread: "
-                                                f":{_color}[{_sig_spread:+.3f}%]")
-                                else:
-                                    st.markdown(f"**{_sig_label}**")
-                                st.dataframe(
-                                    _sig_qt.style.applymap(
-                                        _wf_color, subset=[f"Avg {wf_hold}d Ret%","Win%"]),
-                                    use_container_width=True, hide_index=True, height=200
-                                )
-                            except Exception:
-                                st.caption(f"{_sig_label}: insufficient data")
+                        st.markdown(f"**{_sig_label}**")
+                        _ic_cols = st.columns(2)
+                        with _ic_cols[0]:
+                            if _filt_result is not None:
+                                _qt, _spread = _filt_result
+                                _color = "green" if _spread and _spread > 0.3 else \
+                                         "orange" if _spread and _spread > 0 else "red"
+                                st.caption(f"Filtered — Q4−Q1: :{_color}[{_spread:+.3f}%]" if _spread is not None else "Filtered")
+                                st.dataframe(_qt.style.map(_wf_color, subset=["Avg Ret%","Win%"]),
+                                             use_container_width=True, hide_index=True, height=185)
+                            else:
+                                st.caption("Filtered: insufficient data")
+                        with _ic_cols[1]:
+                            if _raw_result is not None:
+                                _qt_r, _spread_r = _raw_result
+                                _color_r = "green" if _spread_r and _spread_r > 0.3 else \
+                                           "orange" if _spread_r and _spread_r > 0 else "red"
+                                st.caption(f"Raw (pre-filter) — Q4−Q1: :{_color_r}[{_spread_r:+.3f}%]" if _spread_r is not None else "Raw")
+                                st.dataframe(_qt_r.style.map(_wf_color, subset=["Avg Ret%","Win%"]),
+                                             use_container_width=True, hide_index=True, height=185)
+                            else:
+                                st.caption("Raw: insufficient data")
 
 
 # ============================================================
