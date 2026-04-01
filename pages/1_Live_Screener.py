@@ -100,234 +100,6 @@ def _fetch_nse_delivery_pct() -> dict:
 
 
 # ============================================================
-# EVENT CALENDAR — NSE CORPORATE ACTIONS + RESULTS DATES
-# ============================================================
-# Fetched once per day. Returns {SYMBOL: nearest_event_date_str} for any
-# stock that has a board meeting, results, dividend, or AGM within ±5 days.
-# Signals within EVENT_BLACKOUT_DAYS of a corporate event are flagged with
-# "EventRisk" in the score output and get a soft penalty.
-# Non-F&O stocks have no expiry risk but may still have result/AGM risk.
-# ============================================================
-_EVENT_CACHE_TTL = 24 * 3600   # 1 day
-
-@st.cache_data(ttl=_EVENT_CACHE_TTL)
-def _fetch_nse_event_calendar() -> dict:
-    """
-    Returns {SYMBOL: (event_label, days_away)} for the nearest upcoming event.
-    days_away < 0 = event already passed (within lookback window).
-    Returns {} on any failure — caller treats missing keys as no event.
-    Priority: Results > Board Meeting > AGM > Dividend Ex-Date.
-    """
-    _headers_nse = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json",
-        "Referer": "https://www.nseindia.com/"
-    }
-    _event_map = {}
-    try:
-        _r = requests.get(
-            "https://www.nseindia.com/api/event-calendar",
-            headers=_headers_nse, timeout=12
-        )
-        if _r.status_code != 200:
-            return {}
-        _data = _r.json()
-        _today = datetime.now().date()
-        _priority = {"Results": 0, "Board Meeting": 1, "AGM": 2, "Dividend": 3}
-        for _entry in _data:
-            _sym = str(_entry.get("symbol", "")).strip().upper()
-            _purpose = str(_entry.get("purpose", "")).strip()
-            _date_str = str(_entry.get("date", "")).strip()
-            if not (_sym and _date_str):
-                continue
-            try:
-                _ev_date = datetime.strptime(_date_str, "%d-%b-%Y").date()
-            except Exception:
-                try:
-                    _ev_date = datetime.strptime(_date_str, "%Y-%m-%d").date()
-                except Exception:
-                    continue
-            _days = (_ev_date - _today).days
-            # Track only events within ±10 days
-            if abs(_days) > 10:
-                continue
-            # Determine event priority (lower = more important)
-            _ev_pri = 99
-            for _kw, _p in _priority.items():
-                if _kw.lower() in _purpose.lower():
-                    _ev_pri = _p
-                    break
-            # Keep the nearest / highest-priority event per symbol
-            if _sym not in _event_map:
-                _event_map[_sym] = (_purpose[:30], _days, _ev_pri)
-            else:
-                _existing = _event_map[_sym]
-                if abs(_days) < abs(_existing[1]) or _ev_pri < _existing[2]:
-                    _event_map[_sym] = (_purpose[:30], _days, _ev_pri)
-    except Exception:
-        return {}
-    # Simplify: {SYM: (label, days_away)}
-    return {s: (v[0], v[1]) for s, v in _event_map.items()}
-
-
-# ============================================================
-# F&O PARTICIPANT-WISE OI — NSE DAILY FILE
-# ============================================================
-# NSE publishes participant-wise net OI for F&O each day.
-# FII net long in index futures correlates strongly with institutional
-# directional positioning.  For individual stocks: if FII is net long
-# in stock futures → accumulation confirmation.
-# File: https://archives.nseindia.com/content/nsccl/fao_participant_oi_DDMMYYYY.csv
-# Returns {SYMBOL: fii_net_long_flag} where flag is True/False/None.
-# Non-F&O stocks always get None.
-# ============================================================
-@st.cache_data(ttl=_BHAV_CACHE_TTL)
-def _fetch_participant_oi() -> dict:
-    """
-    Returns {SYMBOL_UPPER: fii_net_long (bool)} for F&O stocks.
-    True  = FII net long in that stock's futures OI today.
-    False = FII net short.
-    {} on failure (non-blocking).
-    Only stocks that appear in the participant OI file are included.
-    """
-    _headers_nse = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept":     "text/csv,application/csv",
-        "Referer":    "https://www.nseindia.com/"
-    }
-    from io import StringIO as _SIO
-    for _offset in range(5):
-        _d = datetime.now() - timedelta(days=_offset)
-        if _d.weekday() >= 5:
-            continue
-        _ds = _d.strftime("%d%m%Y")
-        _url = (f"https://archives.nseindia.com/content/nsccl/"
-                f"fao_participant_oi_{_ds}.csv")
-        try:
-            _r = requests.get(_url, headers=_headers_nse, timeout=12)
-            if _r.status_code != 200:
-                continue
-            _df = pd.read_csv(_SIO(_r.text))
-            _df.columns = [c.strip() for c in _df.columns]
-            # NSE format: Client Type, Buy Qty, Sell Qty, Net Qty per segment
-            # We look at rows where Client Type contains "FII/FPI"
-            _ct_col  = next((c for c in _df.columns if "CLIENT" in c.upper() or "TYPE" in c.upper()), None)
-            _net_col = next((c for c in _df.columns if "NET" in c.upper() and "QTY" in c.upper()), None)
-            _sym_col = next((c for c in _df.columns if "SYMBOL" in c.upper()), None)
-            if not (_ct_col and _net_col):
-                break   # file format unexpected — don't keep retrying older dates
-            if _sym_col:
-                # Stock-level participant file (has SYMBOL column)
-                _fii_rows = _df[_df[_ct_col].astype(str).str.upper().str.contains("FII|FPI", na=False)]
-                _fii_rows = _fii_rows.dropna(subset=[_net_col])
-                _fii_rows[_net_col] = pd.to_numeric(
-                    _fii_rows[_net_col].astype(str).str.replace(",", ""), errors="coerce")
-                _fii_rows = _fii_rows.dropna(subset=[_net_col])
-                return {
-                    str(row[_sym_col]).strip().upper(): (float(row[_net_col]) > 0)
-                    for _, row in _fii_rows.iterrows()
-                }
-            else:
-                # Index-level file only — no per-stock breakdown available
-                break
-        except Exception:
-            continue
-    return {}
-
-
-# ============================================================
-# FUNDAMENTAL QUALITY FILTER — yfinance CFO check
-# ============================================================
-# Fetches operating cash flow from yfinance for a symbol.
-# Returns (cfo_positive: bool, cfo_value: float | None).
-# Cached per-symbol for 24 hours to avoid hammering yfinance.
-# Called lazily only when the fundamental gate is enabled in sidebar.
-# ============================================================
-@st.cache_data(ttl=_EVENT_CACHE_TTL)
-def _fetch_fundamental_quality(ticker_nse: str) -> tuple:
-    """
-    Returns (cfo_ok: bool, rev_growth_ok: bool, note: str).
-    cfo_ok = True if operating CF was positive in the most recent annual period.
-    rev_growth_ok = True if TTM revenue > prior year revenue.
-    Note = short diagnostic string.
-    On any failure returns (True, True, 'N/A') — never penalise missing data.
-    """
-    try:
-        _t = yf.Ticker(ticker_nse + ".NS")
-        _cf = _t.cashflow
-        if _cf is None or _cf.empty:
-            return (True, True, "N/A")
-        # Operating cash flow row
-        _ocf_row = next((r for r in _cf.index
-                         if "operating" in str(r).lower() and "cash" in str(r).lower()), None)
-        if _ocf_row is None:
-            return (True, True, "N/A")
-        _ocf_vals = _cf.loc[_ocf_row].dropna()
-        if len(_ocf_vals) < 1:
-            return (True, True, "N/A")
-        _cfo_latest = float(_ocf_vals.iloc[0])
-        _cfo_ok = _cfo_latest > 0
-
-        # Revenue growth
-        _inc = _t.financials
-        _rev_ok = True
-        if _inc is not None and not _inc.empty:
-            _rev_row = next((r for r in _inc.index if "revenue" in str(r).lower() or
-                             "total revenue" in str(r).lower()), None)
-            if _rev_row and len(_inc.loc[_rev_row].dropna()) >= 2:
-                _rev_vals = _inc.loc[_rev_row].dropna()
-                _rev_ok = float(_rev_vals.iloc[0]) >= float(_rev_vals.iloc[1])
-
-        _note = f"CFO {'✓' if _cfo_ok else '✗'}  Rev {'↑' if _rev_ok else '↓'}"
-        return (_cfo_ok, _rev_ok, _note)
-    except Exception:
-        return (True, True, "N/A")
-
-
-# ============================================================
-# SIGNAL AUDIT LOG
-# ============================================================
-# Appends each screener signal to a flat CSV so win-rate, regime
-# performance and model drift can be tracked outside of walk-forward.
-# File: .monarch_signal_log.csv  (same directory as the app)
-# Schema: Timestamp, Ticker, Score, SetupType, Horizon, Entry, Target,
-#         Stop, RR, KellyFrac, Sector, Regime
-# ============================================================
-_SIGNAL_LOG_FILE = ".monarch_signal_log.csv"
-_SIGNAL_LOG_COLS = [
-    "Timestamp", "Ticker", "Score", "SetupType", "Horizon",
-    "Entry", "Target", "Stop", "RR", "KellyFrac", "Sector",
-    "Regime", "EventFlag", "FundamentalOK"
-]
-
-def _append_signal_log(rows: list):
-    """
-    Appends a list of signal dicts to the CSV audit log.
-    Creates the file with header if it does not exist.
-    Silently skips on any write error.
-    """
-    if not rows:
-        return
-    try:
-        _new_df = pd.DataFrame(rows, columns=_SIGNAL_LOG_COLS)
-        _write_header = not os.path.exists(_SIGNAL_LOG_FILE)
-        _new_df.to_csv(_SIGNAL_LOG_FILE, mode="a", header=_write_header, index=False)
-    except Exception:
-        pass
-
-
-def _load_signal_log(max_rows: int = 500) -> pd.DataFrame:
-    """Loads the last max_rows rows from the signal log. Returns empty DF on failure."""
-    try:
-        if os.path.exists(_SIGNAL_LOG_FILE):
-            _df = pd.read_csv(_SIGNAL_LOG_FILE)
-            return _df.tail(max_rows).reset_index(drop=True)
-    except Exception:
-        pass
-    return pd.DataFrame(columns=_SIGNAL_LOG_COLS)
-
-
-# ============================================================
 # PAGE CONFIG
 # ============================================================
 st.set_page_config(layout="wide", page_title="MONARCH PRO — Terminal")
@@ -743,21 +515,6 @@ if "live_tables" not in st.session_state:
         "leader": None, "rs": None, "trigger": None,
         "transition": None, "exit": None
     }
-# ── NEW INSTITUTIONAL FEATURES ──────────────────────────────────────────────
-if "event_calendar" not in st.session_state:
-    st.session_state.event_calendar = {}      # {SYM: (label, days_away)} — refreshed daily
-if "participant_oi" not in st.session_state:
-    st.session_state.participant_oi = {}      # {SYM: fii_net_long bool} — F&O only
-if "per_stock_outcomes" not in st.session_state:
-    st.session_state.per_stock_outcomes = {}  # {SYM: [+1/-1, ...]} — rolling 50 trade outcomes
-if "event_blackout_enabled" not in st.session_state:
-    st.session_state.event_blackout_enabled = True
-if "fundamental_gate_enabled" not in st.session_state:
-    st.session_state.fundamental_gate_enabled = False
-if "portfolio_size_lakh" not in st.session_state:
-    st.session_state.portfolio_size_lakh = 50.0
-if "portfolio_heat_cap_pct" not in st.session_state:
-    st.session_state.portfolio_heat_cap_pct = 40
 
 # ============================================================
 # PERSISTENT STATE — survives app restarts and tab refreshes
@@ -791,7 +548,7 @@ def _load_screener_state() -> dict:
 
 def _save_screener_state():
     """
-    Persist adaptive_weights, per_stock_winrate, delivery_pct, and param_registry to disk.
+    Persist adaptive_weights, per_stock_winrate, and delivery_pct to disk.
     Called after walk-forward runs and after extraction so weights are never lost.
     Silently skips on any write error (read-only filesystem, permissions, etc.).
     """
@@ -810,18 +567,6 @@ def _save_screener_state():
         if dp:
             out["delivery_pct"] = dp
             out["delivery_pct_ts"] = time.time()
-        # ── PARAM REGISTRY (I-PERSIST): persist self-calibrated universe params ──
-        # tanh_w, inst_sigma, prox_lambda, pullback_sigma, stab_adj_obs etc. are
-        # built up across sessions. Without persistence they cold-start on every restart
-        # and fall back to hard-coded bootstraps for the first N stocks processed.
-        # We keep only the last 200 observations per key (same rolling buffer used live)
-        # so the file stays small (< 100 KB) and is safe to read back on any restart.
-        pr = st.session_state.get("param_registry", {})
-        if pr and isinstance(pr, dict):
-            _pr_trimmed = {k: (v[-200:] if isinstance(v, list) else v)
-                          for k, v in pr.items()}
-            out["param_registry"] = _pr_trimmed
-            out["param_registry_ts"] = time.time()
         with open(_SCREENER_STATE_FILE, "w") as f:
             json.dump(out, f)
     except Exception:
@@ -848,24 +593,6 @@ if not st.session_state.get(_SCREENER_STATE_LOADED_KEY):
     if time.time() - _dp_ts < 4 * 3600 and isinstance(_saved.get("delivery_pct"), dict):
         if "delivery_pct" not in st.session_state or not st.session_state.delivery_pct:
             st.session_state.delivery_pct = _saved["delivery_pct"]
-
-    # ── PARAM REGISTRY (I-PERSIST): restore self-calibrated universe params ──
-    # No TTL on these — calibration parameters are structural (stock volatility
-    # cycles, pullback distributions) and remain valid across sessions.
-    # A stale value is always better than a cold-start hardcoded fallback.
-    _pr_saved = _saved.get("param_registry")
-    if isinstance(_pr_saved, dict) and _pr_saved:
-        _existing_pr = st.session_state.get("param_registry", {})
-        _merged_pr = dict(_existing_pr)   # start from current (may have new keys)
-        for _k, _v in _pr_saved.items():
-            if isinstance(_v, list) and len(_v) > 0:
-                # Merge saved observations into any already in session_state.
-                # New session starts with no observations (empty list from init),
-                # so this effectively restores the full saved buffer.
-                _existing_list = _merged_pr.get(_k, [])
-                if not _existing_list:   # only restore if session list is empty
-                    _merged_pr[_k] = _v[-200:]
-        st.session_state.param_registry = _merged_pr
 
     st.session_state[_SCREENER_STATE_LOADED_KEY] = True
 
@@ -1336,56 +1063,6 @@ with st.sidebar:
         "Max 1 stock per sector",
         key="sector_cap_enabled",   # Streamlit writes directly to this key
         help="When ON, top screener output shows at most 1 stock per sector (sector-diversified signals)"
-    )
-
-    st.divider()
-    st.caption("INSTITUTIONAL RISK CONTROLS")
-
-    # ── EVENT BLACKOUT ──────────────────────────────────────────────────────
-    st.checkbox(
-        "Event blackout (±3 days)",
-        key="event_blackout_enabled",
-        value=True,
-        help=(
-            "Suppress or flag signals within ±3 trading days of results, "
-            "board meetings, AGMs, or dividend ex-dates. "
-            "Applies to all stocks — not just F&O."
-        )
-    )
-
-    # ── FUNDAMENTAL GATE ────────────────────────────────────────────────────
-    st.checkbox(
-        "Fundamental quality gate",
-        key="fundamental_gate_enabled",
-        value=False,
-        help=(
-            "Applies a −10 pt soft penalty to stocks with negative operating "
-            "cash flow in the most recent annual report (via yfinance). "
-            "Stocks with no data are NOT penalised. "
-            "Fetched once per day per symbol — first extraction may be slow."
-        )
-    )
-
-    # ── PORTFOLIO HEAT CAP ──────────────────────────────────────────────────
-    st.number_input(
-        "Portfolio size (₹ Lakh)",
-        min_value=1.0, max_value=10000.0, value=50.0, step=10.0,
-        key="portfolio_size_lakh",
-        help=(
-            "Used to cap Kelly% by liquidity: max position = min(Kelly%, "
-            "ADTV_turnover / portfolio_size). "
-            "Also used to enforce the 2% total heat cap."
-        )
-    )
-    st.number_input(
-        "Max total Kelly% (heat cap)",
-        min_value=10, max_value=100, value=40, step=5,
-        key="portfolio_heat_cap_pct",
-        help=(
-            "If the sum of all signal Kelly fractions exceeds this %, "
-            "all Kelly values are scaled down proportionally. "
-            "Institutional standard: 25-40% of capital across open positions."
-        )
     )
 
     st.divider()
@@ -2406,73 +2083,47 @@ def score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker="", bt_mode=False
     hist = df.iloc[:-1]
     hc = hist["close"]; hh = hist["high"]; hl = hist["low"]; hv = hist["volume"]
 
-    # ── FIX-04: WEEKLY + MONTHLY MTF COMPRESSION ────────────────────────────
-    # Resample existing daily hist to weekly and monthly OHLCV — no new API calls.
-    # Three-timeframe alignment: daily + weekly + monthly all compressed = strongest signal.
-    # Monthly compression catches stocks that have been range-bound for 1-3 months —
-    # a coil at this scale typically precedes a much larger move than a daily-only coil.
+    # ── FIX-04: WEEKLY MTF COMPRESSION ──────────────────────────────────────
+    # Resample existing daily hist to weekly OHLCV — no new API calls needed.
     # False-positive source: a stock "quiet" daily but mid-range in a 15% weekly swing.
     # When both daily AND weekly ATR compression confirm, false positives drop sharply.
     _mtf_bonus = 0.0
-    _wk_compressed = False
-    _wk_vc_pct = 0.5
-    _mo_compressed = False
-    _mo_vc_pct = 0.5
     try:
         if "time" in hist.columns:
-            _hist_idx = hist.set_index(pd.to_datetime(hist["time"]))
+            _hist_w = hist.set_index(pd.to_datetime(hist["time"])).resample("W").agg(
+                {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+            ).dropna()
         elif isinstance(hist.index, pd.DatetimeIndex):
-            _hist_idx = hist
+            _hist_w = hist.resample("W").agg(
+                {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+            ).dropna()
         else:
-            _hist_idx = pd.DataFrame()
-
-        def _resample_ohlcv(src, freq):
-            if src.empty or len(src) < 5:
-                return pd.DataFrame()
-            try:
-                return src.resample(freq).agg(
-                    {"open": "first", "high": "max", "low": "min",
-                     "close": "last", "volume": "sum"}
-                ).dropna()
-            except Exception:
-                return pd.DataFrame()
-
-        _hist_w = _resample_ohlcv(_hist_idx, "W")
-        _hist_m = _resample_ohlcv(_hist_idx, "ME") if not _hist_idx.empty else pd.DataFrame()
-        if _hist_m.empty:
-            try:
-                _hist_m = _resample_ohlcv(_hist_idx, "M")
-            except Exception:
-                _hist_m = pd.DataFrame()
-
-        def _vc_pct_for(ohlcv_df, min_bars=10):
-            """Returns ATR5/ATR20 percentile for a resampled OHLCV df."""
-            if len(ohlcv_df) < min_bars:
-                return 0.5, False
-            _tr = pd.concat([
-                ohlcv_df["high"] - ohlcv_df["low"],
-                (ohlcv_df["high"] - ohlcv_df["close"].shift(1)).abs(),
-                (ohlcv_df["low"]  - ohlcv_df["close"].shift(1)).abs()
-            ], axis=1).max(axis=1)
-            _a5  = float(_tr.rolling(5).mean().iloc[-1])
-            _a20 = float(_tr.rolling(20).mean().iloc[-1]) if len(_tr) >= 20 else float(_tr.mean())
-            if _a20 == 0:
-                return 0.5, False
-            _vc_r = _a5 / _a20
-            _vc_h = (_tr.rolling(5).mean() / (_tr.rolling(20).mean() + 1e-9)).dropna()
-            if len(_vc_h) >= min_bars:
-                _pct = float((_vc_h >= _vc_r).mean())
-            else:
-                _pct = 0.5
-            return _pct, _pct <= 0.35
-
+            _hist_w = pd.DataFrame()   # no datetime available — skip MTF
         if len(_hist_w) >= 22:
-            _wk_vc_pct, _wk_compressed = _vc_pct_for(_hist_w, min_bars=22)
-        if len(_hist_m) >= 6:
-            _mo_vc_pct, _mo_compressed = _vc_pct_for(_hist_m, min_bars=6)
-
+            _wk_tr = pd.concat([
+                _hist_w["high"] - _hist_w["low"],
+                (_hist_w["high"] - _hist_w["close"].shift(1)).abs(),
+                (_hist_w["low"]  - _hist_w["close"].shift(1)).abs()
+            ], axis=1).max(axis=1)
+            _wk_atr5  = float(_wk_tr.rolling(5).mean().iloc[-1])
+            _wk_atr20 = float(_wk_tr.rolling(20).mean().iloc[-1])
+            if _wk_atr20 > 0:
+                _wk_vc_ratio = _wk_atr5 / _wk_atr20
+                _wk_vc_hist  = (_wk_tr.rolling(5).mean() / (_wk_tr.rolling(20).mean() + 1e-9)
+                                ).dropna().tail(52)
+                _wk_vc_pct = float((_wk_vc_hist >= _wk_vc_ratio).mean()) if len(_wk_vc_hist) >= 10 else 0.5
+                # Fire only when BOTH daily AND weekly are compressed (daily vc_pct computed later — use placeholder)
+                # Actual gate applied below after vc_ratio/_vc_pct are computed.
+                _wk_compressed = _wk_vc_pct <= 0.35   # weekly ATR in bottom 35th percentile
+            else:
+                _wk_compressed = False
+                _wk_vc_pct = 0.5
+        else:
+            _wk_compressed = False
+            _wk_vc_pct = 0.5
     except Exception:
-        pass
+        _wk_compressed = False
+        _wk_vc_pct = 0.5
 
     # ── PREDICTIVE ARCHITECTURE: score on T-1 EOD, not T-0 EOD ──────────────
     # ALL factor computation uses the HISTORICAL slice (hc/hh/hl/hv = up to T-1).
@@ -3041,26 +2692,13 @@ def score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker="", bt_mode=False
     # Low ratio = high compression = good → invert: score = 1 - percentile
     vc_pts = round((1.0 - _vc_pct) * 5, 1)   # 0-5 pts
 
-    # FIX-04 Part B: MTF bonus — 3-level tiering (daily + weekly + monthly).
-    # Only fires when daily compression is confirmed first.
-    # Three TFs compressed = full bonus (5 pts).
-    # Daily + weekly (or daily + monthly) = moderate bonus (3 pts).
-    # Daily only = no MTF bonus (vc_pts already captures this).
+    # FIX-04 Part B: MTF bonus — now that daily _vc_pct is computed, apply dual gate.
+    # Only fires when BOTH daily (bottom 35th pct) AND weekly (bottom 35th pct) are compressed.
     _daily_compressed = _vc_pct <= 0.35
-    if _daily_compressed:
-        _n_tf_compressed = 1 + int(_wk_compressed) + int(_mo_compressed)
-        if _n_tf_compressed == 3:
-            # All three TFs compressed — rare, very high signal quality
-            _mtf_strength = (1.0 - _vc_pct) * (1.0 - _wk_vc_pct) * (1.0 - _mo_vc_pct)
-            _mtf_bonus = round(float(np.clip(_mtf_strength * 15.0, 0.0, 5.0)), 1)
-        elif _n_tf_compressed == 2:
-            # Two TFs — use the tighter of weekly vs monthly
-            _best_higher = min(_wk_vc_pct if _wk_compressed else 1.0,
-                               _mo_vc_pct if _mo_compressed else 1.0)
-            _mtf_strength = (1.0 - _vc_pct) * (1.0 - _best_higher)
-            _mtf_bonus = round(float(np.clip(_mtf_strength * 10.0, 0.0, 3.0)), 1)
-        else:
-            _mtf_bonus = 0.0
+    if _daily_compressed and _wk_compressed:
+        # Strength = how compressed both timeframes are, combined
+        _mtf_strength = (1.0 - _vc_pct) * (1.0 - _wk_vc_pct)   # 0-1, higher = tighter
+        _mtf_bonus = round(float(np.clip(_mtf_strength * 10.0, 0.0, 5.0)), 1)
     else:
         _mtf_bonus = 0.0
 
@@ -3310,12 +2948,7 @@ def score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker="", bt_mode=False
     # ── L5: OI BUILDUP (F&O stocks only, 0-3 pts) ──
     # Open interest rising while price coils = institutional positioning BEFORE move.
     # For non-F&O stocks OI column is 0 → oi_bonus stays 0.0 automatically.
-    # PARTICIPANT OI ENHANCEMENT: if NSE participant data is available and FII is
-    # net long in this stock's futures, the oi_bonus is scaled up by 1.5×.
-    # This distinguishes informed (FII long-buildup) from uninformed (retail/prop)
-    # OI accumulation. Non-F&O stocks: oi_bonus always 0 — no change.
     oi_bonus = 0.0
-    _fii_net_long = None   # None = no data / non-F&O
     if "oi" in df.columns and len(df) >= 10:
         _oi = df["oi"].dropna()
         # Non-F&O stocks: oi column exists but all values are 0 — skip
@@ -3334,21 +2967,8 @@ def score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker="", bt_mode=False
             _price_coiling  = vc_ratio < _vc_p30_oi
             if _oi_rising and _price_coiling and _oi_z > 0.5:
                 _compression_strength = 1.0 - min(vc_ratio, 1.0)
-                _raw_oi_bonus = float(np.clip(
-                    3.0 * np.tanh(_oi_z * _compression_strength), 0.0, 3.0))
-                # ── Participant OI direction multiplier ──
-                # Only apply if we have actual FII data for this stock.
-                # FII net long = informed accumulation → full 1.5× amplification.
-                # FII net short = hedging/distribution → cap at 0.5× (OI rising but wrong-way flow).
-                # No data (non-F&O, weekend, fetch failed) → neutral ×1.0.
-                if not bt_mode and ticker:
-                    _part_oi_map = st.session_state.get("participant_oi", {})
-                    _fii_net_long = _part_oi_map.get(ticker.upper())
-                    if _fii_net_long is True:
-                        _raw_oi_bonus = min(_raw_oi_bonus * 1.5, 3.0)
-                    elif _fii_net_long is False:
-                        _raw_oi_bonus = min(_raw_oi_bonus * 0.5, 3.0)
-                oi_bonus = round(_raw_oi_bonus, 1)
+                oi_bonus = round(float(np.clip(
+                    3.0 * np.tanh(_oi_z * _compression_strength), 0.0, 3.0)), 1)
 
     # ── L5b: DELIVERY % BONUS (NSE Bhav Copy, 0-4 pts) ──────────────────────
     # FIX 15: Apply delivery bonus to ALL setup types including Reversal.
@@ -4465,50 +4085,6 @@ def score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker="", bt_mode=False
 
     total = max(0, min(100, round(total, 1)))
 
-    # ── EVENT BLACKOUT FLAG ───────────────────────────────────────────────────
-    # Applies to ALL stocks (not just F&O). A results/board-meeting surprise can
-    # overwhelm any technical setup regardless of universe membership.
-    # Blackout window: ±3 trading days from the corporate event.
-    # Action: add "EventRisk" tag to output + apply a soft penalty that scales
-    # with proximity (same-day = −15 pts, 3 days away = −5 pts).
-    _event_flag   = ""
-    _event_penalty = 0.0
-    if not bt_mode and ticker:
-        _ev_cal = st.session_state.get("event_calendar", {})
-        _ev_entry = _ev_cal.get(ticker.upper())
-        if _ev_entry is not None:
-            _ev_label, _ev_days = _ev_entry
-            _blackout_on = st.session_state.get("event_blackout_enabled", True)
-            if abs(_ev_days) <= 3:
-                _event_flag = f"{_ev_label} ({'+' if _ev_days >= 0 else ''}{_ev_days}d)"
-                if _blackout_on:
-                    # Penalty = 15 at day 0, decays linearly to 5 at day 3
-                    _event_penalty = float(np.clip(15.0 - abs(_ev_days) * 3.3, 5.0, 15.0))
-                    total = max(0.0, total - _event_penalty)
-                    total = round(total, 1)
-
-    # ── FUNDAMENTAL QUALITY GATE ─────────────────────────────────────────────
-    # Applies a −10 pt soft penalty if operating cash flow is negative AND the
-    # fundamental gate is enabled. Non-F&O stocks and stocks with missing data
-    # are NOT penalised — data silence is treated as neutral (not bad).
-    _fundamental_ok = True
-    _fundamental_note = "N/A"
-    _fundamental_penalty = 0.0
-    if not bt_mode and ticker and st.session_state.get("fundamental_gate_enabled", False):
-        try:
-            _cfo_ok, _rev_ok, _fundamental_note = _fetch_fundamental_quality(ticker)
-            _fundamental_ok = _cfo_ok   # primary gate: cash flow positive
-            if not _cfo_ok:
-                # CFO negative: −10 pts. Revenue also falling: additional −5 pts.
-                _fundamental_penalty = 10.0 + (5.0 if not _rev_ok else 0.0)
-                total = max(0.0, total - _fundamental_penalty)
-                total = round(total, 1)
-        except Exception:
-            pass   # never crash scoring on a data fetch failure
-
-    # Re-clamp after all adjustments
-    total = max(0, min(100, round(total, 1)))
-
     # ── EMI = Score × ATR%  (rewards volatile high-score setups) ──
     emi = round(total * atr_pct / 100, 3)
 
@@ -4737,14 +4313,6 @@ def score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker="", bt_mode=False
         "MTFBonus":       round(_mtf_bonus, 1),
         "WeeklyVCPct":    round(_wk_vc_pct, 3),
         "WeeklyCompressed": _wk_compressed,
-        "MonthlyVCPct":   round(_mo_vc_pct, 3),        # NEW: monthly timeframe compression
-        "MonthlyCompressed": _mo_compressed,            # NEW: monthly compressed flag
-        "MTFTiers":       int(int(_daily_compressed) + int(_wk_compressed) + int(_mo_compressed)),
-        # ── INSTITUTIONAL OVERLAYS ──────────────────────────────────────────
-        "EventFlag":      _event_flag,                  # e.g. "Results (+1d)" or ""
-        "EventPenalty":   round(_event_penalty, 1),     # pts deducted for proximity to event
-        "FundamentalOK":  _fundamental_ok,              # False = negative CFO
-        "FundamentalNote": _fundamental_note,           # "CFO ✓  Rev ↑" etc.
         # FIX-05: churn / absorption
         "ChurnScore":     round(_churn_pct, 3),
         "ChurnBonus":     round(_churn_bonus, 1),
@@ -4766,37 +4334,18 @@ def score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker="", bt_mode=False
         "Risk":      risk,
         "Reward":    reward,
         "RR":        rr,
-    }
-
-    # ── KELLY POSITION SIZING (L-1) — rolling 50-trade win rate ──
-    # Win rate source priority:
-    #   1. per_stock_outcomes[ticker] — rolling list of +1/-1 trade outcomes (last 50)
-    #   2. per_stock_winrate[ticker]  — scalar win rate from walk-forward (legacy)
-    #   3. Structural prior: 0.40 + 0.20×cs_rs + 0.10×stability
-    # Half-Kelly (0.5×) is used for safety — standard institutional practice.
-    # Liquidity cap: max Kelly = min(Kelly, ADTV_turnover / portfolio_size).
-    _outcomes = st.session_state.get("per_stock_outcomes", {}).get(ticker, []) if not bt_mode else []
-    if len(_outcomes) >= 10:
-        _wr = float(np.mean([1 if o > 0 else 0 for o in _outcomes[-50:]]))
-    elif st.session_state.get("per_stock_winrate", {}).get(ticker) and not bt_mode:
-        _wr = float(st.session_state["per_stock_winrate"][ticker])
-    else:
-        _wr = float(np.clip(0.40 + 0.20 * cs_rs_score + 0.10 * stability, 0.35, 0.70))
-    _rr_safe = max(rr, 0.5)
-    _kelly_raw = float(np.clip(
-        0.5 * (_wr * _rr_safe - (1.0 - _wr)) / (_rr_safe + 1e-9), 0.0, 0.25))
-    if not bt_mode:
-        _port_size = float(st.session_state.get("portfolio_size_lakh", 50.0)) * 1e5
-        _liq_kelly_cap = float(np.clip(_adv_turnover / (_port_size + 1e-9), 0.0, 0.25)) \
-                         if _port_size > 0 else 0.25
-    else:
-        _liq_kelly_cap = 0.25
-    _kelly_final = round(min(_kelly_raw, _liq_kelly_cap), 3)
-
-    return {
-        "KellyFrac":  _kelly_final,
-        "Move%":      move_pct,
-        "EntryNote":  entry_note,
+        # ── KELLY POSITION SIZING (L-1) ──
+        # Fractional Kelly = (win_rate × RR - loss_rate) / RR, capped at 25% of portfolio.
+        # win_rate prior: derived from RSI percentile and stability score.
+        # When walk-forward win-rate data exists in session_state, use that instead.
+        # The 0.5 Kelly (half-Kelly) is used for safety — standard institutional practice.
+        "KellyFrac": (lambda wr, _rr: round(
+            float(np.clip(0.5 * (wr * _rr - (1.0 - wr)) / (_rr + 1e-9), 0.0, 0.25)), 3))(
+            float(st.session_state.get("per_stock_winrate", {}).get(ticker, None) or
+                  np.clip(0.40 + 0.20 * cs_rs_score + 0.10 * stability, 0.35, 0.70)),
+            max(rr, 0.5)),
+        "Move%":     move_pct,
+        "EntryNote": entry_note,
         # factors — decorrelated values (used in Score)
         "RS":        round(rs_pts,       1),
         "RS_Sector": round(rs_sect_pts,  1),
@@ -4868,7 +4417,6 @@ def score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker="", bt_mode=False
         "ATRExpOnset":   round(_atr_exp_bonus, 1),      # coil just starting to release
         # F&O-conditional
         "OI_Buildup":    round(oi_bonus, 1),            # OI rising + coiling (0 for non-F&O)
-        "FIINetLong":    _fii_net_long,                  # True/False/None — participant OI direction
         # intraday
         "VolVelocity":   round(_vol_velocity_score, 1), # intraday vol ahead of pace
         # early rotation
@@ -5186,10 +4734,6 @@ if st.button("🚀 Start Bulk Extraction", use_container_width=True):
             return sty
 
         st.dataframe(_bb_extr(result_df), use_container_width=True, hide_index=True)
-
-    # Persist param_registry after extraction — self-calibrated params are now
-    # populated across the universe and should survive the next app restart.
-    _save_screener_state()
 
 # ============================================================
 # MONARCH DUAL-SETUP ENGINE — 1-5 DAY EDGE MODEL
@@ -5528,21 +5072,6 @@ else:
     screener_rows = []
     _vol_skipped_screener = 0
     _min_vol_screener = st.session_state.get("min_avg_vol", 0)
-
-    # ── PRE-SCREENER: REFRESH INSTITUTIONAL OVERLAYS ─────────────────────────
-    # Fetch event calendar and participant OI once per screener run.
-    # Both are cached (24h TTL) so they do not cause a new HTTP call on every rerun.
-    # Done here — outside the per-stock loop — so they are available as O(1) lookups
-    # inside score_stock_dual via session_state.
-    with st.spinner("Refreshing event calendar…"):
-        _ev_refresh = _fetch_nse_event_calendar()
-        if _ev_refresh:
-            st.session_state.event_calendar = _ev_refresh
-    with st.spinner("Refreshing F&O participant OI…"):
-        _part_refresh = _fetch_participant_oi()
-        if _part_refresh:
-            st.session_state.participant_oi = _part_refresh
-
     for sym, df_raw in st.session_state.raw_data_cache.items():
         try:
             live   = get_live_bar(sym)
@@ -5574,55 +5103,6 @@ else:
     else:
         df_out = pd.DataFrame(screener_rows)
 
-        # ── PORTFOLIO HEAT CAP — scale Kelly fractions so total ≤ heat cap ──
-        # If the sum of all KellyFrac values exceeds the configured cap (default 40%),
-        # every fraction is scaled down proportionally.
-        # This is a post-scoring adjustment — it does NOT change individual scores.
-        # The scaled Kelly is shown in the table as "KellyFrac" so the user immediately
-        # sees executable position sizes, not theoretical over-allocated fractions.
-        if "KellyFrac" in df_out.columns:
-            _heat_cap = float(st.session_state.get("portfolio_heat_cap_pct", 40)) / 100.0
-            _total_kelly = float(df_out["KellyFrac"].fillna(0).sum())
-            if _total_kelly > _heat_cap and _total_kelly > 0:
-                _kelly_scale = _heat_cap / _total_kelly
-                df_out["KellyFrac"] = (df_out["KellyFrac"] * _kelly_scale).round(3)
-                st.caption(
-                    f"⚖️ Portfolio heat cap ({int(_heat_cap*100)}%) active — "
-                    f"Kelly fractions scaled by {_kelly_scale:.2f}× "
-                    f"(raw total was {_total_kelly*100:.1f}%)"
-                )
-
-        # ── SIGNAL AUDIT LOG — append this screener run to CSV ───────────────
-        # Only writes rows with Score >= min_score threshold so noise rows
-        # don't inflate the log. Written here (before display filters) so
-        # every qualifying signal is captured regardless of display settings.
-        try:
-            _audit_ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-            _audit_regime = mkt.get("regime", "?")
-            _audit_rows = []
-            for _, _ar in df_out.iterrows():
-                if float(_ar.get("Score", 0)) < 30:
-                    continue
-                _audit_rows.append({
-                    "Timestamp":      _audit_ts,
-                    "Ticker":         _ar.get("Ticker", ""),
-                    "Score":          round(float(_ar.get("Score", 0)), 1),
-                    "SetupType":      _ar.get("SetupType", ""),
-                    "Horizon":        _ar.get("Horizon", ""),
-                    "Entry":          _ar.get("Entry", ""),
-                    "Target":         _ar.get("Target", ""),
-                    "Stop":           _ar.get("Stop", ""),
-                    "RR":             _ar.get("RR", ""),
-                    "KellyFrac":      _ar.get("KellyFrac", ""),
-                    "Sector":         _ar.get("Sector", ""),
-                    "Regime":         _audit_regime,
-                    "EventFlag":      _ar.get("EventFlag", ""),
-                    "FundamentalOK":  _ar.get("FundamentalOK", True),
-                })
-            _append_signal_log(_audit_rows)
-        except Exception:
-            pass   # audit log failure must never block the screener display
-
         # Volume filter status note
         if _min_vol_screener > 0 and _vol_skipped_screener > 0:
             st.caption(
@@ -5630,16 +5110,6 @@ else:
                 f"skipped {_vol_skipped_screener} low-volume stocks · "
                 f"{len(screener_rows)} stocks in scan"
             )
-
-        # ── EVENT RISK SUMMARY — show flagged stocks prominently ─────────────
-        if "EventFlag" in df_out.columns:
-            _ev_flagged = df_out[df_out["EventFlag"].astype(str).str.len() > 0]
-            if not _ev_flagged.empty:
-                st.warning(
-                    f"⚠️ **{len(_ev_flagged)} signal(s) have upcoming corporate events "
-                    f"within ±3 days** — scores already adjusted. "
-                    f"Tickers: {', '.join(_ev_flagged['Ticker'].tolist()[:10])}"
-                )
 
         # ── REGIME CONTEXT (informational, not a hard gate) ──
         # The regime gate was removed because it was the wrong fix.
@@ -8252,38 +7722,6 @@ else:
                 help="Basis points added to next-day open as entry cost. 15bps = 0.15% for liquid F&O stocks. 30-50bps for mid-cap."
             )
 
-        # ── OOS BOUNDARY — calendar-time anchor ──────────────────────────────
-        # Default: last 20% of calendar time is automatically used as OOS holdout.
-        # Override: user can pin an exact date so the boundary is stable across
-        # multiple WF runs (prevents boundary drift as more data arrives).
-        st.caption("OOS HOLDOUT BOUNDARY")
-        _oos_col1, _oos_col2 = st.columns([2, 3])
-        with _oos_col1:
-            _oos_auto = st.checkbox(
-                "Auto (last 20% of date range)", value=True, key="wf_oos_auto",
-                help="When ON, OOS = last 20% of calendar time. Turn OFF to set a fixed date."
-            )
-        with _oos_col2:
-            if not _oos_auto:
-                _oos_date_min = _wf_valid[int(len(_wf_valid) * 0.5)] if len(_wf_valid) > 10 else _wf_valid[0]
-                _oos_date_max = _wf_valid[-1]
-                _oos_default  = _wf_valid[int(len(_wf_valid) * 0.8)]
-                _oos_sel = st.date_input(
-                    "OOS start date (fixed)",
-                    value=_oos_default,
-                    min_value=_oos_date_min,
-                    max_value=_oos_date_max,
-                    key="wf_oos_date_input",
-                    help="All trades from this date onward are the OOS set. IC measured here."
-                )
-                st.session_state["wf_oos_start_date"] = str(_oos_sel)
-            else:
-                st.session_state.pop("wf_oos_start_date", None)
-                st.caption(
-                    "OOS boundary = auto (last 20% of date range). "
-                    "Uncheck to pin a specific date."
-                )
-
         run_wf = st.button("▶ Run Walk-Forward", use_container_width=True, key="run_wf")
 
         if run_wf:
@@ -8743,47 +8181,11 @@ else:
                     ("coil",     "BBSqueeze"),
                 ]
 
-                # ── CHRONOLOGICAL OOS SPLIT — calendar time, not trade count ──
-                # Problem with trade-count split (old 70/30): if the last 30% of TRADES
-                # span only 2 months but the first 70% span 10 months, the "holdout" is
-                # actually a dense recent period (post-event cluster) that is NOT
-                # representative of typical performance.
-                # Fix: holdout = last 20% of CALENDAR TIME in the walk-forward range.
-                # If the user has set an explicit "OOS start date" in session_state
-                # (from the sidebar date picker), that date takes priority.
+                # Chronological train/test split
                 _wf_sorted = wf_df.sort_values("Date").reset_index(drop=True) \
                              if "Date" in wf_df.columns else wf_df.copy()
-
-                _oos_override = st.session_state.get("wf_oos_start_date")
-                if _oos_override and "Date" in _wf_sorted.columns:
-                    try:
-                        _oos_dt = pd.to_datetime(_oos_override)
-                        _wf_holdout = _wf_sorted[
-                            pd.to_datetime(_wf_sorted["Date"]) >= _oos_dt
-                        ].copy()
-                        _blend_note = (
-                            f"OOS set = trades on/after {_oos_override} "
-                            f"({len(_wf_holdout)} trades, user-defined boundary)."
-                        )
-                    except Exception:
-                        _oos_override = None
-
-                if not _oos_override or not isinstance(_oos_override, str):
-                    if "Date" in _wf_sorted.columns and len(_wf_sorted) >= 10:
-                        _wf_dates = pd.to_datetime(_wf_sorted["Date"])
-                        _d_min = _wf_dates.min()
-                        _d_max = _wf_dates.max()
-                        _d_range = (_d_max - _d_min).days
-                        _oos_cutoff = _d_min + pd.Timedelta(days=int(_d_range * 0.80))
-                        _wf_holdout = _wf_sorted[_wf_dates >= _oos_cutoff].copy()
-                        _blend_note = (
-                            f"OOS = last 20% of calendar time "
-                            f"(from {_oos_cutoff.date()} — {len(_wf_holdout)} trades)."
-                        )
-                    else:
-                        _split_idx = int(len(_wf_sorted) * 0.80)
-                        _wf_holdout = _wf_sorted.iloc[_split_idx:].copy()
-                        _blend_note = f"OOS = last 20% of trades ({len(_wf_holdout)} trades)."
+                _split_idx = int(len(_wf_sorted) * 0.70)
+                _wf_holdout = _wf_sorted.iloc[_split_idx:].copy()
 
                 # If held-out set is too small, fall back to full set but halve blend trust
                 if len(_wf_holdout) < _WF_MIN_TRADES_FOR_REWEIGHT:
@@ -8791,7 +8193,7 @@ else:
                     _BLEND_NEW   = min(_BLEND_NEW, 0.35)   # half trust for circular estimate
                     _blend_note  = "⚠ Held-out set too small — using full set with reduced blend (35%)."
                 else:
-                    _blend_note  = _blend_note + f" IC measured on held-out {len(_wf_holdout)} trades."
+                    _blend_note  = f"IC measured on held-out {len(_wf_holdout)} trades (last 30% of WF range)."
 
                 _new_raw = {}
                 _enough_data = len(_wf_holdout) >= _WF_MIN_TRADES_FOR_REWEIGHT
@@ -9218,194 +8620,3 @@ else:
 #   - SELL marker: ATR trailing stop hit OR close < EMA20
 #   - Bloomberg dark colour scheme throughout
 # ============================================================
-
-# ============================================================
-# SIGNAL HISTORY — Audit Log Viewer
-# ============================================================
-# Reads .monarch_signal_log.csv and displays the last 500 signals
-# with performance analytics: win-rate by setup type, regime, sector,
-# and rolling return chart so model drift is immediately visible.
-# ============================================================
-st.header("📋 Signal History — Audit Log")
-st.caption(
-    "Every signal with Score ≥ 30 is logged here automatically each time "
-    "the screener runs. Use this to track model performance over time, "
-    "identify which setup types / regimes / sectors have the best hit rate, "
-    "and detect when the model starts degrading."
-)
-
-_sig_log_df = _load_signal_log(max_rows=500)
-
-if _sig_log_df.empty:
-    st.info(
-        "No signals logged yet. Run the screener (with data extracted) to start "
-        "building the audit trail. Signals accumulate automatically — no action needed."
-    )
-else:
-    # ── Summary metrics ────────────────────────────────────────────────────
-    _sl_total = len(_sig_log_df)
-    _sl_tickers = _sig_log_df["Ticker"].nunique() if "Ticker" in _sig_log_df.columns else 0
-    _sl_regimes = _sig_log_df["Regime"].value_counts().to_dict() if "Regime" in _sig_log_df.columns else {}
-    _sl_ev_flagged = int((_sig_log_df["EventFlag"].astype(str).str.len() > 0).sum()) \
-                     if "EventFlag" in _sig_log_df.columns else 0
-    _sl_fund_fails = int((~_sig_log_df["FundamentalOK"].astype(str).str.lower().isin(
-        ["true","1","yes","nan","n/a",""])).sum()) \
-        if "FundamentalOK" in _sig_log_df.columns else 0
-
-    _m1, _m2, _m3, _m4, _m5 = st.columns(5)
-    _m1.metric("Total Signals", _sl_total)
-    _m2.metric("Unique Tickers", _sl_tickers)
-    _m3.metric("Event-Flagged", _sl_ev_flagged, help="Signals within ±3d of corporate event")
-    _m4.metric("Fundamental ✗", _sl_fund_fails, help="Signals where CFO was negative")
-    _m5.metric(
-        "Regimes",
-        "  ".join(f"{k}:{v}" for k, v in sorted(_sl_regimes.items())) or "—"
-    )
-
-    st.divider()
-
-    # ── Breakdown tabs ─────────────────────────────────────────────────────
-    _sl_tab_raw, _sl_tab_setup, _sl_tab_sector, _sl_tab_regime = st.tabs([
-        "Raw Log", "By Setup Type", "By Sector", "By Regime"
-    ])
-
-    with _sl_tab_raw:
-        _sl_disp_cols = [c for c in _SIGNAL_LOG_COLS if c in _sig_log_df.columns]
-        _sl_disp = _sig_log_df[_sl_disp_cols].sort_values(
-            "Timestamp", ascending=False
-        ).reset_index(drop=True) if "Timestamp" in _sig_log_df.columns else _sig_log_df
-
-        def _sl_score_color(v):
-            try:
-                v = float(v)
-                if v >= 70: return "background-color:#1a3300;color:#00d084;font-weight:700"
-                if v >= 50: return "background-color:#1a2200;color:#b8e06a"
-                if v >= 30: return "background-color:#2a1800;color:#ffb347"
-            except Exception:
-                pass
-            return "color:#555"
-
-        def _sl_ev_color(v):
-            return "color:#ff3b3b;font-weight:700" if str(v).strip() else ""
-
-        _sl_sty = _sl_disp.style
-        if "Score" in _sl_disp.columns:
-            _sl_sty = _sl_sty.applymap(_sl_score_color, subset=["Score"])
-        if "EventFlag" in _sl_disp.columns:
-            _sl_sty = _sl_sty.applymap(_sl_ev_color, subset=["EventFlag"])
-
-        st.dataframe(_sl_sty, use_container_width=True, hide_index=True, height=380)
-
-        # Download button
-        try:
-            _sl_csv = _sig_log_df.to_csv(index=False)
-            st.download_button(
-                "⬇ Download full log (CSV)",
-                data=_sl_csv,
-                file_name="monarch_signal_log.csv",
-                mime="text/csv",
-                key="dl_signal_log"
-            )
-        except Exception:
-            pass
-
-    with _sl_tab_setup:
-        if "SetupType" in _sig_log_df.columns:
-            _sl_grp_setup = (
-                _sig_log_df.groupby("SetupType")
-                .agg(
-                    Signals=("Score", "count"),
-                    AvgScore=("Score", lambda x: round(x.mean(), 1)),
-                    AvgRR=("RR", lambda x: round(pd.to_numeric(x, errors="coerce").mean(), 2)),
-                    EventFlagged=("EventFlag", lambda x: (x.astype(str).str.len() > 0).sum()),
-                )
-                .reset_index()
-            )
-            st.dataframe(_sl_grp_setup, use_container_width=True, hide_index=True)
-            st.caption(
-                "AvgRR = mean reward-to-risk across all signals of that type. "
-                "EventFlagged = how many had a corporate event within ±3 days."
-            )
-        else:
-            st.info("SetupType column not found in log.")
-
-    with _sl_tab_sector:
-        if "Sector" in _sig_log_df.columns:
-            _sl_grp_sec = (
-                _sig_log_df.groupby("Sector")
-                .agg(
-                    Signals=("Score", "count"),
-                    AvgScore=("Score", lambda x: round(x.mean(), 1)),
-                    Tickers=("Ticker", lambda x: ", ".join(sorted(set(x))[:5])),
-                )
-                .sort_values("Signals", ascending=False)
-                .reset_index()
-            )
-            st.dataframe(_sl_grp_sec, use_container_width=True, hide_index=True)
-            st.caption(
-                "High signal count in a single sector = potential concentration risk. "
-                "Cross-reference with the sector cap toggle in the sidebar."
-            )
-        else:
-            st.info("Sector column not found in log.")
-
-    with _sl_tab_regime:
-        if "Regime" in _sig_log_df.columns:
-            _sl_grp_reg = (
-                _sig_log_df.groupby("Regime")
-                .agg(
-                    Signals=("Score", "count"),
-                    AvgScore=("Score", lambda x: round(x.mean(), 1)),
-                    AvgRR=("RR", lambda x: round(pd.to_numeric(x, errors="coerce").mean(), 2)),
-                    SetupMix=("SetupType", lambda x: x.value_counts().to_dict()),
-                )
-                .reset_index()
-            )
-            st.dataframe(_sl_grp_reg, use_container_width=True, hide_index=True)
-            st.caption(
-                "BEAR regime signals should have lower AvgScore (market headwind applies penalty). "
-                "If BEAR AvgScore ≈ BULL AvgScore, the regime adjustment may need recalibration."
-            )
-        else:
-            st.info("Regime column not found in log.")
-
-    # ── Rolling signal volume chart ─────────────────────────────────────────
-    st.divider()
-    st.subheader("📈 Signal Volume Over Time")
-    if "Timestamp" in _sig_log_df.columns:
-        try:
-            _sl_ts = pd.to_datetime(_sig_log_df["Timestamp"], errors="coerce")
-            _sl_daily = (
-                _sig_log_df.assign(_Date=_sl_ts.dt.date)
-                .groupby("_Date")
-                .agg(Signals=("Score", "count"), AvgScore=("Score", "mean"))
-                .reset_index()
-                .rename(columns={"_Date": "Date"})
-            )
-            if not _sl_daily.empty:
-                _fig_sl = go.Figure()
-                _fig_sl.add_trace(go.Bar(
-                    x=_sl_daily["Date"], y=_sl_daily["Signals"],
-                    name="Signals/day",
-                    marker_color="#ff8c00",
-                ))
-                _fig_sl.add_trace(go.Scatter(
-                    x=_sl_daily["Date"], y=_sl_daily["AvgScore"],
-                    name="Avg Score", yaxis="y2",
-                    line=dict(color="#00ccff", width=2),
-                ))
-                _fig_sl.update_layout(
-                    height=280,
-                    plot_bgcolor="#0a0a0a", paper_bgcolor="#0a0a0a",
-                    font=dict(color="#888", size=9, family="IBM Plex Mono"),
-                    yaxis=dict(title="Signals/day", gridcolor="#1a1a1a", color="#888"),
-                    yaxis2=dict(title="Avg Score", overlaying="y", side="right",
-                                color="#00ccff", gridcolor="#0a0a0a"),
-                    legend=dict(font=dict(color="#888", size=9), bgcolor="rgba(0,0,0,0)"),
-                    margin=dict(t=20, b=30, l=40, r=40),
-                )
-                st.plotly_chart(_fig_sl, use_container_width=True)
-        except Exception as _sl_chart_err:
-            st.caption(f"Chart unavailable: {_sl_chart_err}")
-    else:
-        st.caption("Timestamp column missing — chart unavailable.")
