@@ -901,12 +901,18 @@ def to_ascending(df: pd.DataFrame) -> pd.DataFrame:
     Fix 17: Drop duplicate timestamps before reversing — Upstox occasionally
     returns duplicate rows for the same date when markets partially reopen.
     Duplicates cause silent index bugs in rolling window calculations.
+    pandas 3.x fix: cast OHLCV columns to float64 at ingestion time so all
+    downstream .at[] setitem writes are type-safe (int64 → float raises TypeError
+    in pandas 3.x strict dtype enforcement mode).
     """
     df = df.iloc[::-1].reset_index(drop=True)
     if "time" in df.columns:
         df["time"] = pd.to_datetime(df["time"])
-        # Drop exact duplicate timestamps, keep first (most complete bar)
         df = df.drop_duplicates(subset=["time"], keep="first").reset_index(drop=True)
+    # Cast numeric OHLCV columns to float64 — safe on all pandas versions
+    for _ta_col in ("open", "high", "low", "close", "volume", "oi"):
+        if _ta_col in df.columns:
+            df[_ta_col] = pd.to_numeric(df[_ta_col], errors="coerce").astype(float)
     return df
 
 
@@ -1173,6 +1179,12 @@ def patch_live_bar(df: pd.DataFrame, live: dict) -> pd.DataFrame:
         return df
 
     df = df.copy()
+    # pandas 3.x enforces strict dtype on .at[] setitem — writing a float into an
+    # int64 column raises TypeError. Cast all OHLCV columns to float64 once so
+    # every subsequent .at[] write is type-safe regardless of source dtype.
+    for _plb_col in ("open", "high", "low", "close", "volume", "oi"):
+        if _plb_col in df.columns:
+            df[_plb_col] = df[_plb_col].astype(float)
     last_idx = df.index[-1]
 
     # Snapshot pre-patch values for sanity revert
@@ -2371,6 +2383,12 @@ def score_stock_dual(df_raw, live, nifty_r5, nifty_r20, ticker="", bt_mode=False
         return None
 
     df = df_raw.copy()
+    # pandas 3.x strict dtype enforcement: .at[] setitem raises TypeError when writing
+    # a float into an int64 column. Cast all OHLCV columns to float64 once here so
+    # all downstream .at[] writes (live patch, volume scaling) are type-safe.
+    for _ssd_col in ("open", "high", "low", "close", "volume", "oi"):
+        if _ssd_col in df.columns:
+            df[_ssd_col] = df[_ssd_col].astype(float)
     # ltp = live price (for display, entry, stop calc only — NOT used in factor scoring)
     # ltp_score = T-1 close (set after hist slice below — used for ALL factor scoring)
     _live_ltp = live.get("ltp");   ltp     = float(_live_ltp if _live_ltp is not None else df["close"].iloc[-1])
@@ -6792,6 +6810,10 @@ def bb_chart(sym, df_raw, live, signal_date=None, result=None):
     df = df_raw.copy()
     df["time"] = pd.to_datetime(df["time"])
     df = df.sort_values("time").tail(120)   # last 120 bars for clarity
+    # pandas 3.x: cast OHLCV to float64 before any .at[] write
+    for _bc_col in ("open", "high", "low", "close", "volume"):
+        if _bc_col in df.columns:
+            df[_bc_col] = df[_bc_col].astype(float)
 
     # apply live patch on last bar
     ltp = live.get("ltp")
