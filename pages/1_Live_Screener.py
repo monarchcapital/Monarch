@@ -42,6 +42,25 @@ import feedparser
 import os
 
 # ============================================================
+# PANDAS STYLER COMPATIBILITY — applymap → map (pandas ≥ 2.1)
+# ============================================================
+# pandas 2.1 deprecated Styler.applymap() and renamed it to Styler.map().
+# Streamlit Cloud may run either version depending on the requirements.txt.
+# This shim makes .applymap() work on both:
+#   - pandas < 2.1  : applymap exists natively, shim does nothing
+#   - pandas ≥ 2.1  : applymap is gone; shim aliases it back to map
+# Applied once here so all 20+ call sites in the file work without changes.
+# ============================================================
+try:
+    _pd_version = tuple(int(x) for x in pd.__version__.split(".")[:2])
+    if _pd_version >= (2, 1):
+        import pandas.io.formats.style as _pd_style
+        if not hasattr(_pd_style.Styler, "applymap"):
+            _pd_style.Styler.applymap = _pd_style.Styler.map
+except Exception:
+    pass   # never crash on a compatibility patch failure
+
+# ============================================================
 # NSE BHAV COPY — DELIVERY VOLUME FETCH
 # Delivery % = delivery_qty / traded_qty.
 # High delivery (>50%) = informed money holding overnight.
