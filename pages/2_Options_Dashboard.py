@@ -70,16 +70,16 @@ CFG = {
     # ── Signal model weights — leading indicators first (optimised for 1–5 day prediction) ──────
     # Markets move due to POSITIONING CHANGES, not lagging price indicators.
     # Flow and positioning are leading; trend/momentum are confirming (lagging).
+    # factor_weights: COLD-START PRIOR ONLY.
+    # These are immediately superseded by _rank_based_factor_weights() once
+    # 20+ observations accumulate. Uniform priors avoid baking in any directional
+    # bias before the model has seen real performance data.
     "factor_weights": {
-        # LEADING (predictive) — where money is moving right now
-        "flow":          0.30,   # ΔIV, ΔOI, ΔPCR, ΔSkew — institutional order flow changes
-        "positioning":   0.25,   # PCR level, OI walls, max pain distance — structural positioning
-        "vol_regime":    0.20,   # IV percentile, IV/HV ratio, term structure slope
-        # CONFIRMING (lagging) — what price has already done
-        "rel_strength":  0.15,   # stock return vs Nifty 20D — trend confirmation
-        "trend":         0.10,   # EMA structure + ADX — slowest to update, lowest weight
-        # NOTE: RSI and MACD are subsumed into 'trend' with minimal influence.
-        # They confirm but never drive the signal for 1-5 day horizons.
+        "flow":         0.20,
+        "positioning":  0.20,
+        "vol_regime":   0.20,
+        "rel_strength": 0.20,
+        "trend":        0.20,
     },
     "hv_fallback":     0.15,  # HV fallback when no historical data (15% annualised — NSE index baseline)
     "chain_cache_ttl": 30,    # Seconds to cache live option chain
@@ -159,6 +159,28 @@ CFG = {
     "intra_min_candles_struct":6,          # min candles needed for price structure signal
     "intra_min_candles_lunch": 18,         # min candles needed for lunch reversal (~90 min)
     "intra_min_candles":       2,          # absolute minimum to compute any signal
+}
+
+_REGIME_TRENDING_UP   = "TRENDING_UP"
+_REGIME_TRENDING_DOWN = "TRENDING_DOWN"
+_REGIME_VOL_EXPANSION = "VOL_EXPANSION"
+_REGIME_VOL_COMPRESS  = "VOL_COMPRESSION"
+_REGIME_RANGE_BOUND   = "RANGE_BOUND"
+_REGIME_TRANSITION    = "TRANSITION"
+
+_REGIME_SIGNAL_WEIGHTS = {
+    _REGIME_TRENDING_UP:   {"flow": 0.30, "positioning": 0.15, "vol_regime": 0.10,
+                            "rel_strength": 0.30, "trend": 0.15},
+    _REGIME_TRENDING_DOWN: {"flow": 0.30, "positioning": 0.15, "vol_regime": 0.10,
+                            "rel_strength": 0.30, "trend": 0.15},
+    _REGIME_VOL_EXPANSION: {"flow": 0.45, "positioning": 0.20, "vol_regime": 0.30,
+                            "rel_strength": 0.05, "trend": 0.00},
+    _REGIME_VOL_COMPRESS:  {"flow": 0.25, "positioning": 0.45, "vol_regime": 0.20,
+                            "rel_strength": 0.05, "trend": 0.05},
+    _REGIME_RANGE_BOUND:   {"flow": 0.15, "positioning": 0.55, "vol_regime": 0.15,
+                            "rel_strength": 0.10, "trend": 0.05},
+    _REGIME_TRANSITION:    {"flow": 0.50, "positioning": 0.20, "vol_regime": 0.15,
+                            "rel_strength": 0.10, "trend": 0.05},
 }
 
 # ============================================================
@@ -256,7 +278,33 @@ _PRIOR = {
 
 _CALIB_STORE_KEY = "monarch_calib"   # session_state key for persisted calibration
 _CALIB_FILE      = ".monarch_calib.json"   # disk path — survives restarts
-_CALIB_MIN_OBS   = 8                 # minimum paired observations before overriding prior (was 15 = 60 trading days; 8 = ~32 days)
+_CALIB_MIN_OBS_SEED = 20             # floor: never calibrate on fewer than 20 obs
+_CALIB_MIN_OBS_CAP  = 60             # ceiling: require no more than 60 obs
+
+def _dynamic_min_obs(symbol: str = "") -> int:
+    """Dynamic minimum observation count based on recent outcome stability.
+    Stable (low-variance) outcomes → fewer obs needed.
+    Noisy (high-variance) outcomes → more obs required.
+    Uses exponential decay to weight recent volatility more heavily.
+    """
+    sym  = symbol or st.session_state.get("opt_symbol", "").upper()
+    rkey = f"{sym}:_calib_realised_ret_hist" if sym else "_calib_realised_ret_hist"
+    hist = st.session_state.get(rkey, st.session_state.get("_calib_realised_ret_hist", []))
+    if len(hist) < 5:
+        return _CALIB_MIN_OBS_CAP   # cold start: be conservative
+    arr  = np.array(hist[-60:], dtype=float)
+    # Exponentially-weighted variance of returns
+    decay = np.array([0.94 ** (len(arr) - 1 - i) for i in range(len(arr))])
+    decay /= decay.sum()
+    ew_var = float(np.dot(decay, (arr - np.dot(decay, arr)) ** 2))
+    # High variance → need more obs; low variance → fewer
+    # Baseline annualised vol ~ 20% → daily var ~ (0.20/sqrt(252))^2 ≈ 1.6e-4
+    baseline_var = (0.20 / math.sqrt(252)) ** 2
+    ratio = ew_var / max(baseline_var, 1e-8)
+    n_dyn = int(_CALIB_MIN_OBS_SEED * max(0.5, min(3.0, ratio)))
+    return max(_CALIB_MIN_OBS_SEED, min(_CALIB_MIN_OBS_CAP, n_dyn))
+
+_CALIB_MIN_OBS = _CALIB_MIN_OBS_SEED  # legacy alias; code uses _dynamic_min_obs() at runtime
 _CALIB_WINDOW    = 252               # rolling window for correlation computation
 
 # FIX 5: Prior version sentinel.  Bump this integer whenever a _PRIOR value changes
@@ -428,7 +476,7 @@ def _calib(key: str, symbol: str = None) -> float:
     Returns the data-driven value if available, otherwise the prior.
     """
     sym = symbol if symbol is not None else st.session_state.get("opt_symbol", "")
-    return float(_get_calib(sym).get(key, _PRIOR[key]))
+    return float(_get_calib(sym).get(key, _PRIOR.get(key, 0.5)))
 
 
 def _calib_vec(key: str, symbol: str = None) -> list:
@@ -438,7 +486,7 @@ def _calib_vec(key: str, symbol: str = None) -> list:
     Returned list is always L1-normalised.
     """
     sym = symbol if symbol is not None else st.session_state.get("opt_symbol", "")
-    v   = _get_calib(sym).get(key, _PRIOR[key])
+    v   = _get_calib(sym).get(key, _PRIOR.get(key, [0.5]))
     arr = [float(x) for x in v]
     s   = sum(arr)
     return [x / s for x in arr] if s > 1e-9 else [1.0 / len(arr)] * len(arr)
@@ -446,11 +494,14 @@ def _calib_vec(key: str, symbol: str = None) -> list:
 
 def _update_scalar_calib(key: str, signal_hist: list, outcome_hist: list,
                           transform=None, symbol: str = ""):
-    """Learn the optimal scale/weight for `key` via OLS on (signal → outcome).
-    Symbol-specific: stores result under `symbol` key so each instrument
-    learns its own relationships independently.
+    """Replace OLS with rolling hit-rate + information ratio.
+
+    weight = exp-decay-weighted hit_rate * |information_ratio|
+    Normalized against prior via data_trust ramp.
+    Never uses linear regression — avoids overfit on small samples.
     """
-    if len(signal_hist) < _CALIB_MIN_OBS or len(outcome_hist) < _CALIB_MIN_OBS:
+    n_min = _dynamic_min_obs(symbol)
+    if len(signal_hist) < n_min or len(outcome_hist) < n_min:
         return
     n = min(len(signal_hist), len(outcome_hist), _CALIB_WINDOW)
     x = np.array(signal_hist[-n:], dtype=float)
@@ -459,51 +510,102 @@ def _update_scalar_calib(key: str, signal_hist: list, outcome_hist: list,
         x = np.array([transform(v) for v in x])
     mask = np.isfinite(x) & np.isfinite(y)
     x, y = x[mask], y[mask]
-    if len(x) < _CALIB_MIN_OBS:
+    if len(x) < n_min:
         return
-    xx = float(np.dot(x, x))
-    if xx < 1e-12:
-        return
-    w_ols = float(np.dot(x, y)) / xx
-    prior_val = _PRIOR.get(key, 0.5)
-    shrink = max(0.0, 1.0 - (len(x) - _CALIB_MIN_OBS) / _CALIB_WINDOW)
-    w_blended = (1.0 - shrink) * w_ols + shrink * prior_val
-    if isinstance(prior_val, float) and 0.0 <= prior_val <= 1.0:
-        w_blended = max(0.05, min(0.95, w_blended))
+
+    # Exponential decay weights (recent obs matter more)
+    decay = np.array([0.97 ** (len(x) - 1 - i) for i in range(len(x))])
+    decay /= decay.sum()
+
+    # Hit rate: sign(signal) == sign(outcome)
+    correct = (np.sign(x) == np.sign(y)).astype(float)
+    hit_rate = float(np.dot(decay, correct))   # in [0, 1]
+
+    # Information ratio: mean(signal * outcome) / std(signal * outcome)
+    prod = x * y
+    prod_std = float(np.std(prod))
+    if prod_std < 1e-9:
+        ir = 0.0
     else:
-        w_blended = max(prior_val * 0.1, min(prior_val * 10.0, w_blended))
+        ir = float(np.dot(decay, prod)) / prod_std
+    ir = max(-3.0, min(3.0, ir))              # clamp
+
+    # Scale parameter: hit_rate maps [0.5,1.0] → [0,1]; scaled by |ir|
+    # This measures "how well does this signal calibrate this parameter?"
+    perf_score = max(0.0, (hit_rate - 0.5) * 2.0) * max(0.0, abs(ir) / 2.0)
+
+    prior_val  = _PRIOR.get(key, 0.5)
+    data_trust = min(1.0, (len(x) - n_min) / max(1, _CALIB_WINDOW - n_min))
+
+    # Map perf_score to same scale as prior (prior is used as anchor)
+    if isinstance(prior_val, (int, float)):
+        # Scale factor: perf_score in [0,1] → new value near prior
+        # High perf → stay near prior * (1 + ir_direction)
+        ir_sign  = 1.0 if ir >= 0 else -1.0
+        w_new    = prior_val * (1.0 + 0.5 * perf_score * ir_sign)
+        w_new    = max(prior_val * 0.1, min(prior_val * 3.0, w_new))
+        w_blended = (1.0 - data_trust) * prior_val + data_trust * w_new
+        if 0.0 <= prior_val <= 1.0:
+            w_blended = max(0.05, min(0.95, w_blended))
+    else:
+        w_blended = prior_val   # non-scalar prior: skip
+
     _set_calib(key, round(w_blended, 6), symbol)
 
 
 def _update_vec_calib(key: str, signal_matrix: np.ndarray, outcome_hist: list,
                        symbol: str = ""):
-    """Learn optimal mixing weights for a vector of signals via regularised OLS.
-    Symbol-specific: stores result under `symbol` key.
+    """Replace ridge OLS with rank-based performance weighting.
+
+    For each signal column:
+      perf = exp-decay hit_rate * |corr_with_outcomes|
+    Weights = softmax(ranks(perf))  →  prevents single-factor domination.
+    Blended with uniform prior via data_trust ramp.
     """
-    if len(outcome_hist) < _CALIB_MIN_OBS:
+    n_min = _dynamic_min_obs(symbol)
+    if len(outcome_hist) < n_min:
         return
     n = min(signal_matrix.shape[0], len(outcome_hist), _CALIB_WINDOW)
     X = signal_matrix[-n:].astype(float)
     y = np.array(outcome_hist[-n:], dtype=float)
     mask = np.all(np.isfinite(X), axis=1) & np.isfinite(y)
     X, y = X[mask], y[mask]
-    if len(X) < _CALIB_MIN_OBS:
+    if len(X) < n_min:
         return
-    lam = 0.1
-    XtX = X.T @ X + lam * np.eye(X.shape[1])
-    Xty = X.T @ y
-    try:
-        w = np.linalg.solve(XtX, Xty)
-    except np.linalg.LinAlgError:
-        return
-    w = np.abs(w)
-    prior_arr = np.array(_PRIOR.get(key, [1.0 / X.shape[1]] * X.shape[1]), dtype=float)
-    shrink = max(0.0, 1.0 - (len(X) - _CALIB_MIN_OBS) / _CALIB_WINDOW)
-    w = (1.0 - shrink) * w + shrink * (prior_arr / prior_arr.sum())
-    w = np.clip(w, 0.01, None)
-    w = w / w.sum()
-    _set_calib(key, [round(float(v), 6) for v in w], symbol)
 
+    k = X.shape[1]
+    decay = np.array([0.97 ** (len(X) - 1 - i) for i in range(len(X))])
+    decay /= decay.sum()
+
+    perf = np.zeros(k)
+    for j in range(k):
+        col = X[:, j]
+        if np.std(col) < 1e-9:
+            perf[j] = 0.0
+            continue
+        correct = (np.sign(col) == np.sign(y)).astype(float)
+        hit_w   = float(np.dot(decay, correct))
+        corr    = float(np.corrcoef(col, y)[0, 1]) if len(col) > 2 else 0.0
+        if math.isnan(corr):
+            corr = 0.0
+        perf[j] = max(0.0, (hit_w - 0.5) * 2.0) * abs(corr)
+
+    # Rank-based normalisation: rank position → weight (avoids raw perf domination)
+    order  = np.argsort(perf)
+    ranks  = np.empty(k); ranks[order] = np.arange(1, k + 1, dtype=float)
+    w_rank = ranks / ranks.sum()
+
+    prior_arr  = np.array(_PRIOR.get(key, [1.0 / k] * k), dtype=float)
+    if len(prior_arr) != k:
+        prior_arr = np.full(k, 1.0 / k)
+    prior_arr  = prior_arr / prior_arr.sum()
+
+    data_trust = min(1.0, (len(X) - n_min) / max(1, _CALIB_WINDOW - n_min))
+    w_final    = (1.0 - data_trust) * prior_arr + data_trust * w_rank
+    w_final    = np.clip(w_final, 0.01, None)
+    w_final   /= w_final.sum()
+
+    _set_calib(key, [round(float(v), 6) for v in w_final], symbol)
 
 def _run_calibration_cycle(ohlcv_df, symbol: str = "", horizon: int = 4):
     """Top-level calibration dispatcher.
@@ -521,16 +623,16 @@ def _run_calibration_cycle(ohlcv_df, symbol: str = "", horizon: int = 4):
     real_ret_hist = _get_hist("_calib_realised_ret_hist", sym)
 
     # ── Fallback: OHLCV-derived forward returns (no look-ahead gap enforced) ──
-    # Used only when real_ret_hist has fewer than _CALIB_MIN_OBS entries.
+    # Used only when real_ret_hist has fewer than _dynamic_min_obs(sym) entries.
     ohlcv_fwd_ret = []
-    if len(real_ret_hist) < _CALIB_MIN_OBS:
-        if ohlcv_df is not None and not ohlcv_df.empty and len(ohlcv_df) >= horizon + _CALIB_MIN_OBS + 5:
+    if len(real_ret_hist) < _dynamic_min_obs(sym):
+        if ohlcv_df is not None and not ohlcv_df.empty and len(ohlcv_df) >= horizon + _dynamic_min_obs(sym) + 5:
             c = ohlcv_df["close"].astype(float).reset_index(drop=True)
             ohlcv_fwd_ret = list(np.log(c.shift(-horizon) / c).dropna().values)
 
     # Choose which outcome series to use
-    fwd_ret = real_ret_hist if len(real_ret_hist) >= _CALIB_MIN_OBS else ohlcv_fwd_ret
-    if len(fwd_ret) < _CALIB_MIN_OBS:
+    fwd_ret = real_ret_hist if len(real_ret_hist) >= _dynamic_min_obs(sym) else ohlcv_fwd_ret
+    if len(fwd_ret) < _dynamic_min_obs(sym):
         return   # not enough data to calibrate anything
 
     fwd_ret = list(fwd_ret)
@@ -547,7 +649,7 @@ def _run_calibration_cycle(ohlcv_df, symbol: str = "", horizon: int = 4):
     ev_h   = H("_calib_ev_score_hist")
     dir_h  = H("_calib_dir_align_hist")
     n_ed   = min(len(ev_h), len(dir_h), len(fwd_ret))
-    if n_ed >= _CALIB_MIN_OBS:
+    if n_ed >= _dynamic_min_obs(sym):
         X_ed = np.column_stack([ev_h[-n_ed:], dir_h[-n_ed:]])
         _update_vec_calib("ev_score_vs_dir_align_vec", X_ed, fwd_ret[-n_ed:], symbol=sym)
         vec = _calib_vec("ev_score_vs_dir_align_vec", sym)
@@ -559,7 +661,7 @@ def _run_calibration_cycle(ohlcv_df, symbol: str = "", horizon: int = 4):
     oi_h  = H("_calib_oi_skew_hist")
     mp_h  = H("_calib_mp_z_hist")
     n_pos = min(len(pcr_h), len(oi_h), len(mp_h), len(fwd_ret))
-    if n_pos >= _CALIB_MIN_OBS:
+    if n_pos >= _dynamic_min_obs(sym):
         X_pos = np.column_stack([pcr_h[-n_pos:], oi_h[-n_pos:], mp_h[-n_pos:]])
         _update_vec_calib("positioning_pcr_vs_oi_vs_mp", X_pos, fwd_ret[-n_pos:], symbol=sym)
 
@@ -567,7 +669,7 @@ def _run_calibration_cycle(ohlcv_df, symbol: str = "", horizon: int = 4):
     vrz_h = H("_calib_vol_regime_z_hist")
     tsz_h = H("_calib_term_slope_z_hist")
     n_vr  = min(len(vrz_h), len(tsz_h), len(fwd_ret))
-    if n_vr >= _CALIB_MIN_OBS:
+    if n_vr >= _dynamic_min_obs(sym):
         X_vr = np.column_stack([vrz_h[-n_vr:], tsz_h[-n_vr:]])
         _update_vec_calib("vol_regime_z_vs_ts", X_vr, fwd_ret[-n_vr:], symbol=sym)
         vec2 = _calib_vec("vol_regime_z_vs_ts", sym)
@@ -578,7 +680,7 @@ def _run_calibration_cycle(ohlcv_df, symbol: str = "", horizon: int = 4):
     rs_lev_h = H("_calib_rs_z_hist")
     rs_slp_h = H("_calib_rs_slope_hist")
     n_rs     = min(len(rs_lev_h), len(rs_slp_h), len(fwd_ret))
-    if n_rs >= _CALIB_MIN_OBS:
+    if n_rs >= _dynamic_min_obs(sym):
         X_rs = np.column_stack([rs_lev_h[-n_rs:], rs_slp_h[-n_rs:]])
         _update_vec_calib("rs_level_vs_slope_vec", X_rs, fwd_ret[-n_rs:], symbol=sym)
         vec_rs = _calib_vec("rs_level_vs_slope_vec", sym)
@@ -589,7 +691,7 @@ def _run_calibration_cycle(ohlcv_df, symbol: str = "", horizon: int = 4):
     mc_h  = H("_calib_mc_dir_hist")
     fac_h = H("_calib_fac_dir_hist")
     n_mc  = min(len(mc_h), len(fac_h), len(fwd_ret))
-    if n_mc >= _CALIB_MIN_OBS:
+    if n_mc >= _dynamic_min_obs(sym):
         X_mc = np.column_stack([mc_h[-n_mc:], fac_h[-n_mc:]])
         _update_vec_calib("mc_blend_vec", X_mc, fwd_ret[-n_mc:], symbol=sym)
         vec_mc = _calib_vec("mc_blend_vec", sym)
@@ -600,26 +702,26 @@ def _run_calibration_cycle(ohlcv_df, symbol: str = "", horizon: int = 4):
     safe_h = H("_calib_safety_ratio_hist")
     # Use real return as proxy for safety quality (safe positions → better returns)
     n_sf   = min(len(safe_h), len(fwd_ret))
-    if n_sf >= _CALIB_MIN_OBS:
+    if n_sf >= _dynamic_min_obs(sym):
         _update_scalar_calib("safety_sigmoid_sharpness", safe_h[-n_sf:], fwd_ret[-n_sf:],
                               transform=lambda x: max(0.0, x - 1.0), symbol=sym)
 
     # ── 8. Term-structure tanh scale ───────────────────────────────────────────
     ts_slp_h = H("_calib_ts_slope_raw_hist")
     n_ts     = min(len(ts_slp_h), len(fwd_ret))
-    if n_ts >= _CALIB_MIN_OBS:
+    if n_ts >= _dynamic_min_obs(sym):
         _update_scalar_calib("ts_tanh_scale", ts_slp_h[-n_ts:], fwd_ret[-n_ts:], symbol=sym)
 
     # ── 9. HV accel stretch ────────────────────────────────────────────────────
     hva_h = H("_calib_hv_accel_raw_hist")
     n_hv  = min(len(hva_h), len(fwd_ret))
-    if n_hv >= _CALIB_MIN_OBS:
+    if n_hv >= _dynamic_min_obs(sym):
         _update_scalar_calib("hv_accel_stretch", hva_h[-n_hv:], fwd_ret[-n_hv:], symbol=sym)
 
     # ── 10. Max-pain gravity ────────────────────────────────────────────────────
     mp_raw_h = H("_calib_mp_dist_raw_hist")
     n_mp     = min(len(mp_raw_h), len(fwd_ret))
-    if n_mp >= _CALIB_MIN_OBS:
+    if n_mp >= _dynamic_min_obs(sym):
         _update_scalar_calib("mp_gravity", [-v for v in mp_raw_h[-n_mp:]], fwd_ret[-n_mp:],
                               symbol=sym)
 
@@ -629,7 +731,7 @@ def _run_calibration_cycle(ohlcv_df, symbol: str = "", horizon: int = 4):
     hva_ph = H("_calib_hva_pillar_hist")
     gex_ph = H("_calib_gex_pillar_hist")
     n_rp   = min(len(iv_ph), len(adx_ph), len(hva_ph), len(gex_ph), len(fwd_ret))
-    if n_rp >= _CALIB_MIN_OBS:
+    if n_rp >= _dynamic_min_obs(sym):
         X_rp = np.column_stack([
             np.abs(iv_ph[-n_rp:]), np.abs(adx_ph[-n_rp:]),
             np.abs(hva_ph[-n_rp:]),np.abs(gex_ph[-n_rp:]),
@@ -646,7 +748,7 @@ def _run_calibration_cycle(ohlcv_df, symbol: str = "", horizon: int = 4):
     ema_h = H("_calib_ema_score_hist")
     adx_h = H("_calib_adx_score_hist")
     n_tr  = min(len(ema_h), len(adx_h), len(fwd_ret))
-    if n_tr >= _CALIB_MIN_OBS:
+    if n_tr >= _dynamic_min_obs(sym):
         X_tr = np.column_stack([ema_h[-n_tr:], adx_h[-n_tr:]])
         _update_vec_calib("trend_ema_vs_adx_vec", X_tr, fwd_ret[-n_tr:], symbol=sym)
         vtr = _calib_vec("trend_ema_vs_adx_vec", sym)
@@ -656,7 +758,7 @@ def _run_calibration_cycle(ohlcv_df, symbol: str = "", horizon: int = 4):
     # ── 13. ADX vs RSI within trend ────────────────────────────────────────────
     rsi_h2 = H("_calib_rsi_trend_hist")
     n_ar   = min(len(adx_h), len(rsi_h2), len(fwd_ret))
-    if n_ar >= _CALIB_MIN_OBS:
+    if n_ar >= _dynamic_min_obs(sym):
         X_ar = np.column_stack([adx_h[-n_ar:], rsi_h2[-n_ar:]])
         _update_vec_calib("adx_vs_rsi_vec", X_ar, fwd_ret[-n_ar:], symbol=sym)
         var = _calib_vec("adx_vs_rsi_vec", sym)
@@ -674,7 +776,7 @@ def _run_calibration_cycle(ohlcv_df, symbol: str = "", horizon: int = 4):
     ]
     _intra_hists = [H(k) for k in _intra_keys]
     _n_intra = min(min(len(h) for h in _intra_hists), len(fwd_ret))
-    if _n_intra >= _CALIB_MIN_OBS:
+    if _n_intra >= _dynamic_min_obs(sym):
         X_intra = np.column_stack([h[-_n_intra:] for h in _intra_hists])
         _update_vec_calib("intra_weights_vec", X_intra, fwd_ret[-_n_intra:], symbol=sym)
         v_intra = _calib_vec("intra_weights_vec", sym)
@@ -690,11 +792,11 @@ def _run_calibration_cycle(ohlcv_df, symbol: str = "", horizon: int = 4):
     # ── 15. Intraday blend weight ─────────────────────────────────────────────
     intra_score_h = H("_calib_intraday_score_hist")
     n_ib = min(len(intra_score_h), len(fwd_ret))
-    if n_ib >= _CALIB_MIN_OBS:
+    if n_ib >= _dynamic_min_obs(sym):
         # Calibrate the blend weight: how much does intraday improve over factor-only?
         factor_h = H("_calib_raw_score_hist")
         n_blend  = min(len(intra_score_h), len(factor_h), len(fwd_ret))
-        if n_blend >= _CALIB_MIN_OBS:
+        if n_blend >= _dynamic_min_obs(sym):
             X_blend = np.column_stack([factor_h[-n_blend:], intra_score_h[-n_blend:]])
             _update_vec_calib("intra_blend_vec", X_blend, fwd_ret[-n_blend:], symbol=sym)
             v_blend = _calib_vec("intra_blend_vec", sym)
@@ -815,11 +917,13 @@ def _bootstrap_signal_history(ohlcv_df, symbol: str = "", horizon: int = 4,
                 # Weighted composite (no flow/positioning — unavailable from OHLCV)
                 # Weights sum to 1.0; use the CFG factor weights as guide but
                 # redistribute flow+positioning weight proportionally to what's available.
-                raw = (0.40 * ema_z
-                     + 0.20 * mom_z
-                     + 0.20 * rsi_z
-                     + 0.10 * hv_z
-                     + 0.10 * atr_z)
+                # FIX13/14: RSI weight reduced to minimal (confirming only)
+                # Momentum (5d return) also reduced — bootstrap is vol/trend only
+                raw = (0.50 * ema_z      # EMA structure: primary trend signal
+                     + 0.15 * mom_z      # 5d momentum: short confirming
+                     + 0.05 * rsi_z      # RSI: minimal — easily gamed by mean-reversion
+                     + 0.20 * hv_z       # vol regime: important for bootstrap
+                     + 0.10 * atr_z)     # ATR pct: trend strength proxy
                 raw = max(-1.0, min(1.0, raw))
 
                 prob_up_i = 1.0 / (1.0 + math.exp(-raw * _sharpness_prior))
@@ -837,7 +941,7 @@ def _bootstrap_signal_history(ohlcv_df, symbol: str = "", horizon: int = 4,
             except Exception:
                 continue
 
-        if len(raw_scores) < _CALIB_MIN_OBS:
+        if len(raw_scores) < _dynamic_min_obs():
             return
 
         # ── Write into calibration histories ──────────────────────────────────
@@ -855,10 +959,17 @@ def _bootstrap_signal_history(ohlcv_df, symbol: str = "", horizon: int = 4,
                 g_existing = list(st.session_state.get(key, []))
                 st.session_state[key] = (values + g_existing)[-_CALIB_WINDOW:]
 
-        _write_hist("_calib_raw_score_hist",     raw_scores)
-        _write_hist("_calib_prob_up_hist",        prob_ups)
-        _write_hist("_calib_actual_up_hist",      actual_ups)
-        _write_hist("_calib_realised_ret_hist",   fwd_returns)
+        # FIX8 (MONARCH v2 Tier1): Bootstrap ONLY writes vol/return histories.
+        # Directional signals (raw_score, prob_up, actual_up) are intentionally
+        # excluded — bootstrapped scores use price-only proxies that would corrupt
+        # flow/positioning calibration. Only neutral volatility-based histories
+        # and normalised forward returns are safe to bootstrap.
+        _write_hist("_calib_realised_ret_hist",   fwd_returns)   # safe: raw log returns
+        # Write HV proxy as vol_regime_z baseline (volatility signal only)
+        hv_z_scores = [max(-1.0, min(1.0, -(float(hv20.iloc[i]) - 0.15) / 0.10))
+                        for i in range(warmup, n - horizon)
+                        if not math.isnan(float(hv20.iloc[i]))]
+        _write_hist("_calib_vol_regime_z_hist",   hv_z_scores[:len(fwd_returns)])
 
         # EMA and RSI histories for sub-factor calibration
         ema_scores = []
@@ -875,13 +986,9 @@ def _bootstrap_signal_history(ohlcv_df, symbol: str = "", horizon: int = 4,
             except Exception:
                 ema_scores.append(0.0); rsi_scores.append(0.0)
 
-        _write_hist("_calib_ema_score_hist", ema_scores)
-        _write_hist("_calib_rsi_trend_hist", rsi_scores)
-        # ADX proxy = ATR percentile (directional strength)
-        adx_proxy = [(float(atr_pct_s.iloc[i]) - 0.5) * 2.0
-                     for i in range(warmup, n - horizon)
-                     if not math.isnan(float(atr_pct_s.iloc[i]))]
-        _write_hist("_calib_adx_score_hist", adx_proxy[:len(raw_scores)])
+        # FIX8: EMA/RSI/ADX directional signal histories removed from bootstrap.
+        # These would bias calibration toward price-only trend signals.
+        # They will be populated from real resolved outcomes instead.
 
         # Now run the full calibration cycle with the bootstrapped data
         _run_calibration_cycle(ohlcv_df, symbol=sym, horizon=horizon)
@@ -950,6 +1057,38 @@ def _record_outcome(symbol: str, signal_snapshot: dict, horizon_days: int = 4):
     st.session_state[key] = pending[-100:]
 
 
+def _adaptive_threshold(key: str, fallback: float, symbol: str = "",
+                         percentile: float = 70.0) -> float:
+    """Return a performance-adaptive threshold for a signal gate.
+
+    Computes the `percentile`-th percentile of the signal's SUCCESS distribution
+    (i.e. observations where the signal fired AND the subsequent return agreed),
+    NOT the raw signal value distribution.
+
+    When fewer than 20 success observations exist, returns `fallback` from CFG.
+    This replaces all hard-coded CFG threshold usage in signal gating.
+    """
+    sym    = symbol or st.session_state.get("opt_symbol", "").upper()
+    s_key  = f"{sym}:_thresh_success_{key}" if sym else f"_thresh_success_{key}"
+    success_hist = st.session_state.get(s_key, [])
+    if len(success_hist) < 20:
+        return fallback
+    return float(np.percentile(success_hist, percentile))
+
+
+def _record_threshold_outcome(key: str, signal_value: float, outcome: float,
+                               symbol: str = ""):
+    """Record a signal value into the success history IFF it was followed by a
+    correct directional outcome. Called from _ingest_resolved_outcomes.
+    """
+    if not (math.isfinite(signal_value) and math.isfinite(outcome)):
+        return
+    if float(signal_value) > 0 and float(outcome) > 0:
+        _record(f"_thresh_success_{key}", signal_value, symbol)
+    elif float(signal_value) < 0 and float(outcome) < 0:
+        _record(f"_thresh_success_{key}", abs(signal_value), symbol)
+
+
 def _resolve_outcomes(symbol: str, current_spot: float, ohlcv_df) -> list:
     """Resolve pending signal snapshots by computing realised forward returns.
     Called at LOAD time. For each pending entry whose horizon has elapsed,
@@ -1002,7 +1141,15 @@ def _resolve_outcomes(symbol: str, current_spot: float, ohlcv_df) -> list:
                 else:
                     realised_ret = float(np.log(current_spot / entry_spot))
 
-                resolved.append((entry, realised_ret))
+                # Normalize by realized vol (return / vol → Sharpe-like unit)
+                _rv_key = f"{symbol.upper()}:_calib_realised_ret_hist"
+                _rv_hist = st.session_state.get(_rv_key, [])
+                if len(_rv_hist) >= 5:
+                    _rv_std = float(np.std(_rv_hist[-20:])) or 0.01
+                else:
+                    _rv_std = 0.01   # fallback: ~1% daily vol
+                norm_ret = max(-3.0, min(3.0, realised_ret / (_rv_std + 1e-9)))
+                resolved.append((entry, norm_ret))   # use vol-normalised return
             else:
                 remaining.append(entry)
         except Exception:
@@ -1054,6 +1201,10 @@ def _ingest_resolved_outcomes(symbol: str, resolved_pairs: list):
         if _spot_stored > 0 and _em_stored > 0:
             _actual_move = abs(math.exp(ret) - 1.0) * _spot_stored
             _record("_calib_move_vs_iv_hist", round(_actual_move / _em_stored, 4), sym)
+        # FIX11: Feed adaptive threshold success histories (Fix 3)
+        _record_threshold_outcome("iv_hv",  entry.get("vol_regime_z", 0.0), ret, sym)
+        _record_threshold_outcome("pcr",    entry.get("pcr_level_z",  0.0), ret, sym)
+        _record_threshold_outcome("adx",    entry.get("adx_score",    0.0), ret, sym)
 
 
 # ── Statistical helpers ────────────────────────────────────────────────────────
@@ -1321,7 +1472,7 @@ if "opt_token_loaded" not in st.session_state:
         try:
             with open(TOKEN_FILE, "r") as f:
                 _existing = f.read().strip()
-        except:
+        except OSError:
             _existing = ""
     st.session_state.opt_access_token = _existing
     st.session_state.opt_token_loaded = True
@@ -2111,7 +2262,6 @@ def fetch_fii_dii_data() -> dict:
             return float((s.iloc[-1] - s.iloc[-1-n]) / (s.iloc[-1-n] + 1e-9))
 
         fx_1d   = _pct_chg(fx,   1)   # positive = rupee weakened = FII selling
-        fx_3d   = _pct_chg(fx,   3)
         vix_1d  = _pct_chg(vix,  1)   # positive = VIX rose = risk-off
         nsei_1d = _pct_chg(nsei, 1)   # positive = Nifty up
 
@@ -2390,7 +2540,7 @@ def compute_flow_scores(chain_df, ohlcv_df):
 
                 # Retrieve signal histories aligned to the same sessions
                 hist_map = {
-                    "dIV":   st.session_state.get("opt_iv_history", {}).get(
+                    "dIV":   (st.session_state.get("opt_iv_history") or {}).get(
                                  st.session_state.get("opt_symbol", ""), []),
                     "dPCR":  st.session_state.get("_flow_pcr_hist",  []),
                     "dSkew": st.session_state.get("_flow_skew_hist", []),
@@ -2439,7 +2589,108 @@ def compute_flow_scores(chain_df, ohlcv_df):
     except Exception:
         pass
 
+    # Flow acceleration (MONARCH v2 Block E)
+    try:
+        _regime_now = st.session_state.get("opt_regime_label", _REGIME_TRANSITION)
+
+        def _accel(hist_list, min_len=5):
+            if len(hist_list) < min_len:
+                return 0.0
+            arr = np.array(hist_list[-min_len:], dtype=float)
+            d2  = np.diff(np.diff(arr))
+            if len(d2) == 0:
+                return 0.0
+            raw = float(d2[-1])
+            _sd = float(np.std(d2)) if len(d2) >= 2 else 1.0
+            return float(max(-1.0, min(1.0, raw / (2.0 * (_sd or 1.0)))))
+
+        _sym_fa = st.session_state.get("opt_symbol", "")
+        oi_acc  = _accel(st.session_state.get("_flow_oi_hist", []))
+        pcr_acc = _accel(st.session_state.get("_flow_pcr_hist", []))
+        iv_acc  = _accel((st.session_state.get("opt_iv_history") or {}).get(_sym_fa, []))
+
+        _aw = 0.40 if _regime_now == _REGIME_TRANSITION else 0.20
+        acc_comp = max(-1.0, min(1.0, 0.40 * oi_acc + 0.35 * pcr_acc + 0.25 * iv_acc))
+
+        flow["flow_score"]        = round(
+            max(-1.0, min(1.0, (1.0 - _aw) * flow.get("flow_score", 0.0) + _aw * acc_comp)), 3)
+        flow["flow_acceleration"] = round(acc_comp, 3)
+        flow["oi_accel"]          = round(oi_acc, 3)
+        flow["pcr_accel"]         = round(pcr_acc, 3)
+        flow["iv_accel"]          = round(iv_acc, 3)
+    except Exception:
+        flow.setdefault("flow_acceleration", 0.0)
+        flow.setdefault("oi_accel", 0.0)
+        flow.setdefault("pcr_accel", 0.0)
+        flow.setdefault("iv_accel", 0.0)
+
     return flow
+
+
+def detect_shock_event(atm_iv, chain_df, ohlcv_df) -> dict:
+    """
+    Detect abnormal events (IV spike, OI jump, cross-asset shock) via z-scores.
+    When detected, returns override_weights that increase FLOW+VOL, reduce TREND.
+    All thresholds are z-score based -- no fixed numbers.
+    """
+    result = {
+        "shock_detected": False, "iv_shock": False, "oi_shock": False, "ca_shock": False,
+        "shock_intensity": 0.0, "iv_zscore": 0.0, "oi_zscore": 0.0, "override_weights": None,
+    }
+    try:
+        # IV z-score
+        _sym   = st.session_state.get("opt_symbol", "")
+        _iv_h  = st.session_state.get("opt_iv_history", {}).get(_sym, [])
+        iv_z   = 0.0; iv_shock = False
+        if len(_iv_h) >= 10:
+            _a = np.array(_iv_h, dtype=float)
+            _mu = float(_a[:-1].mean()); _sd = float(_a[:-1].std()) or (_mu * 0.1)
+            iv_z = (atm_iv - _mu) / (_sd + 1e-9)
+            iv_shock = abs(iv_z) > 2.5
+
+        # OI z-score
+        _oi_h   = st.session_state.get("_flow_oi_hist", [])
+        oi_z    = 0.0; oi_shock = False
+        if len(_oi_h) >= 5 and chain_df is not None and not chain_df.empty:
+            _tot = float(chain_df["CE_OI"].sum() + chain_df["PE_OI"].sum())
+            _a   = np.array(_oi_h[:-1], dtype=float)
+            if len(_a) >= 3:
+                _mu = float(_a.mean()); _sd = float(_a.std()) or (_mu * 0.05)
+                oi_z = (_tot - _mu) / (_sd + 1e-9)
+                oi_shock = abs(oi_z) > 2.5
+
+        # Cross-asset shock — zscores are normalised to [-1,+1] by _norm()
+        # so the threshold must be in that range (>2.0 would never fire)
+        _ca   = st.session_state.get("opt_cross_asset", {})
+        ca_shock = (_ca.get("data_available") and
+                    any(abs(v) > 0.75 for v in _ca.get("zscores", {}).values()))
+
+        _n  = sum([iv_shock, oi_shock, ca_shock])
+        det = _n >= 1
+        intensity = min(1.0, (abs(iv_z) + abs(oi_z)) / 6.0 + (0.3 if ca_shock else 0.0))
+
+        ow = None
+        if det:
+            _raw = {
+                "flow":        min(0.55, 0.30 + 0.15 * intensity),
+                "positioning": 0.20,
+                "vol_regime":  min(0.35, 0.20 + 0.10 * intensity),
+                "rel_strength":0.05,
+                "trend":       max(0.00, 0.10 - 0.08 * intensity),
+            }
+            _t = sum(_raw.values()) or 1.0
+            ow = {k: v / _t for k, v in _raw.items()}
+
+        result.update({
+            "shock_detected": det, "iv_shock": iv_shock, "oi_shock": oi_shock,
+            "ca_shock": ca_shock, "shock_intensity": round(intensity, 3),
+            "iv_zscore": round(iv_z, 2), "oi_zscore": round(oi_z, 2),
+            "override_weights": ow,
+        })
+    except Exception:
+        pass
+    return result
+
 
 
 def directional_bias(df, ltp, chain_df=None):
@@ -2702,7 +2953,12 @@ def directional_bias(df, ltp, chain_df=None):
     #           flow is applied in compute_probabilistic_score where it has 0.30 weight.
     #           Here we use 0.0 for flow since it hasn't been computed yet.
     # ════════════════════════════════════════════════════════════════════════
-    fw = CFG["factor_weights"]
+    # Use regime-adaptive weights, but normalise over only the 4 factors
+    # computed here (flow is handled separately in compute_probabilistic_score).
+    _raw_fw = st.session_state.get("opt_regime_weights", CFG["factor_weights"])
+    _db_keys = ["trend", "vol_regime", "positioning", "rel_strength"]
+    _db_total = sum(_raw_fw.get(k, 0.0) for k in _db_keys) or 1.0
+    fw = {k: _raw_fw.get(k, 0.0) / _db_total for k in _db_keys}
 
     # Blend trend + momentum → single "trend" contribution
     # Momentum (RSI z-score, 5D return) shrinks to minor role inside trend
@@ -2759,8 +3015,8 @@ def vol_regime(ivr):
     Thresholds from CFG: iv_hv_pct_sell (sell premium) and iv_hv_pct_buy (buy premium).
     Midpoints between those are normal-high / normal-low.
     """
-    _sell = CFG["iv_hv_pct_sell"]  # e.g. 75
-    _buy  = CFG["iv_hv_pct_buy"]   # e.g. 30
+    _sell = _adaptive_threshold("iv_hv", CFG["iv_hv_pct_sell"], percentile=70.0)
+    _buy  = _adaptive_threshold("iv_hv", CFG["iv_hv_pct_buy"],  percentile=30.0)
     _mid  = (_sell + _buy) / 2     # e.g. 52.5
     _very_hi = _sell + (100 - _sell) * 0.6  # 60% of way to 100 → extreme
 
@@ -2769,6 +3025,104 @@ def vol_regime(ivr):
     elif ivr >= _mid:     return "NORMAL-HIGH",   "Slight sell lean — balanced spreads, light credits",     "#ffb347"
     elif ivr >= _buy:     return "NORMAL-LOW",    "Slight buy lean — calendars / ratio spreads",            "#7ec8e3"
     else:                 return "LOW VOL",       "BUY premium — debit spreads / long options / straddles", "#1e90ff"
+
+
+# ============================================================
+# CROSS-ASSET SIGNALS
+# ============================================================
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_cross_asset_signals() -> dict:
+    """
+    Fetch US 10Y yield, DXY, Crude, VIX, India VIX and normalise to [-1,+1].
+    Composite weighted by correlation with forward returns (learned dynamically).
+    Returns dict with individual signals + composite + availability flag.
+    """
+    _result = {
+        "rate_signal": 0.0, "dollar_signal": 0.0, "oil_signal": 0.0,
+        "vix_signal": 0.0, "indiavix_signal": 0.0,
+        "composite": 0.0, "data_available": False, "zscores": {},
+    }
+    try:
+        _raw = yf.download(
+            ["^TNX", "DX-Y.NYB", "CL=F", "^VIX", "^INDIAVIX"],
+            period="60d", interval="1d",
+            progress=False, auto_adjust=True, group_by="ticker"
+        )
+        if _raw.empty:
+            return _result
+
+        def _get_ca_close(ticker):
+            try:
+                return (_raw[ticker]["Close"].dropna()
+                        if isinstance(_raw.columns, pd.MultiIndex)
+                        else _raw["Close"].dropna())
+            except Exception:
+                return pd.Series(dtype=float)
+
+        def _norm(series, window=20):
+            s = series.dropna()
+            if len(s) < 5:
+                return 0.0
+            pct_now = float((s.iloc[-1] - s.iloc[-2]) / (abs(s.iloc[-2]) + 1e-9))
+            hist    = s.pct_change().dropna().tail(window).values
+            if len(hist) < 3:
+                return float(math.tanh(pct_now * 20))
+            mu = float(hist.mean()); sd = max(float(hist.std()), abs(mu) * 0.1 + 1e-6)
+            return float(max(-1.0, min(1.0, (pct_now - mu) / (2.0 * sd))))
+
+        # Invert: rising rates/dollar/VIX = bearish for India equity
+        sigs = {
+            "rate":     -_norm(_get_ca_close("^TNX")),
+            "dollar":   -_norm(_get_ca_close("DX-Y.NYB")),
+            "oil":      -_norm(_get_ca_close("CL=F")) * 0.5,
+            "vix":      -_norm(_get_ca_close("^VIX")),
+            "indiavix": -_norm(_get_ca_close("^INDIAVIX")),
+        }
+
+        _ca_w = st.session_state.get("_cross_asset_weights",
+                    {k: 0.20 for k in sigs})
+        total_w = sum(_ca_w.values()) or 1.0
+        composite = max(-1.0, min(1.0,
+            sum(_ca_w.get(k, 0.20) / total_w * v for k, v in sigs.items())))
+
+        _result.update({
+            "rate_signal":     round(sigs["rate"],     4),
+            "dollar_signal":   round(sigs["dollar"],   4),
+            "oil_signal":      round(sigs["oil"],      4),
+            "vix_signal":      round(sigs["vix"],      4),
+            "indiavix_signal": round(sigs["indiavix"], 4),
+            "composite":       round(composite, 4),
+            "data_available":  True,
+            "zscores":         {k: round(v, 4) for k, v in sigs.items()},
+        })
+    except Exception:
+        pass
+    return _result
+
+
+def _update_cross_asset_weights():
+    """Update cross-asset signal weights from correlation with forward returns."""
+    try:
+        sym    = st.session_state.get("opt_symbol", "").upper()
+        ret_k  = f"{sym}:_calib_realised_ret_hist" if sym else "_calib_realised_ret_hist"
+        r_hist = np.array(st.session_state.get(ret_k,
+                     st.session_state.get("_calib_realised_ret_hist", [])), dtype=float)
+        if len(r_hist) < 10:
+            return
+        _ca_hist = st.session_state.get("_cross_asset_signal_hist", {})
+        new_w = {}
+        for k in ["rate", "dollar", "oil", "vix", "indiavix"]:
+            hist = np.array(_ca_hist.get(k, []), dtype=float)
+            n    = min(len(hist), len(r_hist))
+            if n < 10:
+                new_w[k] = 0.20; continue
+            corr = float(np.corrcoef(hist[-n:], r_hist[-n:])[0, 1])
+            new_w[k] = max(0.01, abs(corr) if not math.isnan(corr) else 0.10)
+        total = sum(new_w.values()) or 1.0
+        st.session_state["_cross_asset_weights"] = {k: v / total for k, v in new_w.items()}
+    except Exception:
+        pass
 
 # ============================================================
 # MARKET REGIME DETECTION
@@ -2900,9 +3254,6 @@ def parse_chain(raw_data, spot, step=50):
     rows = []
     if not raw_data: return pd.DataFrame()
     items = raw_data if isinstance(raw_data, list) else raw_data.get("options", [])
-
-    # Pre-compute approximate T for IV fallback (calendar days / 365, rough)
-    _today = datetime.now().date()
 
     # ── Helpers defined ONCE outside the loop ────────────────────────────────
     def _md(d, *keys):
@@ -3318,9 +3669,7 @@ def compute_intraday_signals(intraday_df: pd.DataFrame,
     # ── Lunch-hour reversal — configurable candle indices from CFG ───────────
     _lm  = CFG["intra_min_candles_lunch"]
     _lcs = CFG["intra_lunch_candle_start"]   # pre-lunch candle index
-    _lcm = CFG["intra_lunch_candle_morn"]    # morning close candle index
     if len(df) >= _lm:
-        morning_close   = float(df.iloc[_lcm]["close"])
         prelunch_close  = float(df.iloc[_lcs]["close"])
         postlunch_close = float(df.tail(1)["close"].values[0])
         open_p          = float(df.iloc[0]["open"])
@@ -3382,217 +3731,174 @@ def compute_intraday_signals(intraday_df: pd.DataFrame,
 # MARKET REGIME DETECTION
 # ============================================================
 
-def detect_market_regime(ohlcv_df, atm_iv, hv20):
-    """Classify market regime using four statistical pillars (Improvement #6):
-      1. IV percentile (where current IV sits in its own history)
-      2. ADX percentile (trend strength relative to its own distribution)
-      3. Realized volatility (HV20 vs HV5 to detect vol acceleration)
-      4. Gamma exposure sign (GEX: positive = pinning, negative = trending)
-
-    Each pillar maps to a score in [-1, +1].  The composite regime is derived
-    from the quadrant of (trend_strength, vol_level) rather than fixed thresholds,
-    making it fully adaptive to the instrument's own distribution.
-
-    Also provides strategy_ev_by_regime: which strategy types have historically
-    had positive EV in each regime quadrant (from backtest_strategies_by_regime).
-    Returns dict with regime label + sub-labels for trend/range/vol state.
+def detect_market_regime(ohlcv_df, atm_iv, hv20, cross_asset_signal=0.0):
     """
-    result = {"trend": "UNKNOWN", "range": "UNKNOWN", "vol": "UNKNOWN",
-              "regime": "UNKNOWN", "adx": 0.0, "bb_width_pct": 0.0,
-              "atr_pct": 0.0, "color": "#888",
-              "iv_pct": 50.0, "adx_pct": 50.0, "hv_accel": 0.0,
-              "gex_sign": 0, "regime_confidence": 0.0}
+    Regime detection — runs FIRST in the signal pipeline.
+
+    6 observable inputs, all distribution-derived:
+      IV percentile, IV/HV percentile, HV acceleration z-score,
+      ADX percentile x direction, term structure slope z-score,
+      cross-asset composite signal.
+
+    Confidence = 1 - normalised stddev of pillar vector
+    (measures pillar agreement, not a fixed number).
+
+    Outputs regime label + confidence + per-regime signal weights.
+    """
+    result = {
+        "trend": "UNKNOWN", "range": "UNKNOWN", "vol": "UNKNOWN",
+        "regime": _REGIME_TRANSITION, "adx": 0.0, "bb_width_pct": 0.0,
+        "atr_pct": 0.0, "color": "#888",
+        "iv_pct": 50.0, "adx_pct": 50.0, "hv_accel": 0.0,
+        "gex_sign": 0, "regime_confidence": 0.0,
+        "signal_weights": _REGIME_SIGNAL_WEIGHTS[_REGIME_TRANSITION],
+        "pillars": {},
+    }
     if ohlcv_df is None or ohlcv_df.empty or len(ohlcv_df) < 30:
         return result
+
     c = ohlcv_df["close"].astype(float)
     h = ohlcv_df["high"].astype(float)
     l = ohlcv_df["low"].astype(float)
 
-    # ── Pillar 1: IV percentile ──────────────────────────────────────────────
-    # Compare current IV to its own rolling history.  Uses session-state iv_history.
-    _sym_key   = st.session_state.get("opt_symbol", "")
-    _iv_hist   = st.session_state.get("opt_iv_history", {}).get(_sym_key, [])
-    if len(_iv_hist) >= 5:
-        iv_pct = _percentile_score(_iv_hist, atm_iv) * 100   # 0–100
-    else:
-        iv_pct = 50.0   # neutral fallback
-    # IV pillar score: high IV pct = elevated vol = score +1 (vol expansion regime)
-    iv_pillar = (iv_pct / 100.0) * 2 - 1   # [-1, +1]; +1 = very high IV
+    # P1: IV percentile
+    _sym = st.session_state.get("opt_symbol", "")
+    _iv_hist = st.session_state.get("opt_iv_history", {}).get(_sym, [])
+    iv_pct   = _percentile_score(_iv_hist, atm_iv) * 100 if len(_iv_hist) >= 5 else 50.0
+    iv_pillar = (iv_pct / 100.0) * 2 - 1
 
-    # ── Pillar 2: ADX percentile ─────────────────────────────────────────────
-    tr    = pd.concat([h - l, (h - c.shift(1)).abs(), (l - c.shift(1)).abs()], axis=1).max(axis=1)
-    atr14 = tr.ewm(alpha=1/14, adjust=False).mean()
-    up_move   = h - h.shift(1)
-    down_move = l.shift(1) - l
-    dm_p = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=c.index)
-    dm_m = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=c.index)
-    di_p  = 100 * dm_p.ewm(alpha=1/14, adjust=False).mean() / (atr14 + 1e-9)
-    di_m  = 100 * dm_m.ewm(alpha=1/14, adjust=False).mean() / (atr14 + 1e-9)
-    dx    = 100 * (di_p - di_m).abs() / (di_p + di_m + 1e-9)
-    adx_series = dx.ewm(alpha=1/14, adjust=False).mean().dropna()
-    adx   = float(adx_series.iloc[-1])
-    adx_dir = 1.0 if float(di_p.iloc[-1]) > float(di_m.iloc[-1]) else -1.0
+    # P2: IV/HV ratio percentile
+    _hv_s    = hv20 if (hv20 and hv20 > 0.01) else CFG["hv_fallback"]
+    _iv_hv_h = _get_hist("_calib_iv_hv_ratio_hist")
+    iv_hv_r  = atm_iv / (_hv_s + 1e-9)
+    iv_hv_p  = _percentile_score(_iv_hv_h, iv_hv_r) if len(_iv_hv_h) >= 5 else 0.5
+    iv_hv_pillar = iv_hv_p * 2 - 1
 
-    # ADX percentile within its OWN rolling distribution (no fixed 25 threshold)
-    if len(adx_series) >= 10:
-        adx_pct_val = _percentile_score(adx_series.values, adx) * 100   # 0–100
-    else:
-        adx_pct_val = 50.0
-    # ADX pillar: high percentile + direction = strong trend
-    adx_pillar = (adx_pct_val / 100.0) * adx_dir   # [-1, +1]
-
-    # ── Pillar 3: Realized volatility acceleration ───────────────────────────
-    # HV5 vs HV20: rising near-term vol = acceleration = trending/breaking out
-    hv5  = float(np.log(c / c.shift(1)).dropna().tail(5).std()  * np.sqrt(252)) if len(c) >= 6  else hv20
-    hv20_val = hv20 if hv20 and hv20 > 0.01 else (
-        float(np.log(c / c.shift(1)).dropna().tail(20).std() * np.sqrt(252)) if len(c) >= 21 else 0.15
-    )
-    hv_accel = (hv5 - hv20_val) / (hv20_val + 1e-9)   # positive = vol accelerating
-    # Calibrated tanh stretch (replaces hardcoded ×3)
+    # P3: HV acceleration z-score
+    hv5 = (float(np.log(c / c.shift(1)).dropna().tail(5).std() * np.sqrt(252))
+           if len(c) >= 6 else _hv_s)
+    hv_accel = (hv5 - _hv_s) / (_hv_s + 1e-9)
     hv_accel_pillar = float(np.tanh(hv_accel * _calib("hv_accel_stretch")))
     _record("_calib_hv_accel_raw_hist", hv_accel)
     _record("_calib_hva_pillar_hist",   hv_accel_pillar)
 
-    # ── Pillar 4: Gamma Exposure sign ────────────────────────────────────────
-    oi_d_cur = st.session_state.get("opt_oi", {})
-    net_gex  = float(oi_d_cur.get("net_gex", 0) or 0)
-    gex_sign  = 1 if net_gex > 0 else (-1 if net_gex < 0 else 0)
-    _gex_hist_all = st.session_state.get("_flow_gex_hist", [net_gex] if net_gex != 0 else [0])
-    if len(_gex_hist_all) >= 3 and net_gex != 0:
-        # Percentile-based magnitude: where does this GEX sit in its own history?
-        # _percentile_score returns [0, 1]; multiply by sign for directional pillar.
-        gex_mag_pct = _percentile_score([abs(g) for g in _gex_hist_all], abs(net_gex))
-        gex_pillar  = -gex_sign * gex_mag_pct
-    elif net_gex != 0:
-        # Cold-start (< 3 history points): use sign only at half-strength (0.5).
-        # The old formula used 1e9 as denominator which always ≈ 1.0 for NSE GEX
-        # (which is in the 10^10–10^12 range), saturating to ±1 on every fresh session.
-        gex_pillar = -gex_sign * 0.5
-    else:
-        gex_pillar = 0.0
-    _record("_calib_iv_pillar_hist",  iv_pillar)
+    # P4: ADX percentile x direction
+    tr     = pd.concat([h-l, (h-c.shift(1)).abs(), (l-c.shift(1)).abs()], axis=1).max(axis=1)
+    atr14  = tr.ewm(alpha=1/14, adjust=False).mean()
+    up_m   = h - h.shift(1); dn_m = l.shift(1) - l
+    dm_p   = pd.Series(np.where((up_m > dn_m) & (up_m > 0), up_m, 0.0), index=c.index)
+    dm_m   = pd.Series(np.where((dn_m > up_m) & (dn_m > 0), dn_m, 0.0), index=c.index)
+    di_p   = 100 * dm_p.ewm(alpha=1/14, adjust=False).mean() / (atr14 + 1e-9)
+    di_m_s = 100 * dm_m.ewm(alpha=1/14, adjust=False).mean() / (atr14 + 1e-9)
+    dx     = 100 * (di_p - di_m_s).abs() / (di_p + di_m_s + 1e-9)
+    adx_s  = dx.ewm(alpha=1/14, adjust=False).mean().dropna()
+    adx    = float(adx_s.iloc[-1])
+    adx_dir = 1.0 if float(di_p.iloc[-1]) > float(di_m_s.iloc[-1]) else -1.0
+    adx_pct_v = _percentile_score(adx_s.values, adx) * 100 if len(adx_s) >= 10 else 50.0
+    adx_pillar = (adx_pct_v / 100.0) * adx_dir
     _record("_calib_adx_pillar_hist", adx_pillar)
-    _record("_calib_gex_pillar_hist", gex_pillar)
 
-    # ── Composite regime scores — all mixing weights calibrated ──────────────
-    _ra_w = _calib("regime_adx_vs_gex")
-    trend_axis = _ra_w * adx_pillar + (1.0 - _ra_w) * (-gex_pillar)
-    trend_axis = max(-1.0, min(1.0, trend_axis))
-
-    _rv_w = _calib("regime_iv_vs_hv_accel")
-    vol_axis = _rv_w * iv_pillar + (1.0 - _rv_w) * hv_accel_pillar
-    vol_axis = max(-1.0, min(1.0, vol_axis))
-
-    # Regime confidence: calibrated pillar weights
-    regime_confidence = round(
-        _calib("regime_conf_iv")  * abs(iv_pillar)
-      + _calib("regime_conf_adx") * abs(adx_pillar)
-      + _calib("regime_conf_hv")  * abs(hv_accel_pillar)
-      + _calib("regime_conf_gex") * abs(gex_pillar), 3
-    )
-
-    # ── Trend classification — ADX percentile threshold, adx_weak_frac calibrated ──
-    adx_pct_threshold = CFG["adx_trend_pct"] / 100.0
-    if len(adx_series) >= 10:
-        adx_trend_level = float(adx_series.quantile(adx_pct_threshold))
+    # P5: Term structure slope
+    # Derive term slope from opt_multi_expiry (same source as compute_probabilistic_score)
+    # opt_term_slope was never set, so we compute it directly here.
+    _ts_data = st.session_state.get("opt_multi_expiry", [])
+    if len(_ts_data) >= 2:
+        _ts = float(_ts_data[1].get("atm_iv", atm_iv)) - float(_ts_data[0].get("atm_iv", atm_iv))
     else:
-        adx_trend_level = 25.0
-    adx_weak_level = adx_trend_level * _calib("adx_weak_frac")
+        _ts = 0.0
+    _tsh = st.session_state.get("_calib_ts_slope_hist", [])
+    ts_p = (-(_zscore_clamp(_tsh, _ts, clamp=2.0) / 2.0) if len(_tsh) >= 5
+            else -math.tanh(_ts * _calib("ts_tanh_scale")))
 
-    spot_now = float(c.iloc[-1])
-    e20_v  = float(c.ewm(span=20, adjust=False).mean().iloc[-1])
-    e50_v  = float(c.ewm(span=50, adjust=False).mean().iloc[-1])
-    e200_v = float(c.ewm(span=200, adjust=False).mean().iloc[-1]) if len(c) >= 200 else e50_v
+    # P6: Cross-asset
+    ca_p = max(-1.0, min(1.0, float(cross_asset_signal)))
+    _record("_calib_cross_asset_hist", ca_p)
 
-    if adx >= adx_trend_level and spot_now > e20_v > e50_v:
-        trend = "UPTREND"
-    elif adx >= adx_trend_level and spot_now < e20_v < e50_v:
-        trend = "DOWNTREND"
-    elif adx < adx_weak_level:
-        trend = "RANGE"
+    # P7: GEX sign
+    _oi_d   = st.session_state.get("opt_oi", {})
+    net_gex = float(_oi_d.get("net_gex", 0) or 0)
+    gex_s   = 1 if net_gex > 0 else (-1 if net_gex < 0 else 0)
+    _gexh   = st.session_state.get("_flow_gex_hist", [net_gex] if net_gex != 0 else [0])
+    if len(_gexh) >= 3 and net_gex != 0:
+        gex_p = -gex_s * _percentile_score([abs(g) for g in _gexh], abs(net_gex))
+    elif net_gex != 0:
+        gex_p = -gex_s * 0.5
     else:
-        trend = "CHOPPY"
+        gex_p = 0.0
+    _record("_calib_iv_pillar_hist",  iv_pillar)
+    _record("_calib_gex_pillar_hist", gex_p)
 
-    # ── Vol state from IV percentile (replaces fixed % thresholds) ───────────
-    _sell_pct = CFG["iv_hv_pct_sell"]
-    _buy_pct  = CFG["iv_hv_pct_buy"]
-    if   iv_pct >= _sell_pct + 15: vol_state = "HIGH VOL"
-    elif iv_pct >= _sell_pct:      vol_state = "VOL EXPANDING"
-    elif iv_pct <= _buy_pct:       vol_state = "VOL COMPRESSING"
-    elif iv_pct <= _buy_pct + 15:  vol_state = "LOW VOL"
-    else:                          vol_state = "NORMAL VOL"
+    # Composite axes
+    _ra_w    = _calib("regime_adx_vs_gex")
+    trend_ax = max(-1.0, min(1.0,
+        _ra_w * adx_pillar + (1.0 - _ra_w) * (-gex_p) + 0.15 * ca_p))
+    _rv_w    = _calib("regime_iv_vs_hv_accel")
+    vol_ax   = max(-1.0, min(1.0,
+        _rv_w * iv_hv_pillar + (1.0 - _rv_w) * hv_accel_pillar + 0.10 * abs(iv_pillar)))
 
-    # ── Bollinger Band Width for range classification ────────────────────────
-    bm    = c.rolling(20).mean()
-    bstd  = c.rolling(20).std()
-    _bup  = (bm + 2*bstd).iloc[-1]
-    _blo  = (bm - 2*bstd).iloc[-1]
-    _bm   = bm.iloc[-1]
-    if pd.isna(_bup) or pd.isna(_blo) or pd.isna(_bm) or _bm == 0:
-        bb_w = 4.0
+    # Regime confidence: 1 - normalised stddev
+    _pvec = np.array([iv_pillar, iv_hv_pillar, hv_accel_pillar,
+                      adx_pillar, ts_p, ca_p, gex_p])
+    regime_conf = round(max(0.0, 1.0 - float(np.std(_pvec)) / 0.6), 3)
+
+    # Regime label from (trend_ax, vol_ax)
+    _any_shock = any(abs(x) > 0.85 for x in [iv_pillar, hv_accel_pillar, ca_p])
+    _vol_hi    = vol_ax  >  0.20
+    _vol_lo    = vol_ax  < -0.20
+    _trending  = abs(trend_ax) > 0.25
+    _ranging   = abs(trend_ax) < 0.15 and not _vol_hi
+
+    if _any_shock or (_vol_hi and not _trending):
+        regime, col = _REGIME_VOL_EXPANSION, "#ff3b3b"
+    elif _trending and trend_ax > 0.25:
+        regime, col = _REGIME_TRENDING_UP, "#00d084"
+    elif _trending and trend_ax < -0.25:
+        regime, col = _REGIME_TRENDING_DOWN, "#ff7777"
+    elif _vol_lo and _ranging:
+        regime, col = _REGIME_VOL_COMPRESS, "#1e90ff"
+    elif _ranging:
+        regime, col = _REGIME_RANGE_BOUND, "#7ec8e3"
     else:
-        bb_w = float((_bup - _blo) / _bm * 100)
-    atr_pct = float(atr14.iloc[-1] / c.iloc[-1] * 100)
-    range_state = "WIDE RANGE" if bb_w > 6 else ("TIGHT RANGE" if bb_w < 3 else "NORMAL RANGE")
+        regime, col = _REGIME_TRANSITION, "#888"
 
-    # ── Composite regime label (4-quadrant: trend×vol) ───────────────────────
-    if trend in ("UPTREND", "DOWNTREND") and vol_state in ("HIGH VOL", "VOL EXPANDING"):
-        regime = "TRENDING HIGH VOL"
-        col    = "#ff3b3b"
-    elif trend in ("UPTREND", "DOWNTREND") and vol_state in ("LOW VOL", "VOL COMPRESSING", "NORMAL VOL"):
-        regime = "TRENDING LOW VOL"
-        col    = "#00d084"
-    elif trend == "RANGE" and vol_state in ("LOW VOL", "VOL COMPRESSING"):
-        regime = "RANGE LOW VOL"
-        col    = "#1e90ff"
-    elif trend == "RANGE" and vol_state in ("HIGH VOL", "VOL EXPANDING"):
-        regime = "RANGE HIGH VOL"
-        col    = "#ffb347"
-    else:
-        regime = "TRANSITIONAL"
-        col    = "#888"
+    # Legacy labels
+    trend  = ("UPTREND" if trend_ax > 0.3 else "DOWNTREND" if trend_ax < -0.3
+              else "RANGE" if abs(trend_ax) < 0.15 else "CHOPPY")
+    volst  = ("HIGH VOL" if vol_ax > 0.4 else "VOL EXPANDING" if vol_ax > 0.2
+              else "VOL COMPRESSING" if vol_ax < -0.2 else "LOW VOL" if vol_ax < -0.4
+              else "NORMAL VOL")
+    atr_pct = float(atr14.iloc[-1] / c.iloc[-1] * 100) if float(c.iloc[-1]) > 0 else 0.0
 
-    # ── Strategy EV guidance per regime (from backtest results) ─────────────
-    # Map regime label to historically highest-EV strategy types
-    _regime_strategy_map = {
-        "TRENDING HIGH VOL": ["Long ATM Call", "Long ATM Put", "Long Straddle", "Long Strangle"],
-        "TRENDING LOW VOL":  ["Bull Call Spread", "Bear Put Spread", "Long ATM Call", "Long ATM Put"],
-        "RANGE HIGH VOL":    ["Iron Condor", "Short Strangle", "Iron Butterfly", "Short Straddle"],
-        "RANGE LOW VOL":     ["Iron Condor", "ATM Butterfly", "Calendar Spread", "Bull Put Spread"],
-        "TRANSITIONAL":      ["Iron Condor", "ATM Butterfly", "Bull Call Spread", "Bear Put Spread"],
+    # Persist for downstream
+    st.session_state["opt_regime_label"]      = regime
+    st.session_state["opt_regime_confidence"] = regime_conf
+    st.session_state["opt_regime_weights"]    = _REGIME_SIGNAL_WEIGHTS[regime]
+
+    _strat_map = {
+        "TRENDING HIGH VOL": ["Long ATM Call","Long ATM Put","Long Straddle"],
+        "TRENDING LOW VOL":  ["Bull Call Spread","Bear Put Spread","Covered Call"],
+        "RANGE LOW VOL":     ["Short Strangle","Iron Condor","Short Straddle"],
+        "RANGE HIGH VOL":    ["Iron Condor","Iron Butterfly","Jade Lizard"],
+        "TRANSITIONAL":      ["Iron Condor","ATM Straddle (small)","Wait"],
     }
-    # Check backtest results stored in session state for regime-specific EV data
-    bt_results  = st.session_state.get("opt_backtest", {})
-    regime_evs  = {}
-    if bt_results:
-        for strat_name, strat_data in bt_results.items():
-            reg_pnl = strat_data.get("regime_pnl", {})
-            if regime in reg_pnl:
-                regime_evs[strat_name] = reg_pnl[regime].get("avg_pnl", 0.0)
-    # Sort by EV in this regime; fall back to static map if no backtest data
-    if regime_evs:
-        best_for_regime = sorted(regime_evs, key=regime_evs.get, reverse=True)[:4]
-    else:
-        best_for_regime = _regime_strategy_map.get(regime, [])
+    _compat = {
+        _REGIME_TRENDING_UP: "TRENDING LOW VOL",   _REGIME_TRENDING_DOWN: "TRENDING LOW VOL",
+        _REGIME_VOL_EXPANSION: "TRENDING HIGH VOL", _REGIME_VOL_COMPRESS: "RANGE LOW VOL",
+        _REGIME_RANGE_BOUND: "RANGE LOW VOL",       _REGIME_TRANSITION: "TRANSITIONAL",
+    }
 
     return {
-        "trend":              trend,
-        "range":              range_state,
-        "vol":                vol_state,
-        "regime":             regime,
-        "adx":                round(adx, 1),
-        "adx_pct":            round(adx_pct_val, 1),
-        "iv_pct":             round(iv_pct, 1),
-        "hv_accel":           round(hv_accel, 4),
-        "gex_sign":           gex_sign,
-        "trend_axis":         round(trend_axis, 3),
-        "vol_axis":           round(vol_axis, 3),
-        "regime_confidence":  regime_confidence,
-        "bb_width_pct":       round(bb_w, 2),
-        "atr_pct":            round(atr_pct, 2),
-        "e200_dist_pct":      round((spot_now - e200_v) / e200_v * 100, 2) if e200_v > 0 else 0,
-        "color":              col,
-        "best_strategies":    best_for_regime,   # highest-EV strategies for this regime
+        "trend": trend, "range": volst, "vol": volst, "regime": regime, "color": col,
+        "adx": round(adx, 1), "adx_pct": round(adx_pct_v, 1), "iv_pct": round(iv_pct, 1),
+        "hv_accel": round(hv_accel, 4), "atr_pct": round(atr_pct, 2), "bb_width_pct": 0.0,
+        "gex_sign": gex_s, "regime_confidence": regime_conf,
+        "signal_weights": _REGIME_SIGNAL_WEIGHTS[regime],
+        "pillars": {
+            "iv": round(iv_pillar, 3), "iv_hv": round(iv_hv_pillar, 3),
+            "hv_accel": round(hv_accel_pillar, 3), "adx": round(adx_pillar, 3),
+            "ts_slope": round(ts_p, 3), "cross_asset": round(ca_p, 3), "gex": round(gex_p, 3),
+        },
+        "strategy_ev_by_regime": _strat_map.get(_compat.get(regime, "TRANSITIONAL"), []),
     }
 
 # ============================================================
@@ -4047,7 +4353,7 @@ def backtest_strategies_by_regime(ohlcv_df, iv_history, hv20):
             "high":  h.iloc[:i].values,
             "low":   l.iloc[:i].values,
         })
-        regime_d = detect_market_regime(full_sub_df, iv_proxy, hv20)
+        regime_d = detect_market_regime(full_sub_df, iv_proxy, hv20, st.session_state.get("opt_cross_asset", {}).get("composite", 0.0))
         reg_label = regime_d.get("regime", "UNKNOWN")
 
         # Actual move
@@ -4228,7 +4534,8 @@ def oi_analysis(chain_df, spot, step=50, T=None, r=None, atm_iv=None, lot_size=N
     # ── PCR signal — fully percentile-based, adaptive to THIS chain's distribution ──
     full_pcr = chain_df["PCR"].replace([np.inf, -np.inf], np.nan).dropna()
     pcr_pct  = float((full_pcr <= pcr_oi).mean() * 100) if len(full_pcr) > 0 else 50.0
-    _pb = CFG["pcr_bull_pct"]; _pbe = CFG["pcr_bear_pct"]
+    _pb  = _adaptive_threshold("pcr", CFG["pcr_bull_pct"],  percentile=65.0)
+    _pbe = _adaptive_threshold("pcr", CFG["pcr_bear_pct"],  percentile=35.0)
     if   pcr_pct >= _pb:           pcr_sig = f"BULLISH — PCR at {pcr_pct:.0f}th pct; heavy put writing = support"
     elif pcr_pct >= (_pb + _pbe)/2:pcr_sig = f"SLIGHT BULLISH — PCR {pcr_pct:.0f}th pct; put OI outweighs calls"
     elif pcr_pct >= (_pbe + _pb)/2:pcr_sig = f"NEUTRAL — PCR {pcr_pct:.0f}th pct; balanced OI both sides"
@@ -4353,6 +4660,139 @@ def _logistic(x):
     """Sigmoid function: maps any real x → (0, 1)."""
     return 1.0 / (1.0 + math.exp(-max(-20.0, min(20.0, x))))
 
+
+
+def _gate_signals_by_regime(factor_scores: dict, regime: str,
+                             confidence: float) -> dict:
+    """Regime-first signal gating (MONARCH v2 Tier 2 Fix 5).
+
+    Suppresses factors that are structurally uninformative in the current regime
+    by setting them to zero before the weighted composite is computed.
+    Confidence scales the suppression: low confidence → partial suppression only.
+
+    Gating rules (empirically motivated):
+      TRENDING_UP / TRENDING_DOWN:
+        - trend + rel_strength fully active
+        - flow active (confirms momentum)
+        - vol_regime reduced (vol not predictive in clean trends)
+        - positioning suppressed (positioning reverts, trend runs)
+      VOL_EXPANSION:
+        - flow + vol_regime fully active (vol events are flow-driven)
+        - trend SUPPRESSED (mean-reversion dominates after vol spikes)
+        - rel_strength reduced
+      VOL_COMPRESSION:
+        - positioning fully active (range-bound → mean-revert to strikes)
+        - flow reduced (flow meaningless in coiled market)
+        - trend suppressed
+      RANGE_BOUND:
+        - positioning dominant
+        - trend + rel_strength suppressed
+      TRANSITION:
+        - all signals active but flow up-weighted (spec: 0.50)
+        - acceleration already handled in flow engine
+    """
+    # Gate multipliers per regime (1.0 = fully on, 0.0 = fully suppressed)
+    # Uses module-level _REGIME_* constants to avoid duplication
+    _gates = {
+        _REGIME_TRENDING_UP:   {"flow": 1.0, "positioning": 0.4, "vol_regime": 0.5,
+                                "rel_strength": 1.0, "trend": 1.0},
+        _REGIME_TRENDING_DOWN: {"flow": 1.0, "positioning": 0.4, "vol_regime": 0.5,
+                                "rel_strength": 1.0, "trend": 1.0},
+        _REGIME_VOL_EXPANSION: {"flow": 1.0, "positioning": 0.6, "vol_regime": 1.0,
+                                "rel_strength": 0.5, "trend": 0.0},
+        _REGIME_VOL_COMPRESS:  {"flow": 0.5, "positioning": 1.0, "vol_regime": 0.8,
+                                "rel_strength": 0.4, "trend": 0.2},
+        _REGIME_RANGE_BOUND:   {"flow": 0.5, "positioning": 1.0, "vol_regime": 0.6,
+                                "rel_strength": 0.3, "trend": 0.1},
+    }
+    # TRANSITION regime: all signals active, flow up-weighted
+    _gates[_REGIME_TRANSITION] = {"flow": 1.0, "positioning": 0.9, "vol_regime": 0.9,
+                                   "rel_strength": 0.7, "trend": 0.6}
+    default_gates = {"flow": 1.0, "positioning": 1.0, "vol_regime": 1.0,
+                     "rel_strength": 0.8, "trend": 0.6}
+    gates = _gates.get(regime, default_gates)
+
+    # Scale suppression by confidence: low conf → partial gates only
+    # conf=1.0 → full gating; conf=0.0 → no gating (all signals pass)
+    conf = max(0.0, min(1.0, float(confidence)))
+    gated = {}
+    for k, v in factor_scores.items():
+        g = gates.get(k, 1.0)
+        # Effective gate: interpolate between 1.0 (no gate) and g (full gate)
+        eff_gate = 1.0 - conf * (1.0 - g)
+        gated[k] = float(v) * eff_gate
+    return gated
+
+
+def _rank_based_factor_weights(factor_scores_now: dict, fw_cfg: dict) -> dict:
+    """
+    Exponential-weighted rank-based adaptive weights (MONARCH v2 Block F).
+
+    For each factor:
+      hit_rate_w   = exponentially-weighted directional accuracy
+      corr         = Pearson correlation with forward return (signed)
+      perf_score   = hit_rate_w x |corr|
+
+    Weights = softmax of ranks (not raw perf_scores -> prevents domination).
+    Blended with CFG prior via data_trust = min(1, n_obs/100).
+    """
+    try:
+        sym    = st.session_state.get("opt_symbol", "").upper()
+        ret_k  = f"{sym}:_calib_realised_ret_hist" if sym else "_calib_realised_ret_hist"
+        r_hist = st.session_state.get(ret_k,
+                 st.session_state.get("_calib_realised_ret_hist", []))
+        if len(r_hist) < 10:
+            return fw_cfg.copy()
+
+        r_arr_f = np.array(r_hist, dtype=float)
+        fh      = st.session_state.get("opt_factor_hist", {})
+        perf    = {}; signs = {}; n_max = 0
+
+        for fn in factor_scores_now:
+            hist = np.array(fh.get(fn, []), dtype=float)
+            n    = min(len(hist), len(r_arr_f))
+            n_max = max(n_max, n)
+            if n < 10:
+                perf[fn] = fw_cfg.get(fn, 0.2); signs[fn] = 1; continue
+            s_a  = hist[-n:]; r_a = r_arr_f[-n:]
+            if np.std(s_a) < 1e-9:
+                perf[fn] = fw_cfg.get(fn, 0.2); signs[fn] = 1; continue
+            corr = float(np.corrcoef(s_a, r_a)[0, 1])
+            if math.isnan(corr):
+                corr = 0.0
+            # Exponentially weighted hit rate
+            decay = np.array([0.95 ** (n - 1 - i) for i in range(n)])
+            decay /= decay.sum()
+            match  = (np.sign(s_a) == np.sign(r_a)).astype(float)
+            hit_w  = float(np.dot(decay, match))
+            perf[fn]  = max(0.01, hit_w * max(0.0, abs(corr)))
+            signs[fn] = 1 if corr >= 0 else -1
+
+        # Rank-based normalisation (average-rank for ties, prevents first-index bias)
+        _perf_keys = list(perf.keys())
+        _perf_vals = np.array([perf[k] for k in _perf_keys], dtype=float)
+        _order     = np.argsort(_perf_vals)              # ascending
+        _ranks     = np.empty(len(_perf_vals))
+        _ranks[_order] = np.arange(1, len(_perf_vals)+1, dtype=float)
+        # Average-rank for ties
+        for _v in np.unique(_perf_vals):
+            _mask = _perf_vals == _v
+            _ranks[_mask] = _ranks[_mask].mean()
+        ranks  = {k: float(r) for k, r in zip(_perf_keys, _ranks)}
+        total  = sum(ranks.values()) or 1.0
+        norm_w = {k: v / total for k, v in ranks.items()}
+
+        # Blend with prior
+        trust  = min(1.0, n_max / 100.0)
+        final  = {k: (1.0 - trust) * fw_cfg.get(k, 0.2) + trust * norm_w.get(k, 0.2)
+                  for k in factor_scores_now}
+        tot_f  = sum(final.values()) or 1.0
+        final  = {k: v / tot_f for k, v in final.items()}
+
+        st.session_state["_factor_corr_signs"] = signs
+        return final
+    except Exception:
+        return fw_cfg.copy()
 
 def compute_probabilistic_score(
         bias_res, chain_df, ohlcv_df, spot, atm_iv, hv20,
@@ -4534,6 +4974,7 @@ def compute_probabilistic_score(
         iv_far   = float(ts_data[1].get("atm_iv", atm_iv))
         ts_slope = iv_far - iv_near
         _record_if_load("_calib_ts_slope_raw_hist", ts_slope)
+        st.session_state["opt_term_slope"] = ts_slope   # persist for detect_market_regime
         term_slope_z = max(-1.0, min(1.0, ts_slope * _calib("ts_slope_scale")))
 
     _record_if_load("_calib_term_slope_z_hist", term_slope_z)
@@ -4644,89 +5085,38 @@ def compute_probabilistic_score(
     # normalised to sum=1.  Falls back to CFG weights when < 10 observations.
     # ════════════════════════════════════════════════════════════════════════
 
-    _factor_scores_now = {
+    # Raw (ungated) factor scores — stored in history BEFORE regime gating.
+    # History must reflect true signal strength, not gated-zero values.
+    # Gating is applied only to the final composite, not to the learning signal.
+    _factor_scores_raw = {
         "flow":         fs["flow_score"],
         "positioning":  fs["positioning_score"],
         "vol_regime":   fs["vol_regime_score"],
         "rel_strength": fs["rs_score"],
         "trend":        fs["trend_z"],
     }
-    _fw_cfg = CFG["factor_weights"]   # original fixed weights as fallback
+    _fw_cfg = CFG["factor_weights"]   # uniform prior fallback (superseded by rank-based weights)
 
-    def _compute_factor_weights(ohlcv_local, factor_hist_key="opt_factor_score_hist",
-                                 horizon=4):
-        """Compute normalised correlation weights for the five factors.
-
-        BUG FIX (abs(corr) ignores sign): The original code used abs(corr) which gave
-        a contrarian factor (corr=-0.80) the same weight as a confirming one (corr=+0.80),
-        while its score contributed in the WRONG direction to raw_score. This amplified
-        error rather than suppressing it.
-
-        Fix: use the signed correlation as the weight magnitude, and separately persist
-        the sign in session_state["_factor_corr_signs"]. The raw_score computation below
-        multiplies each factor score by its sign before blending, so a contrarian factor
-        (negative corr) is effectively inverted before it enters the composite.
-
-        This means:
-          - Weight magnitude = abs(corr)  (how predictive the factor is)
-          - Score direction  = sign(corr) * factor_score  (which way to use it)
-          - Together: the composite always benefits from each factor's predictive power.
-        """
-        try:
-            sym_pfx = st.session_state.get("opt_symbol","").upper()
-            ret_key  = f"{sym_pfx}:_calib_realised_ret_hist" if sym_pfx else "_calib_realised_ret_hist"
-            ret_hist = st.session_state.get(ret_key,
-                       st.session_state.get("_calib_realised_ret_hist", []))
-            if len(ret_hist) < 10:
-                return _fw_cfg.copy()   # not enough resolved outcomes yet
-
-            r_arr_full = np.array(ret_hist, dtype=float)
-            factor_hist_store = st.session_state.get("opt_factor_hist", {})
-            raw_w = {}
-            corr_signs = {}   # +1 or -1 per factor — persisted for use in raw_score
-            for fname in _factor_scores_now:
-                hist = np.array(factor_hist_store.get(fname, []), dtype=float)
-                n = min(len(hist), len(r_arr_full))
-                if n < 10:
-                    raw_w[fname]    = _fw_cfg[fname]
-                    corr_signs[fname] = 1   # default: assume confirming direction
-                    continue
-                s_arr = hist[-n:]
-                r_arr = r_arr_full[-n:]
-                if np.std(s_arr) < 1e-9 or np.std(r_arr) < 1e-9:
-                    raw_w[fname]    = _fw_cfg[fname]
-                    corr_signs[fname] = 1
-                    continue
-                corr = float(np.corrcoef(s_arr, r_arr)[0, 1])
-                if np.isnan(corr):
-                    raw_w[fname]    = _fw_cfg[fname]
-                    corr_signs[fname] = 1
-                else:
-                    raw_w[fname]    = abs(corr)   # weight = magnitude of predictiveness
-                    corr_signs[fname] = 1 if corr >= 0 else -1   # sign tracked separately
-
-            # Persist signs so raw_score computation can apply them
-            st.session_state["_factor_corr_signs"] = corr_signs
-
-            total = sum(raw_w.values())
-            if total < 1e-9:
-                return _fw_cfg.copy()
-            return {k: v / total for k, v in raw_w.items()}
-        except Exception:
-            return _fw_cfg.copy()
-
-    # Update rolling factor score history — only on genuine Load (FIX: was every render)
+    # Update rolling factor score history from UNGATED scores (only on genuine Load)
     _fhist = st.session_state.get("opt_factor_hist", {})
     _fhist_load_id = st.session_state.get("opt_load_id", 0)
     _fhist_last_id = st.session_state.get("_fhist_last_load_id", -1)
     if _fhist_load_id != _fhist_last_id:
         st.session_state["_fhist_last_load_id"] = _fhist_load_id
-        for _fname, _fval in _factor_scores_now.items():
+        for _fname, _fval in _factor_scores_raw.items():
             _fhist.setdefault(_fname, []).append(float(_fval))
             _fhist[_fname] = _fhist[_fname][-252:]
         st.session_state["opt_factor_hist"] = _fhist
 
-    fw = _compute_factor_weights(None)  # uses realised_ret_hist, correctly aligned
+    # Regime-first gating: suppress signals not informative in this regime.
+    # Applied AFTER history recording so gated zeros never corrupt the learning signal.
+    _regime_now   = st.session_state.get("opt_regime_label", _REGIME_TRANSITION)
+    _regime_conf  = st.session_state.get("opt_regime_confidence", 0.5)
+    _factor_scores_now = _gate_signals_by_regime(_factor_scores_raw, _regime_now, _regime_conf)
+
+    # Weights computed from ungated scores (true signal performance)
+    fw = _rank_based_factor_weights(_factor_scores_raw, _fw_cfg)
+
 
     # BUG FIX (abs(corr) sign): retrieve per-factor correlation signs persisted above.
     # A factor with negative historical correlation is contrarian — its score must be
@@ -4735,12 +5125,33 @@ def compute_probabilistic_score(
     _fc_signs = st.session_state.get("_factor_corr_signs", {})
     _fs = lambda fname: _fc_signs.get(fname, 1)   # +1 confirming, -1 contrarian
 
-    raw_score = (
-          fw["flow"]         * _fs("flow")         * fs["flow_score"]
-        + fw["positioning"]  * _fs("positioning")  * fs["positioning_score"]
-        + fw["vol_regime"]   * _fs("vol_regime")   * fs["vol_regime_score"]
-        + fw["rel_strength"] * _fs("rel_strength") * fs["rs_score"]
-        + fw["trend"]        * _fs("trend")        * fs["trend_z"]
+    # Rank-aggregation composite (Fix 9: replaces linear weighted sum).
+    # Each factor score is first mapped to a percentile rank within its own
+    # rolling history (→ comparable [-1,+1] rank signal), then weighted.
+    # This neutralises scale differences and prevents any single fat signal
+    # from dominating the composite.
+    # _fhist_ps: use the same factor history (already updated with ungated scores above)
+    _fhist_ps = st.session_state.get("opt_factor_hist", {})
+    def _rank_score(fname, raw_val):
+        h = np.array(_fhist_ps.get(fname, []), dtype=float)
+        if len(h) < 10:
+            return float(raw_val)  # cold start: pass through
+        pct = float((h < raw_val).mean())  # 0..1
+        return max(-1.0, min(1.0, (pct - 0.5) * 2.0))  # → [-1,+1]
+
+    # Rank from ungated scores (true signal percentile), then apply gate multiplier
+    _fscores_ranked = {}
+    for _fname_r in _factor_scores_raw:
+        _raw_r  = _factor_scores_raw[_fname_r]
+        _gate_r = (_factor_scores_now[_fname_r] / (_raw_r + 1e-9)
+                   if abs(_raw_r) > 1e-9 else 0.0)
+        _gate_r = max(0.0, min(1.0, abs(_gate_r)))  # gate ratio 0..1
+        _ranked_r = _rank_score(_fname_r, _raw_r)   # rank based on ungated history
+        _fscores_ranked[_fname_r] = _ranked_r * _gate_r  # apply gate to ranked score
+
+    raw_score = sum(
+        fw.get(k, 0.0) * _fs(k) * _fscores_ranked.get(k, 0.0)
+        for k in _factor_scores_raw
     )
     raw_score = max(-1.0, min(1.0, raw_score))
 
@@ -4806,6 +5217,13 @@ def compute_probabilistic_score(
     except Exception:
         pass
 
+    # FIX10: MC now conditions core probability (not just EV)
+    if abs(_mc_direction) > 0.05:
+        _mc_prob = max(0.10, min(0.90, 0.50 + _mc_direction * 0.40))
+        _mc_w    = max(0.15, min(0.45, _calib("mc_blend")))
+        prob_up  = max(0.05, min(0.95, (1.0 - _mc_w) * prob_up + _mc_w * _mc_prob))
+        prob_down = 1.0 - prob_up
+
     # ── STEP 4: Implied probability from IV ──────────────────────────────────
     # expected_move_iv = spot * atm_iv * sqrt(DTE/252)  (spec formula)
     _dte_days = max(T * CFG["ann_days"], 1.0)
@@ -4847,7 +5265,7 @@ def compute_probabilistic_score(
     if len(_iv_hv_hist) >= 5:
         _iv_hv_now    = atm_iv / (hv20 + 1e-9) if hv20 and hv20 > 0.01 else 1.0
         _iv_hv_pct_rv = _percentile_score(_iv_hv_hist, _iv_hv_now)   # 0–1
-        if _iv_hv_pct_rv >= CFG["iv_hv_pct_sell"] / 100.0:
+        if _iv_hv_pct_rv >= _adaptive_threshold("iv_hv", CFG["iv_hv_pct_sell"], percentile=70.0) / 100.0:
             vol_edge = "SELL"   # IV expensive vs history → sell premium
         elif _iv_hv_pct_rv <= CFG["iv_hv_pct_buy"] / 100.0:
             vol_edge = "BUY"    # IV cheap vs history → buy vol
@@ -5921,6 +6339,31 @@ if load_btn:
         # Persist ohlcv_df so flow/factor weight functions can access it without a parameter chain
         st.session_state["opt_ohlcv_df"] = ohlcv_df if not ohlcv_df.empty else None
 
+        # Cross-asset signals (MONARCH v2 Block G — Step 1)
+        _ca_data = fetch_cross_asset_signals()
+        st.session_state["opt_cross_asset"] = _ca_data
+        if _ca_data.get("data_available"):
+            _ca_hist = st.session_state.get("_cross_asset_signal_hist", {})
+            for _k, _v in _ca_data.get("zscores", {}).items():
+                _ca_hist.setdefault(_k, []).append(float(_v))
+                _ca_hist[_k] = _ca_hist[_k][-252:]
+            st.session_state["_cross_asset_signal_hist"] = _ca_hist
+            _update_cross_asset_weights()
+        _ca_composite = _ca_data.get("composite", 0.0)
+
+        # Preliminary IV (before chain fetch) for early regime detection
+        _hv_prelim = hv20 if hv20 and hv20 > 0.01 else CFG["hv_fallback"]
+        atm_iv_prelim = _hv_prelim * 1.15
+
+        # REGIME FIRST - Step 1 (MONARCH v2 Block G)
+        regime_d = detect_market_regime(
+            ohlcv_df if not ohlcv_df.empty else None,
+            atm_iv_prelim, _hv_prelim, _ca_composite)
+        st.session_state["opt_regime_d"]           = regime_d
+        st.session_state["opt_regime_label"]       = regime_d.get("regime", _REGIME_TRANSITION)
+        st.session_state["opt_regime_confidence"]  = regime_d.get("regime_confidence", 0.5)
+        st.session_state["opt_regime_weights"]     = regime_d.get("signal_weights", CFG["factor_weights"])
+
         # ── Outcome resolution: compute real forward returns for past signals ──
         # This is the core feedback loop. Pending snapshots whose horizon has
         # elapsed are resolved against the current spot price, producing real
@@ -6056,6 +6499,12 @@ if load_btn:
         _intra_sigs = compute_intraday_signals(intraday_df, chain_df, spot)
         st.session_state["opt_intraday_signals"] = _intra_sigs
 
+        # Shock detection (MONARCH v2 Block G — Step 2)
+        _shock = detect_shock_event(atm_iv_prelim, chain_df if not chain_df.empty else None, ohlcv_df if not ohlcv_df.empty else None)
+        st.session_state["opt_shock"] = _shock
+        if _shock["shock_detected"] and _shock["override_weights"]:
+            st.session_state["opt_regime_weights"] = _shock["override_weights"]
+
         # 3b. Direction — MOVED here (was before chain fetch — BUG FIX 2).
         # directional_bias calls compute_flow_scores which reads dPCR, dSkew, dIV, dOI
         # from the LIVE chain. Running it before fetch_option_chain meant flow signals
@@ -6154,9 +6603,20 @@ if load_btn:
         else:
             st.session_state.opt_iv_percentile = 50.0
 
-        # Market Regime
+        # Market Regime (MONARCH v2 Block G — Step 3: final call with real atm_iv)
         _hv_for_regime = hv20 or hv_ref
-        st.session_state.opt_regime = detect_market_regime(ohlcv_df, atm_iv, _hv_for_regime)
+        _ca_composite_final = st.session_state.get("opt_cross_asset", {}).get("composite", 0.0)
+        regime_d_final = detect_market_regime(
+            ohlcv_df if not ohlcv_df.empty else None,
+            atm_iv or atm_iv_prelim, _hv_for_regime, _ca_composite_final)
+        st.session_state.opt_regime   = regime_d_final
+        st.session_state["opt_regime_d"] = regime_d_final
+        st.session_state["opt_regime_label"]      = regime_d_final.get("regime")
+        st.session_state["opt_regime_confidence"] = regime_d_final.get("regime_confidence")
+        # Keep shock-overridden weights if shock still active
+        _shock_now = st.session_state.get("opt_shock", {})
+        if not (_shock_now.get("shock_detected") and _shock_now.get("override_weights")):
+            st.session_state["opt_regime_weights"] = regime_d_final.get("signal_weights", CFG["factor_weights"])
 
         # Event Detection
         if expiry_sel:
@@ -6815,14 +7275,15 @@ if st.session_state.get("opt_load_id",0) != st.session_state.get("_last_outcome_
         "vol_regime_z":       _fs.get("vol_regime_z",         0.0),
         "term_slope_z":       _fs.get("term_slope_z",         0.0),
         "rs_z":               _fs.get("rs_z",                 0.0),
-        "rs_slope_z":         0.0,
+        "rs_slope_z":         float((st.session_state.get("opt_rs_nifty") or {}).get(
+                                   "rs_slope_z", 0.0) or 0.0),
         "ema_score":          _fs.get("trend_z",              0.0),
-        "adx_score":          float(prob_score.get("iv_hv_pct", 0.5)),
-        "rsi_z":              _fs.get("rsi_v",                50.0),
-        "iv_pillar":          float(prob_score.get("iv_hv_pct", 0.5)) * 2 - 1,
-        "adx_pillar":         _fs.get("trend_z",              0.0),
-        "hv_accel_pillar":    0.0,
-        "gex_pillar":         0.0,
+        "adx_score":          float((st.session_state.get("opt_regime_d") or {}).get("adx", 0.0)),
+        "rsi_z":              max(-1.0, min(1.0, (_fs.get("rsi_v", 50.0) - 50.0) / 25.0)),
+        "iv_pillar":          (st.session_state.get("opt_regime_d") or {}).get("pillars", {}).get("iv", 0.0),
+        "adx_pillar":         (st.session_state.get("opt_regime_d") or {}).get("pillars", {}).get("adx", 0.0),
+        "hv_accel_pillar":    (st.session_state.get("opt_regime_d") or {}).get("pillars", {}).get("hv_accel", 0.0),
+        "gex_pillar":         (st.session_state.get("opt_regime_d") or {}).get("pillars", {}).get("gex", 0.0),
     }, horizon_days=max(4, dte // 2))
 
 BIAS_COLORS = {
@@ -6865,7 +7326,7 @@ if _pending and _pending.get("symbol") == sym:
         positioning_score = float(_fs_now2.get("pcr_level_z", 0.0)),
         vol_regime_score  = float(_fs_now2.get("vol_regime_z", 0.0)),
         trend_score       = float(_fs_now2.get("trend_z", 0.0)),
-        intraday_score    = float(st.session_state.get("opt_intraday_signals", {}).get("intraday_score", 0.0)),
+        intraday_score    = float((st.session_state.get("opt_intraday_signals") or {}).get("intraday_score", 0.0)),
         dte               = dte,
     )
     st.session_state["_pending_signal_log"] = {}  # clear pending flag
@@ -7353,13 +7814,13 @@ border-left:4px solid {_ev_col};padding:10px 14px;font-family:'IBM Plex Mono',mo
     _fw_live     = prob_score.get("factor_weights", CFG["factor_weights"])
     _mc_blend_live = round(_calib("mc_blend") * 100)
     _sharp_live    = round(_calib("logistic_sharpness"), 2)
-    _calib_color   = "#00d084" if _n_real >= _CALIB_MIN_OBS else ("#ffb347" if _n_params >= 1 else "#555")
+    _calib_color   = "#00d084" if _n_real >= _dynamic_min_obs() else ("#ffb347" if _n_params >= 1 else "#555")
     _calib_status  = (f"LIVE — {_n_real} real outcomes · {_pending_n} pending"
-                      if _n_real >= _CALIB_MIN_OBS
-                      else f"WARMING UP — {_n_real}/{_CALIB_MIN_OBS} real outcomes needed")
+                      if _n_real >= _dynamic_min_obs()
+                      else f"WARMING UP — {_n_real}/{_dynamic_min_obs()} real outcomes needed")
 
     # ── Always-visible compact calibration progress bar ───────────────────────
-    _pct_cal_bar  = min(100, int(_n_real / max(_CALIB_MIN_OBS, 1) * 100))
+    _pct_cal_bar  = min(100, int(_n_real / max(_dynamic_min_obs(), 1) * 100))
     _flow_pcr_n   = len(st.session_state.get("_flow_pcr_hist", []))
     _flow_pct_bar = min(100, int(_flow_pcr_n / 10 * 100))   # 10 loads = full flow history
     _bar_bg       = "#00d084" if _pct_cal_bar >= 100 else ("#ffb347" if _pct_cal_bar >= 50 else "#ff3b3b")
@@ -7376,7 +7837,7 @@ font-family:'IBM Plex Mono',monospace;font-size:0.76rem;margin-bottom:6px;">
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;">
     <div>
       <div style="color:#555;font-size:0.70rem;margin-bottom:2px;">
-        CALIBRATION  {_n_real}/{_CALIB_MIN_OBS} real outcomes
+        CALIBRATION  {_n_real}/{_dynamic_min_obs()} real outcomes
       </div>
       <div style="background:#1a1a1a;height:6px;border-radius:2px;overflow:hidden;">
         <div style="width:{_pct_cal_bar}%;height:100%;background:{_bar_bg};border-radius:2px;"></div>
@@ -7418,7 +7879,7 @@ color:#555;padding:6px 0 2px;">
 </div>""", unsafe_allow_html=True)
 
         # Calibration quality bar — fraction of parameters with real data vs priors
-        _pct_calibrated = min(100, int(_n_real / max(_CALIB_MIN_OBS, 1) * 100))
+        _pct_calibrated = min(100, int(_n_real / max(_dynamic_min_obs(), 1) * 100))
         _bar_col = "#00d084" if _pct_calibrated >= 100 else ("#ffb347" if _pct_calibrated >= 50 else "#ff3b3b")
         st.markdown(f"""
 <div style="font-family:'IBM Plex Mono',monospace;margin:6px 0 4px;">
@@ -7427,7 +7888,7 @@ color:#555;padding:6px 0 2px;">
     <div style="width:{100-_pct_calibrated}%;background:#1a1a1a;"></div>
   </div>
   <div style="color:#555;font-size:0.72rem;margin-top:2px;">
-    Learning progress: {_pct_calibrated}% · {_n_real} real outcomes / {_CALIB_MIN_OBS} needed per parameter
+    Learning progress: {_pct_calibrated}% · {_n_real} real outcomes / {_dynamic_min_obs()} needed per parameter
   </div>
 </div>""", unsafe_allow_html=True)
 
@@ -7487,12 +7948,35 @@ width:100%;background:#0d0d0d;border:1px solid #2a2a2a;margin-top:8px;">
 </table>""", unsafe_allow_html=True)
 
         # Regime pillar confidence
+        # Pillar breakdown
+        _pillars_d = regime_d.get("pillars", {})
         st.caption(
-            f"Regime pillars: IV {_calib('regime_conf_iv'):.2f} · "
-            f"ADX {_calib('regime_conf_adx'):.2f} · "
-            f"HV-accel {_calib('regime_conf_hv'):.2f} · "
-            f"GEX {_calib('regime_conf_gex'):.2f} · "
-            f"Confidence: {regime_d.get('regime_confidence', 0):.2f}"
+            f"Pillars: iv={_pillars_d.get('iv',0):+.2f} "
+            f"iv_hv={_pillars_d.get('iv_hv',0):+.2f} "
+            f"hv_acc={_pillars_d.get('hv_accel',0):+.2f} "
+            f"adx={_pillars_d.get('adx',0):+.2f} "
+            f"ts={_pillars_d.get('ts_slope',0):+.2f} "
+            f"xasset={_pillars_d.get('cross_asset',0):+.2f} "
+            f"gex={_pillars_d.get('gex',0):+.2f} · "
+            f"Conf: {regime_d.get('regime_confidence', 0):.2f}"
+        )
+        # Shock + acceleration status
+        _shock_d  = st.session_state.get("opt_shock", {})
+        _flow_d   = (st.session_state.get("opt_bias") or {}).get("flow", {})
+        _fa       = float(_flow_d.get("flow_acceleration", 0.0))
+        _oia      = float(_flow_d.get("oi_accel", 0.0))
+        _pcra     = float(_flow_d.get("pcr_accel", 0.0))
+        if _shock_d.get("shock_detected"):
+            st.warning(
+                f"⚡ SHOCK DETECTED — intensity {_shock_d.get('shock_intensity',0):.2f} · "
+                f"IV z={_shock_d.get('iv_zscore',0):+.2f} "
+                f"OI z={_shock_d.get('oi_zscore',0):+.2f} "
+                + ("· CA shock" if _shock_d.get("ca_shock") else ""),
+                icon="⚠️"
+            )
+        st.caption(
+            f"Flow accel: composite={_fa:+.3f} "
+            f"OI={_oia:+.3f} PCR={_pcra:+.3f}"
         )
 
         # Real outcome performance summary
@@ -8182,7 +8666,7 @@ padding:12px 16px;margin-bottom:7px;font-family:'IBM Plex Mono',monospace;">
             # ── LOG button: snapshot this strategy into the Tradebook ────────
             _log_col, _log_spacer = st.columns([1, 5])
             with _log_col:
-                if st.button(f"📋 LOG Trade", key=f"log_strat_{i}_{s.get('Strategy','x')}",
+                if st.button("📋 LOG Trade", key=f"log_strat_{i}_{s.get('Strategy','x')}",
                              help="Snapshot this signal + strategy into the Tradebook tab. Live PnL will update on each reload."):
                     _trade_entry = {
                         "id":               f"{int(time.time()*1000)}_{i}",
@@ -10113,7 +10597,7 @@ font-family:'IBM Plex Mono',monospace;font-size:0.86rem;color:{_shape_c};margin:
             if _ed["smile"]:
                 _sdf = pd.DataFrame(_ed["smile"])
                 # Dynamic chart range: ±3 MC expected moves, floored at ±2× ATR
-                _em_ts    = st.session_state.get("opt_prob_score", {}).get("mc_expected_move", _atr_seed(_spot_ts) * 5)
+                _em_ts    = (st.session_state.get("opt_prob_score") or {}).get("mc_expected_move", _atr_seed(_spot_ts) * 5)
                 _floor_ts = max(_atr_seed(_spot_ts) * 2, _spot_ts * 0.02)  # 2× ATR or 2% floor
                 _range_ts = max(3.0 * _em_ts, _floor_ts)
                 _sdf = _sdf[(_sdf.Strike >= _spot_ts - _range_ts) & (_sdf.Strike <= _spot_ts + _range_ts)]
@@ -11619,10 +12103,10 @@ Collect signals daily for 2–3 months for statistically meaningful results.
         c8b.metric("Logistic k",       f"{_s8_sharp:.3f}",
                    help="Calibrated sharpness. Default=4.0. Higher=steeper prob curve. "
                         "Learned from correlation between raw_score and forward returns.")
-        c8c.metric("Min needed",       str(_CALIB_MIN_OBS),
-                   help=f"Minimum {_CALIB_MIN_OBS} observations before sharpness overrides cold-start prior")
-        _s8_status = ("🟢 LIVE — using learned k" if n_s8 >= _CALIB_MIN_OBS
-                      else f"🟡 WARMING UP — {n_s8}/{_CALIB_MIN_OBS}")
+        c8c.metric("Min needed",       str(_dynamic_min_obs()),
+                   help=f"Minimum {_dynamic_min_obs()} observations before sharpness overrides cold-start prior")
+        _s8_status = ("🟢 LIVE — using learned k" if n_s8 >= _dynamic_min_obs()
+                      else f"🟡 WARMING UP — {n_s8}/{_dynamic_min_obs()}")
         c8d.metric("Status",  _s8_status)
 
         if n_s8 >= 5:
@@ -11783,7 +12267,7 @@ Collect signals daily for 2–3 months for statistically meaningful results.
                         if _xx > 1e-9:
                             _k_ols = float(np.dot(_x, _y)) / _xx
                             # Shrink toward prior
-                            _shrink = max(0.0, 1.0 - (_i - _CALIB_MIN_OBS) / _CALIB_WINDOW)
+                            _shrink = max(0.0, 1.0 - (_i - _dynamic_min_obs()) / _CALIB_WINDOW)
                             _k_blended = (1.0 - _shrink) * _k_ols + _shrink * 4.0
                             _k_history.append(round(max(0.5, min(20.0, _k_blended)), 4))
                         else:
@@ -11842,7 +12326,8 @@ Collect signals daily for 2–3 months for statistically meaningful results.
                         mode="lines", name="Trend",
                         line=dict(color="#ff8c00", width=1.5, dash="dot")
                     ))
-                    _corr = float(np.corrcoef(_pred_pu, _ret_arr)[0, 1])
+                    _corr_raw = np.corrcoef(_pred_pu, _ret_arr)[0, 1]
+                    _corr = float(_corr_raw) if not (isinstance(_corr_raw, float) and math.isnan(_corr_raw)) and not np.isnan(_corr_raw) else 0.0
                     _corr_col = "#00d084" if _corr > 0.1 else "#ff3b3b" if _corr < -0.1 else "#888"
 
                 fig_scat.add_hline(y=0, line=dict(color="#333", width=1))
@@ -12094,6 +12579,37 @@ with t_prob:
         st.progress(_bar_pct,
                     text=f"Brier: {_brier:.4f} | Skill: {_skill*100:.0f}% | {_blbl}")
         st.caption("Reference: 0.25 = random  |  0.20 = weak  |  0.18 = tradable  |  0.15 = strong  |  0.12 = very strong")
+
+        # FIX15: Calibration curve (prob bins vs outcome frequency)
+        if _n_obs >= 20:
+            with st.expander("📊 Calibration Curve (bins vs actual outcomes)", expanded=False):
+                _pu_arr  = np.array(st.session_state.get("_calib_prob_up_hist", [])[-_n_obs:], dtype=float)
+                _au_arr  = np.array(st.session_state.get("_calib_actual_up_hist", [])[-_n_obs:], dtype=float)
+                _bins    = np.linspace(0.0, 1.0, 11)  # 10 equal-width bins
+                _rows15  = []
+                for _bi in range(len(_bins)-1):
+                    _m = (_pu_arr >= _bins[_bi]) & (_pu_arr < _bins[_bi+1])
+                    if _m.sum() < 2: continue
+                    _pred_mid = float(_pu_arr[_m].mean())
+                    _act_freq = float(_au_arr[_m].mean())
+                    _gap15    = _act_freq - _pred_mid
+                    _rows15.append({
+                        "Prob Bin":        f"{int(_bins[_bi]*100)}-{int(_bins[_bi+1]*100)}%",
+                        "Avg Predicted":   round(_pred_mid * 100, 1),
+                        "Actual Up %":     round(_act_freq * 100, 1),
+                        "Gap (pp)":        round(_gap15 * 100, 1),
+                        "N":               int(_m.sum()),
+                    })
+                if _rows15:
+                    st.dataframe(pd.DataFrame(_rows15), hide_index=True,
+                                 use_container_width=True)
+                    # Calibration ECE (Expected Calibration Error)
+                    _total_binned = sum(r["N"] for r in _rows15)
+                    _ece = sum(abs(r["Gap (pp)"]) * r["N"] for r in _rows15) / max(_total_binned, 1)
+                    _ece_lbl = "🟢 Good" if _ece < 5 else "🟡 Fair" if _ece < 10 else "🔴 Poor"
+                    st.metric("ECE (Expected Calibration Error)", f"{_ece:.1f}pp", help="Lower is better. <5pp = well-calibrated.")
+                    st.caption(_ece_lbl + " | ECE measures average gap between predicted probabilities and actual frequencies")
+
     else:
         st.info(f"Brier score needs 5 observations (currently {_n_obs}). "
                 "Each Load click followed by market close adds one observation after ~4 trading days.")
@@ -12110,9 +12626,9 @@ with t_prob:
     if len(_iv_hv_hist_pe) >= 5:
         _iv_hv_now_pe = _pe_ivhv   # already computed as atm_iv / hv above
         _iv_hv_pct_pe = _percentile_score(_iv_hv_hist_pe, _iv_hv_now_pe)
-        if _iv_hv_pct_pe >= CFG["iv_hv_pct_sell"] / 100.0:
+        if _iv_hv_pct_pe >= _adaptive_threshold("iv_hv", CFG["iv_hv_pct_sell"], percentile=70.0) / 100.0:
             _vol_edge = "SELL"
-        elif _iv_hv_pct_pe <= CFG["iv_hv_pct_buy"] / 100.0:
+        elif _iv_hv_pct_pe <= _adaptive_threshold("iv_hv", CFG["iv_hv_pct_buy"], percentile=30.0) / 100.0:
             _vol_edge = "BUY"
         else:
             _vol_edge = "NEUTRAL"
